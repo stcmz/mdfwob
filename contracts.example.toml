@@ -1,0 +1,46 @@
+# IBKR TWS or IB Gateway API connection. Ignored by other providers.
+[ibkr]
+host = "127.0.0.1" # Host running TWS or IB Gateway.
+port = 4002 # Common defaults: Gateway paper 4002, Gateway live 4001.
+client_id = 0 # Must be unique among API clients connected to this session.
+
+# Databento authentication and dataset selection. Ignored by other providers.
+[databento]
+api_key_env = "DATABENTO_API_KEY" # Environment variable containing the API key.
+stock_dataset = "EQUS.MINI" # Dataset used for [[stocks]] contracts.
+option_dataset = "OPRA.PILLAR" # Dataset used for [[options]] contracts.
+
+# Settings shared by every market-data provider.
+[download]
+provider = "ibkr" # Implemented values: "ibkr" and "databento".
+output_dir = "./data" # FWOB files are created under this directory.
+start = "2026-06-01" # Optional for IBKR; required for Databento. Date or RFC3339.
+end = "2026-06-09T00:00:00Z" # Optional fixed cutoff; omit to use the current time dynamically.
+use_rth = false # false includes all available hours; Databento currently requires false.
+parallelism = 4 # Maximum number of contracts processed concurrently.
+request_interval_ms = 3000 # Global minimum spacing between provider requests.
+
+# Symbols in one stock group share currency and exchange properties.
+[[stocks]]
+symbols = ["AAPL", "MSFT", "AMZN", "GOOGL"]
+currency = "USD" # Contract currency.
+exchange = "SMART" # Routing or listing exchange used for contract resolution.
+primary_exchange = "NASDAQ" # Optional but recommended for ambiguous stock symbols.
+
+[[stocks]]
+symbols = ["BRK B", "BABA", "DIS"]
+currency = "USD"
+exchange = "SMART"
+primary_exchange = "NYSE"
+
+# Each option entry identifies one exact contract and creates a separate FWOB file.
+[[options]]
+symbol = "MSFT" # Underlying symbol.
+expiration = "20260717" # Expiration in YYYYMMDD format.
+strike = 450 # Positive finite strike price.
+right = "call" # "call", "put", "C", or "P".
+currency = "USD" # Optional; defaults to USD.
+exchange = "SMART" # Optional; defaults to SMART.
+multiplier = "100" # Optional; defaults to 100.
+trading_class = "MSFT" # Optional IBKR disambiguator for nonstandard contracts.
+local_symbol = "MSFT  260717C00450000" # Optional for IBKR; required for Databento.
