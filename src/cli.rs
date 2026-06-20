@@ -65,6 +65,10 @@ struct DownloadArgs {
     #[arg(long)]
     client_id: Option<i32>,
 
+    /// Seconds to retry IBKR reconnects. -1 retries forever; 0 disables retries.
+    #[arg(long, allow_hyphen_values = true)]
+    reconnect_timeout_seconds: Option<i64>,
+
     /// Default primary exchange for ad hoc stock symbols.
     #[arg(long)]
     primary_exchange: Option<String>,
@@ -126,6 +130,9 @@ impl DownloadArgs {
         }
         if let Some(client_id) = self.client_id {
             config.ibkr.client_id = client_id;
+        }
+        if let Some(reconnect_timeout_seconds) = self.reconnect_timeout_seconds {
+            config.ibkr.reconnect_timeout_seconds = reconnect_timeout_seconds;
         }
         if let Some(start) = self.start {
             config.download.start = Some(start);
@@ -246,5 +253,23 @@ mod tests {
 
         assert_eq!(args.request_interval_ms, Some(1_000));
         assert_eq!(args.items, ["SPCX"]);
+    }
+
+    #[test]
+    fn reconnect_timeout_is_accepted_as_an_ibkr_override() {
+        for (value, expected) in [("-1", -1), ("0", 0), ("1234", 1234)] {
+            let cli = Cli::try_parse_from([
+                "mdfwob",
+                "download",
+                "SPCX",
+                "--reconnect-timeout-seconds",
+                value,
+            ])
+            .unwrap();
+            let Command::Download(args) = cli.command else {
+                panic!("expected download command");
+            };
+            assert_eq!(args.reconnect_timeout_seconds, Some(expected));
+        }
     }
 }

@@ -93,6 +93,12 @@ mdfwob download IBKR
 `ibkr` and `databento` are implemented. `polygon` and `thetadata` are reserved
 provider tokens but are not implemented.
 
+IBKR connection resets are retried from the unchanged download cursor. Set
+`ibkr.reconnect_timeout_seconds` or `--reconnect-timeout-seconds` to `-1` for
+unlimited retries (the default), `0` to fail the symbol immediately, or a
+positive number for a wall-clock retry budget in seconds. Retries share the
+global request pacer configured by `download.request_interval_ms`.
+
 Databento uses its official Rust SDK and reads the API key from
 `DATABENTO_API_KEY` by default. The variable name and stock/option datasets are
 configured in `[databento]`. Databento requires an explicit `download.start`

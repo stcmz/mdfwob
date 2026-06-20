@@ -14,7 +14,7 @@ use tracing::{error, info, warn};
 use crate::{
     config::{Config, OptionContractConfig, OptionRight, ProviderKind, StockContractConfig},
     fwob_options::FwobOptions,
-    providers::{DatabentoProvider, IbkrProvider, MarketDataProvider},
+    providers::{DatabentoProvider, IbkrProvider, MarketDataProvider, RecoveryAction},
     storage::{TickStore, TickWriter},
     tick::ShortTick,
 };
@@ -230,6 +230,7 @@ fn run_with_provider(
         configured_start: plan.configured_start,
         configured_end: plan.configured_end,
         use_rth: plan.config.download.use_rth,
+        reconnect_timeout_seconds: plan.config.ibkr.reconnect_timeout_seconds,
         cancel,
         pacer,
     };
@@ -291,6 +292,9 @@ struct SymbolDownloader<'a, P> {
     configured_start: Option<OffsetDateTime>,
     configured_end: Option<OffsetDateTime>,
     use_rth: bool,
+    /// IBKR reconnect retry budget: -1 retries forever, 0 disables retries, and a
+    /// positive value caps the wall-clock seconds spent retrying a single request.
+    reconnect_timeout_seconds: i64,
     cancel: &'a CancellationToken,
     pacer: &'a RequestPacer,
 }
@@ -368,16 +372,10 @@ impl<P: MarketDataProvider> SymbolDownloader<'_, P> {
                 break;
             }
 
-            if !self.pacer.wait(self.cancel) {
+            let Some(mut ticks) = self.fetch_with_recovery(contract, cursor, end)? else {
+                // Cancellation requested while pacing/retrying; stop this symbol cleanly.
                 break;
-            }
-            let mut ticks = self.provider.historical_trade_ticks(
-                contract,
-                cursor,
-                end,
-                MAX_TICKS_PER_REQUEST,
-                self.use_rth,
-            )?;
+            };
             validate_provider_batch(&ticks, cursor, &contract.symbol)?;
             let provider_returned_ticks = !ticks.is_empty();
             ticks.retain(|tick| tick.timestamp < end);
@@ -403,6 +401,73 @@ impl<P: MarketDataProvider> SymbolDownloader<'_, P> {
             info!(symbol = %contract.symbol, count, next = %cursor, "appended ticks");
         }
         Ok(appended)
+    }
+
+    /// Fetch one batch for `cursor`, transparently retrying retryable provider failures
+    /// (connection resets / reconnects) from the **unchanged** cursor so a dropped gateway
+    /// never advances past unfetched data. Returns `Ok(None)` when cancellation interrupts
+    /// the wait. The retry budget is per logical request: it starts at the first retryable
+    /// failure and resets once a request succeeds.
+    fn fetch_with_recovery(
+        &self,
+        contract: &StockContract,
+        cursor: OffsetDateTime,
+        end: OffsetDateTime,
+    ) -> Result<Option<Vec<ProviderTick>>> {
+        let mut retry_deadline: Option<Instant> = None;
+        loop {
+            if !self.pacer.wait(self.cancel) {
+                return Ok(None);
+            }
+            let error = match self.provider.historical_trade_ticks(
+                contract,
+                cursor,
+                end,
+                MAX_TICKS_PER_REQUEST,
+                self.use_rth,
+            ) {
+                Ok(ticks) => return Ok(Some(ticks)),
+                Err(error) => error,
+            };
+
+            let Some(action) = self.provider.recovery_action(&error) else {
+                return Err(error);
+            };
+            // 0 disables retries entirely; surface the error like any other.
+            if self.reconnect_timeout_seconds == 0 {
+                return Err(error);
+            }
+            // A positive budget caps wall-clock retry time from the first retryable failure.
+            if self.reconnect_timeout_seconds > 0 {
+                let deadline = *retry_deadline.get_or_insert_with(|| {
+                    Instant::now() + Duration::from_secs(self.reconnect_timeout_seconds as u64)
+                });
+                if Instant::now() >= deadline {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "exhausted {}s reconnect budget for {}",
+                            self.reconnect_timeout_seconds, contract.symbol
+                        )
+                    });
+                }
+            }
+
+            warn!(
+                symbol = %contract.symbol,
+                error = %format!("{error:#}"),
+                "retryable provider error; retrying from the unchanged cursor"
+            );
+            if let RecoveryAction::Reconnect { generation } = action {
+                // A failed reconnect is itself retryable while within budget; keep looping.
+                if let Err(reconnect_error) = self.provider.reconnect(generation) {
+                    warn!(
+                        symbol = %contract.symbol,
+                        error = %format!("{reconnect_error:#}"),
+                        "reconnect attempt failed; will retry"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -627,6 +692,330 @@ mod tests {
         }
     }
 
+    /// Error type the recovery mock returns; `action` mirrors what a real provider's
+    /// `recovery_action` would report (`None` = non-retryable).
+    #[derive(Debug)]
+    struct MockError {
+        action: Option<RecoveryAction>,
+    }
+
+    impl std::fmt::Display for MockError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "mock provider error")
+        }
+    }
+
+    impl std::error::Error for MockError {}
+
+    enum Response {
+        Data(Vec<ProviderTick>),
+        /// A failure; `Some(action)` is retryable, `None` is fatal.
+        Fail(Option<RecoveryAction>),
+    }
+
+    /// What the provider returns once its scripted `responses` queue drains.
+    enum Drain {
+        Empty,
+        FailRetryable(RecoveryAction),
+    }
+
+    struct RecoveryProvider {
+        responses: Mutex<VecDeque<Response>>,
+        drain: Drain,
+        starts: Mutex<Vec<OffsetDateTime>>,
+        reconnects: Mutex<u64>,
+        /// When `Some(n)`, cancel `cancel` once the n-th request has been issued.
+        cancel_after: Option<usize>,
+        cancel: CancellationToken,
+    }
+
+    impl RecoveryProvider {
+        fn new(responses: Vec<Response>, drain: Drain) -> Self {
+            Self {
+                responses: Mutex::new(VecDeque::from(responses)),
+                drain,
+                starts: Mutex::new(Vec::new()),
+                reconnects: Mutex::new(0),
+                cancel_after: None,
+                cancel: CancellationToken::new(),
+            }
+        }
+
+        fn request_count(&self) -> usize {
+            self.starts.lock().unwrap().len()
+        }
+
+        fn reconnect_count(&self) -> u64 {
+            *self.reconnects.lock().unwrap()
+        }
+    }
+
+    impl MarketDataProvider for RecoveryProvider {
+        fn head_timestamp(
+            &self,
+            _contract: &StockContract,
+            _use_rth: bool,
+        ) -> Result<OffsetDateTime> {
+            unreachable!("recovery tests configure an explicit start")
+        }
+
+        fn historical_trade_ticks(
+            &self,
+            _contract: &StockContract,
+            start: OffsetDateTime,
+            _end: OffsetDateTime,
+            _max_ticks: i32,
+            _use_rth: bool,
+        ) -> Result<Vec<ProviderTick>> {
+            {
+                let mut starts = self.starts.lock().unwrap();
+                starts.push(start);
+                if self.cancel_after.is_some_and(|n| starts.len() >= n) {
+                    self.cancel.cancel();
+                }
+            }
+            match self.responses.lock().unwrap().pop_front() {
+                Some(Response::Data(ticks)) => Ok(ticks),
+                Some(Response::Fail(action)) => Err(MockError { action }.into()),
+                None => match self.drain {
+                    Drain::Empty => Ok(Vec::new()),
+                    Drain::FailRetryable(action) => Err(MockError {
+                        action: Some(action),
+                    }
+                    .into()),
+                },
+            }
+        }
+
+        fn recovery_action(&self, error: &anyhow::Error) -> Option<RecoveryAction> {
+            error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<MockError>())
+                .and_then(|mock| mock.action)
+        }
+
+        fn reconnect(&self, _generation: u64) -> Result<()> {
+            *self.reconnects.lock().unwrap() += 1;
+            Ok(())
+        }
+    }
+
+    fn download_with_recovery(
+        provider: &RecoveryProvider,
+        reconnect_timeout_seconds: i64,
+        configured_start: OffsetDateTime,
+        configured_end: Option<OffsetDateTime>,
+        cancel: &CancellationToken,
+        pacer: &RequestPacer,
+        store: &TickStore,
+    ) -> Result<()> {
+        SymbolDownloader {
+            provider,
+            configured_start: Some(configured_start),
+            configured_end,
+            use_rth: false,
+            reconnect_timeout_seconds,
+            cancel,
+            pacer,
+        }
+        .download_symbol(&test_stock("AAPL"), store)
+    }
+
+    #[test]
+    fn reset_then_success_retries_same_cursor_without_losing_data() {
+        let base = OffsetDateTime::from_unix_timestamp(1_700_100_000).unwrap();
+        let provider = RecoveryProvider::new(
+            vec![
+                Response::Fail(Some(RecoveryAction::Retry)),
+                Response::Data(vec![
+                    ProviderTick {
+                        timestamp: base,
+                        price: 10.0,
+                        size: 1,
+                    },
+                    ProviderTick {
+                        timestamp: base + time::Duration::seconds(1),
+                        price: 10.1,
+                        size: 2,
+                    },
+                ]),
+            ],
+            Drain::Empty,
+        );
+        let dir = temp_dir("mdfwob-reset-retry");
+        let store = TickStore::new(&dir, "AAPL", FwobOptions::default());
+        let cancel = CancellationToken::new();
+        let pacer = RequestPacer::new(Duration::ZERO);
+
+        download_with_recovery(
+            &provider,
+            -1,
+            base,
+            Some(base + time::Duration::seconds(2)),
+            &cancel,
+            &pacer,
+            &store,
+        )
+        .unwrap();
+
+        // The reset re-requests the SAME cursor (no day-skip), then the data lands intact.
+        assert_eq!(provider.starts.lock().unwrap().as_slice(), &[base, base]);
+        assert_eq!(provider.reconnect_count(), 0);
+        assert_eq!(
+            store.last_timestamp().unwrap(),
+            Some((base + time::Duration::seconds(1)).unix_timestamp() as u32)
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reconnect_action_recreates_client_once_then_resumes() {
+        let base = OffsetDateTime::from_unix_timestamp(1_700_200_000).unwrap();
+        let provider = RecoveryProvider::new(
+            vec![
+                Response::Fail(Some(RecoveryAction::Reconnect { generation: 0 })),
+                Response::Data(vec![ProviderTick {
+                    timestamp: base,
+                    price: 10.0,
+                    size: 1,
+                }]),
+            ],
+            Drain::Empty,
+        );
+        let dir = temp_dir("mdfwob-reconnect");
+        let store = TickStore::new(&dir, "AAPL", FwobOptions::default());
+        let cancel = CancellationToken::new();
+        let pacer = RequestPacer::new(Duration::ZERO);
+
+        download_with_recovery(
+            &provider,
+            -1,
+            base,
+            Some(base + time::Duration::seconds(1)),
+            &cancel,
+            &pacer,
+            &store,
+        )
+        .unwrap();
+
+        assert_eq!(provider.reconnect_count(), 1);
+        assert_eq!(provider.starts.lock().unwrap().as_slice(), &[base, base]);
+        assert_eq!(
+            store.last_timestamp().unwrap(),
+            Some(base.unix_timestamp() as u32)
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn zero_timeout_fails_the_symbol_without_retrying() {
+        let base = OffsetDateTime::from_unix_timestamp(1_700_300_000).unwrap();
+        let provider = RecoveryProvider::new(
+            vec![Response::Fail(Some(RecoveryAction::Retry))],
+            Drain::Empty,
+        );
+        let dir = temp_dir("mdfwob-zero-timeout");
+        let store = TickStore::new(&dir, "AAPL", FwobOptions::default());
+        let cancel = CancellationToken::new();
+        let pacer = RequestPacer::new(Duration::ZERO);
+
+        let result = download_with_recovery(
+            &provider,
+            0,
+            base,
+            Some(base + time::Duration::seconds(10)),
+            &cancel,
+            &pacer,
+            &store,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(provider.request_count(), 1);
+        assert_eq!(provider.reconnect_count(), 0);
+        fs::remove_dir_all(dir).unwrap_or(());
+    }
+
+    #[test]
+    fn non_retryable_error_propagates_immediately() {
+        let base = OffsetDateTime::from_unix_timestamp(1_700_400_000).unwrap();
+        let provider = RecoveryProvider::new(vec![Response::Fail(None)], Drain::Empty);
+        let dir = temp_dir("mdfwob-fatal");
+        let store = TickStore::new(&dir, "AAPL", FwobOptions::default());
+        let cancel = CancellationToken::new();
+        let pacer = RequestPacer::new(Duration::ZERO);
+
+        let result = download_with_recovery(
+            &provider,
+            -1,
+            base,
+            Some(base + time::Duration::seconds(10)),
+            &cancel,
+            &pacer,
+            &store,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(provider.request_count(), 1);
+        assert_eq!(provider.reconnect_count(), 0);
+        fs::remove_dir_all(dir).unwrap_or(());
+    }
+
+    #[test]
+    fn finite_timeout_exhaustion_fails_the_symbol() {
+        let base = OffsetDateTime::from_unix_timestamp(1_700_500_000).unwrap();
+        let provider = RecoveryProvider::new(vec![], Drain::FailRetryable(RecoveryAction::Retry));
+        let dir = temp_dir("mdfwob-finite-timeout");
+        let store = TickStore::new(&dir, "AAPL", FwobOptions::default());
+        let cancel = CancellationToken::new();
+        // Pace retries so a 1s budget exhausts in a bounded number of attempts.
+        let pacer = RequestPacer::new(Duration::from_millis(100));
+
+        let result = download_with_recovery(
+            &provider,
+            1,
+            base,
+            Some(base + time::Duration::seconds(10)),
+            &cancel,
+            &pacer,
+            &store,
+        );
+
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("reconnect budget"));
+        assert!(provider.request_count() >= 1);
+        fs::remove_dir_all(dir).unwrap_or(());
+    }
+
+    #[test]
+    fn infinite_retry_is_interrupted_by_cancellation() {
+        let base = OffsetDateTime::from_unix_timestamp(1_700_600_000).unwrap();
+        let cancel = CancellationToken::new();
+        let mut provider =
+            RecoveryProvider::new(vec![], Drain::FailRetryable(RecoveryAction::Retry));
+        provider.cancel_after = Some(3);
+        provider.cancel = cancel.clone();
+
+        let dir = temp_dir("mdfwob-infinite-cancel");
+        let store = TickStore::new(&dir, "AAPL", FwobOptions::default());
+        let pacer = RequestPacer::new(Duration::ZERO);
+
+        // Infinite budget would loop forever; cancellation must stop it cleanly (Ok).
+        download_with_recovery(
+            &provider,
+            -1,
+            base,
+            Some(base + time::Duration::seconds(10)),
+            &cancel,
+            &pacer,
+            &store,
+        )
+        .unwrap();
+
+        assert!(cancel.is_canceled());
+        assert_eq!(provider.request_count(), 3);
+        fs::remove_dir_all(dir).unwrap_or(());
+    }
+
     #[test]
     fn mock_download_appends_batches_and_advances_cursor() {
         let base = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
@@ -671,6 +1060,7 @@ mod tests {
             configured_start: None,
             configured_end: Some(base + time::Duration::seconds(3)),
             use_rth: false,
+            reconnect_timeout_seconds: -1,
             cancel: &cancel,
             pacer: &pacer,
         }
@@ -718,6 +1108,7 @@ mod tests {
             configured_start: None,
             configured_end: Some(base + time::Duration::seconds(2)),
             use_rth: false,
+            reconnect_timeout_seconds: -1,
             cancel: &cancel,
             pacer: &pacer,
         }
@@ -766,6 +1157,7 @@ mod tests {
             configured_start: Some(base),
             configured_end: Some(end),
             use_rth: false,
+            reconnect_timeout_seconds: -1,
             cancel: &cancel,
             pacer: &pacer,
         }
@@ -809,6 +1201,7 @@ mod tests {
             configured_start: Some(base),
             configured_end: Some(base + time::Duration::seconds(2)),
             use_rth: false,
+            reconnect_timeout_seconds: -1,
             cancel: &cancel,
             pacer: &pacer,
         }
@@ -852,6 +1245,7 @@ mod tests {
             configured_start: Some(base),
             configured_end: Some(base + time::Duration::seconds(10)),
             use_rth: false,
+            reconnect_timeout_seconds: -1,
             cancel: &cancel,
             pacer: &pacer,
         }

@@ -9,6 +9,12 @@ use crate::downloader::{ProviderTick, StockContract};
 pub use databento::DatabentoProvider;
 pub use ibkr::IbkrProvider;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryAction {
+    Retry,
+    Reconnect { generation: u64 },
+}
+
 pub trait MarketDataProvider: Sync {
     fn head_timestamp(&self, contract: &StockContract, use_rth: bool) -> Result<OffsetDateTime>;
 
@@ -25,4 +31,12 @@ pub trait MarketDataProvider: Sync {
         max_ticks: i32,
         use_rth: bool,
     ) -> Result<Vec<ProviderTick>>;
+
+    fn recovery_action(&self, _error: &anyhow::Error) -> Option<RecoveryAction> {
+        None
+    }
+
+    fn reconnect(&self, _generation: u64) -> Result<()> {
+        anyhow::bail!("provider does not support reconnecting")
+    }
 }

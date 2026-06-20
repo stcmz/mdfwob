@@ -1,6 +1,6 @@
 [package]
 name = "mdfwob"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -21,7 +21,7 @@ fwob = "1"
 fwob-core = "1"
 fwob-v1 = "1"
 fwob-v2 = "1"
-ibapi = { version = "3.0.1", default-features = false, features = ["sync"] }
+ibapi = { version = "3.1.0", default-features = false, features = ["sync"] }
 serde = { version = "1.0", features = ["derive"] }
 time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }

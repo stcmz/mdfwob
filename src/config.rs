@@ -56,6 +56,7 @@ pub struct IbkrConfig {
     pub host: String,
     pub port: u16,
     pub client_id: i32,
+    pub reconnect_timeout_seconds: i64,
 }
 
 impl Default for IbkrConfig {
@@ -64,6 +65,7 @@ impl Default for IbkrConfig {
             host: "127.0.0.1".into(),
             port: 4002,
             client_id: 0,
+            reconnect_timeout_seconds: -1,
         }
     }
 }
@@ -247,6 +249,7 @@ mod tests {
         assert_eq!(config.ibkr.host, "gateway.internal");
         assert_eq!(config.ibkr.port, 7496);
         assert_eq!(config.ibkr.client_id, 42);
+        assert_eq!(config.ibkr.reconnect_timeout_seconds, -1);
     }
 
     #[test]

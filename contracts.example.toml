@@ -3,6 +3,7 @@
 host = "127.0.0.1" # Host running TWS or IB Gateway.
 port = 4002 # Common defaults: Gateway paper 4002, Gateway live 4001.
 client_id = 0 # Must be unique among API clients connected to this session.
+reconnect_timeout_seconds = -1 # -1 retries forever; 0 fails immediately; positive values are seconds.
 
 # Databento authentication and dataset selection. Ignored by other providers.
 [databento]
