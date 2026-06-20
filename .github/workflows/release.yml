@@ -1,0 +1,181 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    name: Validate release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release must run from a vX.Y.Z tag, got: $tag" >&2
+            exit 1
+          fi
+          version="${tag#v}"
+          pkg_version="$(
+            cargo metadata --no-deps --format-version 1 |
+              jq -r '.packages[] | select(.name == "mdfwob") | .version'
+          )"
+          if [[ "$pkg_version" != "$version" ]]; then
+            printf 'Tag version %s does not match package version: %s\n' \
+              "$version" "$pkg_version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - run: cargo test --all-features --locked
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            executable: mdfwob
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            executable: mdfwob.exe
+            archive: zip
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            executable: mdfwob
+            archive: tar.gz
+          - os: macos-15
+            target: aarch64-apple-darwin
+            executable: mdfwob
+            archive: tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package binary
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $base = "mdfwob-${{ needs.validate.outputs.version }}-${{ matrix.target }}"
+          $stage = Join-Path "dist" $base
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.executable }}" $stage
+          Copy-Item README.md,LICENSE $stage
+
+          if ("${{ matrix.archive }}" -eq "zip") {
+            $archive = "dist/$base.zip"
+            Compress-Archive -Path "$stage/*" -DestinationPath $archive
+          } else {
+            $archive = "dist/$base.tar.gz"
+            tar -czf $archive -C dist $base
+          }
+
+          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          $file = Split-Path -Leaf $archive
+          "$hash  $file" | Set-Content -NoNewline "$archive.sha256"
+          Remove-Item -LiteralPath $stage -Recurse -Force
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish-crates:
+    name: Publish crates.io
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: crates-io
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - shell: bash
+        run: |
+          set -euo pipefail
+
+          crate_exists() {
+            curl --fail --silent --show-error \
+              --user-agent "mdfwob-release-workflow" \
+              "https://crates.io/api/v1/crates/$1/$VERSION" >/dev/null 2>&1
+          }
+
+          publish_and_wait() {
+            local crate="$1"
+            if crate_exists "$crate"; then
+              echo "$crate $VERSION is already published; skipping"
+              return
+            fi
+
+            cargo publish --locked --package "$crate"
+            for _ in {1..60}; do
+              if crate_exists "$crate"; then
+                echo "$crate $VERSION is available from crates.io"
+                return
+              fi
+              sleep 10
+            done
+
+            echo "Timed out waiting for $crate $VERSION in crates.io" >&2
+            exit 1
+          }
+
+          publish_and_wait mdfwob
+
+  github-release:
+    name: GitHub release
+    needs: [validate, build, publish-crates]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.validate.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* \
+              --verify-tag \
+              --generate-notes \
+              --title "mdfwob $TAG"
+          fi

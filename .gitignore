@@ -1,0 +1,29 @@
+# Rust build output
+/target/
+**/*.rs.bk
+
+# Downloaded market data and generated logs
+*.fwob
+*.fwob2
+*.log
+*.fwob.lock
+
+# Local configuration and credentials
+/*.local.toml
+.env
+.env.*
+!.env.example
+
+# Scratch and temporary output
+/_*/
+/data/
+/tmp/
+/temp/
+*.tmp
+*.bak
+
+# Editors and operating systems
+/.idea/
+/.vscode/
+.DS_Store
+Thumbs.db
