@@ -11,6 +11,7 @@ use crate::{
 
 #[derive(Debug, Parser)]
 #[command(name = "mdfwob")]
+#[command(version)]
 #[command(about = "Download market data into FWOB files")]
 pub struct Cli {
     #[command(subcommand)]

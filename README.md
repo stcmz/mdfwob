@@ -1,6 +1,7 @@
 # mdfwob
 
 [![CI](https://github.com/stcmz/mdfwob/actions/workflows/ci.yml/badge.svg)](https://github.com/stcmz/mdfwob/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/mdfwob.svg)](https://crates.io/crates/mdfwob)
 
 Standalone CLI for downloading historical market data into FWOB files.
 
