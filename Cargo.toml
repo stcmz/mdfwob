@@ -25,6 +25,6 @@ ibapi = { version = "3.0.1", default-features = false, features = ["sync"] }
 serde = { version = "1.0", features = ["derive"] }
 time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
-toml = "0.8"
+toml = "1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
