@@ -126,6 +126,25 @@ impl StdError for IbkrRequestError {
     }
 }
 
+/// True for I/O error kinds that mean the TWS/Gateway socket was lost and a fresh client
+/// connection is required: e.g. Windows `os error 10053` (`ConnectionAborted`) or an
+/// `UnexpectedEof` ("failed to fill whole buffer") while reading the next message. ibapi
+/// surfaces these as [`ibapi::Error::Io`]. Its own transparent reconnect can fail (for
+/// instance when TWS demands the paper-trading disclaimer be re-accepted), so we treat them
+/// as recoverable and re-issue from the unchanged cursor after rebuilding the client.
+fn is_connection_loss(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    matches!(
+        error.kind(),
+        ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::BrokenPipe
+            | ErrorKind::UnexpectedEof
+            | ErrorKind::NotConnected
+            | ErrorKind::ConnectionRefused
+    )
+}
+
 /// Maps a request failure to the downloader's recovery action. Extracted as a free function so
 /// it can be unit-tested without a live IBKR client.
 fn classify_recovery(error: &anyhow::Error) -> Option<RecoveryAction> {
@@ -137,6 +156,14 @@ fn classify_recovery(error: &anyhow::Error) -> Option<RecoveryAction> {
             Some(RecoveryAction::Retry)
         }
         IbkrFailure::Ibapi(ibapi::Error::ConnectionFailed | ibapi::Error::Shutdown) => {
+            Some(RecoveryAction::Reconnect {
+                generation: request.generation,
+            })
+        }
+        // A dropped API socket (os error 10053 / UnexpectedEof) arrives as an I/O error. Rebuild
+        // the client and retry rather than abandoning the symbol, so a connection that recovers
+        // (or a disclaimer that gets accepted) resumes the download instead of failing the run.
+        IbkrFailure::Ibapi(ibapi::Error::Io(io)) if is_connection_loss(io) => {
             Some(RecoveryAction::Reconnect {
                 generation: request.generation,
             })
@@ -354,5 +381,37 @@ mod tests {
 
         // Unrelated errors are not recoverable.
         assert_eq!(classify_recovery(&anyhow::anyhow!("nope")), None);
+    }
+
+    #[test]
+    fn socket_loss_io_errors_reconnect_and_resume() {
+        use std::io::{Error as IoError, ErrorKind};
+
+        // os error 10053 is ConnectionAborted; "failed to fill whole buffer" is UnexpectedEof.
+        for kind in [
+            ErrorKind::ConnectionAborted,
+            ErrorKind::UnexpectedEof,
+            ErrorKind::ConnectionReset,
+            ErrorKind::BrokenPipe,
+            ErrorKind::NotConnected,
+            ErrorKind::ConnectionRefused,
+        ] {
+            let error = IbkrProvider::request_error(
+                IbkrFailure::Ibapi(ibapi::Error::Io(IoError::from(kind))),
+                4,
+            );
+            assert_eq!(
+                classify_recovery(&error),
+                Some(RecoveryAction::Reconnect { generation: 4 }),
+                "kind {kind:?} should reconnect"
+            );
+        }
+
+        // A non-connection I/O error is not a transport loss and must stay non-retryable.
+        let unrelated = IbkrProvider::request_error(
+            IbkrFailure::Ibapi(ibapi::Error::Io(IoError::from(ErrorKind::InvalidData))),
+            1,
+        );
+        assert_eq!(classify_recovery(&unrelated), None);
     }
 }
