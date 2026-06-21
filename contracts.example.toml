@@ -34,6 +34,37 @@ currency = "USD"
 exchange = "SMART"
 primary_exchange = "NYSE"
 
+# Analysis subcommands (stat, bars, calc). Read only by the analysis commands;
+# the download command ignores this section, so one file can serve both.
+[analysis]
+symbols = ["AAPL", "MSFT"] # Default symbol universe when no positional path is given.
+output_dir = "./data" # Directory searched when resolving a bare symbol to <symbol>.fwob.
+
+# Regular-trading-hours window for --use-rth (DST-correct, exchange timezone).
+[analysis.rth]
+tz = "America/New_York" # IANA timezone name.
+hours = "09:30-16:00" # HH:MM-HH:MM local session window.
+
+# Extended-hours window used when --use-rth is not set (for gap day-keying).
+[analysis.extended]
+tz = "America/New_York"
+hours = "04:00-20:00"
+
+# Per-command defaults. CLI tokens/flags override these.
+[analysis.stat]
+max_gap = 60 # Intra-day spacing (seconds) above which a gap is counted.
+
+[analysis.bars]
+interval = "5m" # Default bar interval when no interval token is given.
+fill = false # Forward-fill empty intervals with flat bars.
+
+[analysis.calc]
+interval = "1d" # Default interval when resampling a tick file.
+method = "log" # Summary return method: "log" or "simple".
+fill = false
+annualize = false # Annualize the --summary realized volatility.
+periods_per_year = 252.0 # Annualization factor (sqrt scaling).
+
 # Each option entry identifies one exact contract and creates a separate FWOB file.
 [[options]]
 symbol = "MSFT" # Underlying symbol.

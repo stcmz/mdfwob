@@ -25,7 +25,9 @@ fwob-core = "1.8"
 fwob-v1 = "1.8"
 fwob-v2 = "1.8"
 ibapi = { version = "3.1.0", default-features = false, features = ["sync"] }
+jiff = "0.2"
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 toml = "0.8"

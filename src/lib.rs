@@ -1,8 +1,11 @@
 //! mdfwob library surface.
 //!
-//! The download/verify functionality is exposed as a library in addition to the
-//! `mdfwob` command-line tool.
+//! In addition to the `mdfwob` command-line tool, the market-data **analysis**
+//! engine is exposed here as a public API so programs can compute summaries,
+//! resample ticks into bars, and run indicator pipelines (including custom
+//! user-supplied functions) directly. See [`analysis`].
 
+pub mod analysis;
 pub mod cli;
 pub mod config;
 pub mod fwob_options;

@@ -136,6 +136,76 @@ mdfwob download AAPL MSFT --output D:/MarketData
 mdfwob download SPCX --request-interval-ms 1000
 ```
 
+## Analysis
+
+Three subcommands analyze the tick FWOB files mdfwob produces. They share the
+fwob-family positional-token style: paths/symbols, an interval token
+(`Ns`/`Nm`/`Nh`/`Nd`/`Nw`/`Nmo`/`Ny` for seconds/minutes/hours/days/weeks/
+months/years), an output-format token (`table` default, plus `csv`, `md`,
+`json`, `jsonl`, and — for `bars`/`calc` — `fwob`), and the `rth` token
+(equivalent to `--use-rth`). A bare symbol is resolved to
+`<output_dir>/<symbol>.fwob`; a directory contributes its immediate `*.fwob`
+files; no path uses the current directory. `--start`/`--end` accept a date
+(`YYYY-MM-DD`, UTC) or RFC3339; a bare end date is inclusive of that day.
+
+```text
+mdfwob stat data/ md rth
+mdfwob bars AAPL.fwob 5m
+mdfwob bars AAPL.fwob 1w               # weekly bars (calendar week, exchange tz)
+mdfwob bars data/ 1mo fwob --output bars/
+mdfwob calc AAPL.fwob 1d rth ret:log vol:20 sma:20 rsi:14 --summary
+mdfwob calc bars/AAPL.fwob sma:20            # a bar file needs no interval
+```
+
+- **`stat`** prints one summary row per tick file: symbol, format, tick count,
+  time range, price min/max/mean, VWAP, signed volume, and intra-day gap count.
+- **`bars`** resamples ticks into OHLCV(+VWAP, trades) bars. Sub-day intervals
+  are UTC-epoch aligned; **day, week, month, and year intervals are aligned to
+  the calendar in the exchange timezone** (DST-correct) — week to Monday, month
+  to the 1st, year to Jan 1 — so extended-hours ticks that cross UTC midnight
+  stay in the correct period's bar. `--fill` forward-fills empty intervals with
+  flat bars; `fwob` output writes one `<symbol>.fwob` per symbol into `--output`.
+- **`calc`** computes per-bar indicator columns from composable specs —
+  `sma:N`, `ema:N`, `rsi:N`, `ret:log`, `ret:simple`, `vol:N` — over a bar file,
+  or over a tick file plus an interval token (auto-resampled). `--summary`
+  appends whole-series mean return and realized volatility (`--annualize`
+  `--periods-per-year F`); `--method log|simple` selects the summary return type.
+
+`--use-rth` keeps only regular-trading-hours ticks. Sessions are defined in an
+exchange timezone (DST-correct), defaulting to `09:30-16:00 America/New_York`
+(extended hours default to `04:00-20:00`); override with `--session HH:MM-HH:MM`
+and `--tz NAME`. That timezone also anchors day/week/month/year bars even when
+`--use-rth` is off, so such a bar's timestamp is the start of the period in UTC
+(e.g. ET midnight = `05:00:00Z` in winter). Gap counting in `stat` only counts intra-day
+gaps, so the overnight/weekend boundary is never miscounted. Time is rendered as a UTC
+datetime in `table`/`md` and as raw epoch seconds in `csv`/`json`/`jsonl`. With
+more than one symbol the output gains a leading `symbol` column.
+
+The same TOML file used for downloads can carry an `[analysis]` section (see
+`contracts.example.toml`); only that section is read by the analysis commands,
+and CLI tokens/flags override it. A symbol universe under `[analysis].symbols`
+is used when no positional path/symbol is given.
+
+### Library API
+
+The analysis engine is also a public library, so programs can read ticks,
+resample, and run indicator pipelines directly — including custom user functions:
+
+```rust
+use mdfwob::analysis::{read_ticks, resample, Calc, Interval, Sma, TickQuery};
+
+let (symbol, ticks) = read_ticks("AAPL.fwob".as_ref(), &TickQuery::default())?;
+let bars = resample(&ticks, Interval::parse("5m").unwrap()?, false);
+let out = Calc::new(&bars)
+    .with(Sma { period: 20 })
+    .with_fn("zscore", |bars| {
+        // any Fn(&[Bar]) -> Vec<Option<f64>>
+        bars.iter().map(|b| Some(b.close)).collect()
+    })
+    .run();
+# Ok::<(), anyhow::Error>(())
+```
+
 ## Build
 
 Rust 1.88 or newer is required.

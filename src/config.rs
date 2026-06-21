@@ -11,6 +11,10 @@ pub struct Config {
     pub download: DownloadConfig,
     pub stocks: Vec<StockContractConfig>,
     pub options: Vec<OptionContractConfig>,
+    /// Analysis settings (`[analysis]`). Present here so the same TOML file can
+    /// drive both `download` and the analysis subcommands; only the relevant
+    /// sections are read by each command.
+    pub analysis: crate::analysis::config::AnalysisConfig,
 }
 
 impl Config {
