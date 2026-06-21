@@ -13,6 +13,13 @@ Price  u32  price * 10,000
 Size   i32  shares
 ```
 
+New v2 files tag display semantics so `fwob dump` is human-readable: `Time` as
+`unix-seconds` (shown as an RFC3339 datetime) and `Price` as `fixed-4` (shown
+divided by 10,000, e.g. `150.0000`). The stored integers are unchanged; the
+semantics only affect display. Files created before this version can be tagged
+in place with `fwob edit --set-semantic Price=fixed-4 SYMBOL.fwob` (v2 only; v1
+does not store field semantics).
+
 `Time` is always an absolute UTC epoch second. TWS login timezone, computer
 timezone, exchange timezone, and daylight-saving transitions do not change the
 stored value. Date-time inputs must include an RFC3339 offset or `Z`; date-only

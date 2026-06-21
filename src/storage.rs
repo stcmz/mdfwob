@@ -475,16 +475,22 @@ mod tests {
     }
 
     #[test]
-    fn time_field_carries_timestamp_semantic_in_v2_and_drops_it_in_v1() {
+    fn field_semantics_persist_in_v2_and_drop_in_v1() {
         use fwob_core::{FieldSemantic, TimestampUnit};
 
-        for (label, format, expected) in [
+        for (label, format, time_expected, price_expected) in [
             (
                 "v2",
                 TargetFormat::V2,
                 FieldSemantic::UnixTimestamp(TimestampUnit::Seconds),
+                FieldSemantic::FixedPoint(4),
             ),
-            ("v1", TargetFormat::V1, FieldSemantic::None),
+            (
+                "v1",
+                TargetFormat::V1,
+                FieldSemantic::None,
+                FieldSemantic::None,
+            ),
         ] {
             let dir = temp_dir(&format!("mdfwob-semantic-{label}"));
             let options = options_for(format);
@@ -495,7 +501,9 @@ mod tests {
 
             let reader = Reader::open(store.path()).unwrap();
             assert_eq!(reader.schema().fields[0].name, "Time");
-            assert_eq!(reader.schema().fields[0].semantic, expected);
+            assert_eq!(reader.schema().fields[0].semantic, time_expected);
+            assert_eq!(reader.schema().fields[1].name, "Price");
+            assert_eq!(reader.schema().fields[1].semantic, price_expected);
             fs::remove_dir_all(dir).unwrap();
         }
     }

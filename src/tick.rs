@@ -41,7 +41,10 @@ pub fn short_tick_schema() -> Schema {
             // V2 persists this semantic; V1 accepts but does not store it (reads back as None).
             Field::new("Time", FieldType::UnsignedInteger, 4, 0)
                 .with_semantic(FieldSemantic::UnixTimestamp(TimestampUnit::Seconds)),
-            Field::new("Price", FieldType::UnsignedInteger, 4, 4),
+            // Price is stored as the real price * PRICE_SCALE (10,000), i.e. 4 decimal places.
+            // V2 persists this semantic so `fwob dump` shows the real price; V1 reads it back as None.
+            Field::new("Price", FieldType::UnsignedInteger, 4, 4)
+                .with_semantic(FieldSemantic::FixedPoint(4)),
             Field::new("Size", FieldType::SignedInteger, 4, 8),
         ],
         0,
