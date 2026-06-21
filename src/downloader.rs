@@ -425,10 +425,17 @@ impl<P: MarketDataProvider> SymbolDownloader<'_, P> {
                 end,
                 MAX_TICKS_PER_REQUEST,
                 self.use_rth,
+                self.cancel,
             ) {
                 Ok(ticks) => return Ok(Some(ticks)),
                 Err(error) => error,
             };
+
+            // A request interrupted by Ctrl+C surfaces as an error; while cancellation is in
+            // effect, treat any failure as a clean stop instead of retrying or abandoning.
+            if self.cancel.is_canceled() {
+                return Ok(None);
+            }
 
             let Some(action) = self.provider.recovery_action(&error) else {
                 return Err(error);
@@ -686,6 +693,7 @@ mod tests {
             _end: OffsetDateTime,
             _max_ticks: i32,
             _use_rth: bool,
+            _cancel: &CancellationToken,
         ) -> Result<Vec<ProviderTick>> {
             self.starts.lock().unwrap().push(start);
             Ok(self.batches.lock().unwrap().pop_front().unwrap())
@@ -766,6 +774,7 @@ mod tests {
             _end: OffsetDateTime,
             _max_ticks: i32,
             _use_rth: bool,
+            _cancel: &CancellationToken,
         ) -> Result<Vec<ProviderTick>> {
             {
                 let mut starts = self.starts.lock().unwrap();
@@ -1013,6 +1022,36 @@ mod tests {
 
         assert!(cancel.is_canceled());
         assert_eq!(provider.request_count(), 3);
+        fs::remove_dir_all(dir).unwrap_or(());
+    }
+
+    #[test]
+    fn cancel_during_request_stops_cleanly_even_on_non_retryable_error() {
+        let base = OffsetDateTime::from_unix_timestamp(1_700_700_000).unwrap();
+        let cancel = CancellationToken::new();
+        // Fatal (non-retryable) error, but cancellation fires during the same request: the
+        // downloader must stop cleanly (Ok) rather than surface the error.
+        let mut provider = RecoveryProvider::new(vec![Response::Fail(None)], Drain::Empty);
+        provider.cancel_after = Some(1);
+        provider.cancel = cancel.clone();
+
+        let dir = temp_dir("mdfwob-cancel-fatal");
+        let store = TickStore::new(&dir, "AAPL", FwobOptions::default());
+        let pacer = RequestPacer::new(Duration::ZERO);
+
+        let result = download_with_recovery(
+            &provider,
+            -1,
+            base,
+            Some(base + time::Duration::seconds(10)),
+            &cancel,
+            &pacer,
+            &store,
+        );
+
+        assert!(result.is_ok());
+        assert!(cancel.is_canceled());
+        assert_eq!(provider.request_count(), 1);
         fs::remove_dir_all(dir).unwrap_or(());
     }
 
@@ -1279,6 +1318,7 @@ mod tests {
                 _end: OffsetDateTime,
                 _max_ticks: i32,
                 _use_rth: bool,
+                _cancel: &CancellationToken,
             ) -> Result<Vec<ProviderTick>> {
                 self.symbols.lock().unwrap().push(contract.symbol.clone());
                 Ok(vec![ProviderTick {
@@ -1362,6 +1402,7 @@ mod tests {
                 _end: OffsetDateTime,
                 _max_ticks: i32,
                 _use_rth: bool,
+                _cancel: &CancellationToken,
             ) -> Result<Vec<ProviderTick>> {
                 if contract.symbol == "BAD" {
                     bail!("simulated provider failure for {}", contract.symbol);

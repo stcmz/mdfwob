@@ -12,7 +12,7 @@ use tokio::runtime::Runtime;
 use super::MarketDataProvider;
 use crate::{
     config::DatabentoConfig,
-    downloader::{ProviderTick, StockContract},
+    downloader::{CancellationToken, ProviderTick, StockContract},
 };
 
 pub struct DatabentoProvider {
@@ -71,6 +71,7 @@ impl MarketDataProvider for DatabentoProvider {
         end: OffsetDateTime,
         _max_ticks: i32,
         use_rth: bool,
+        _cancel: &CancellationToken,
     ) -> Result<Vec<ProviderTick>> {
         if use_rth {
             bail!("provider databento does not yet support regular-hours filtering");

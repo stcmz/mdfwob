@@ -99,6 +99,15 @@ unlimited retries (the default), `0` to fail the symbol immediately, or a
 positive number for a wall-clock retry budget in seconds. Retries share the
 global request pacer configured by `download.request_interval_ms`.
 
+A TWS/IB Gateway upstream-connectivity blip (IBKR system codes 1100 then
+1101/1102) can silently orphan an in-flight request without dropping the API
+socket. A background watcher on the IBKR notice stream detects the restore and
+re-issues the affected request from the unchanged cursor within about a second,
+so the download resumes on its own without a gateway restart. A request that is
+merely slow (no connectivity blip) is never re-issued. Ctrl+C is honored
+promptly even while a request is blocked or stalled; a second Ctrl+C forces an
+immediate exit.
+
 Databento uses its official Rust SDK and reads the API key from
 `DATABENTO_API_KEY` by default. The variable name and stock/option datasets are
 configured in `[databento]`. Databento requires an explicit `download.start`
