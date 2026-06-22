@@ -206,6 +206,17 @@ let out = Calc::new(&bars)
 # Ok::<(), anyhow::Error>(())
 ```
 
+## Install
+
+Install the command-line tool from crates.io:
+
+```text
+cargo install mdfwob
+```
+
+For an exactly reproducible build using the dependency versions pinned in the
+published `Cargo.lock`, add `--locked`.
+
 ## Build
 
 Rust 1.88 or newer is required.
