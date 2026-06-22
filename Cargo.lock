@@ -58,7 +58,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -69,7 +69,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -717,7 +717,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -859,9 +859,9 @@ dependencies = [
 
 [[package]]
 name = "fwob"
-version = "1.8.1"
+version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef10eb0e4733abb8928531adddb89498303be4c7b7699de0a6587cd09ea9eedf"
+checksum = "00b57c505ee961021bad38232a3c04dd7a17732e97d4a34281353a0e32744995"
 dependencies = [
  "anyhow",
  "clap",
@@ -878,9 +878,9 @@ dependencies = [
 
 [[package]]
 name = "fwob-core"
-version = "1.8.1"
+version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f50bf8b41cb857fe72e5bf39c21bb80fa3c684f12c9d7a7fac6f3e3b64b049c"
+checksum = "6999c745b57a030735ef7f0368eb824abc241f4ca0bfd5615f269532cf20e788"
 dependencies = [
  "fwob-derive",
  "rust_decimal",
@@ -900,9 +900,9 @@ dependencies = [
 
 [[package]]
 name = "fwob-v1"
-version = "1.8.1"
+version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e28f49fd02ff73a3c8501fd629221a8bd7d2da208a6931717a3ed57072786f8"
+checksum = "c0a4dfa0a01d778ff796a3ff7d8e058ae2c95c5cdb6451e5813470e4afac779a"
 dependencies = [
  "byteorder",
  "fwob-core",
@@ -911,9 +911,9 @@ dependencies = [
 
 [[package]]
 name = "fwob-v2"
-version = "1.8.1"
+version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7a588e2b3f3fe911ebee65a0d6095a4d8a6a56b1bbdaf5d5c4b34895b7126d7"
+checksum = "a3a62cb82f8a04411e564430d93720ee35556d915a44f05af2bb380cb66df4a6"
 dependencies = [
  "byteorder",
  "crc32fast",
@@ -1494,7 +1494,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2085,7 +2085,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2142,7 +2142,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2380,7 +2380,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2459,7 +2459,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3067,7 +3067,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
