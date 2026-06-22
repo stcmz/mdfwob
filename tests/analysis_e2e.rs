@@ -9,7 +9,7 @@ use fwob::Writer;
 use fwob_v2::WriterOptions;
 
 use mdfwob::analysis::config::ReturnMethod;
-use mdfwob::analysis::output::{BarSeries, OutputFormat, write_bars};
+use mdfwob::analysis::output::{AnalysisFormat, BarSeries, write_bars};
 use mdfwob::analysis::{
     BarClock, Calc, Interval, Session, Sma, TickQuery, compute_stat, read_bars, read_ticks,
     resample, summarize,
@@ -102,7 +102,7 @@ fn bars_fwob_round_trips_through_library() {
     let mut sink = Vec::new();
     write_bars(
         &series,
-        OutputFormat::Fwob,
+        AnalysisFormat::Fwob,
         Some(out_dir.as_path()),
         &mut sink,
     )
@@ -136,7 +136,8 @@ fn cli_stat_bars_calc_run() {
     assert!(stdout.contains("symbol"));
     assert!(stdout.contains("AAPL"));
 
-    // bars 5m csv
+    // bars 5m csv: headers are the schema field names; values are raw stored integers
+    // (price * 10_000, epoch time) -- identical to `fwob dump ... csv`.
     let out = Command::new(exe)
         .args(["bars", path_str, "5m", "csv"])
         .output()
@@ -147,7 +148,22 @@ fn cli_stat_bars_calc_run() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.starts_with("time,open,high,low,close,volume,vwap,trades"));
+    assert!(
+        stdout.starts_with("Time,Open,High,Low,Close,Volume,VWAP,Trades"),
+        "{stdout}"
+    );
+    // First 5m bar opens at 185.0 -> stored 1_850_000; time is the raw epoch second.
+    assert!(stdout.contains("1704205800,1850000,"), "{stdout}");
+
+    // bars 5m table: time renders as RFC3339 (unified with fwob dump).
+    let out = Command::new(exe)
+        .args(["bars", path_str, "5m"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Time"), "{stdout}");
+    assert!(stdout.contains("2024-01-02T14:30:00Z"), "{stdout}");
 
     // calc 5m sma:2 rsi:3 (table) with summary
     let out = Command::new(exe)

@@ -859,9 +859,9 @@ dependencies = [
 
 [[package]]
 name = "fwob"
-version = "1.8.2"
+version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00b57c505ee961021bad38232a3c04dd7a17732e97d4a34281353a0e32744995"
+checksum = "1ece1393812a4e2c2209bb308f689b2ad08984ee5774f345b8cf0a9847844ee4"
 dependencies = [
  "anyhow",
  "clap",
@@ -878,9 +878,9 @@ dependencies = [
 
 [[package]]
 name = "fwob-core"
-version = "1.8.2"
+version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6999c745b57a030735ef7f0368eb824abc241f4ca0bfd5615f269532cf20e788"
+checksum = "34aa865f5cb37eec7c4ceb100c52c9aaf88ebbc2e7b35a485d399b12cd322a7f"
 dependencies = [
  "fwob-derive",
  "rust_decimal",
@@ -900,9 +900,9 @@ dependencies = [
 
 [[package]]
 name = "fwob-v1"
-version = "1.8.2"
+version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0a4dfa0a01d778ff796a3ff7d8e058ae2c95c5cdb6451e5813470e4afac779a"
+checksum = "8d3093132df81feb1406424123aaa0f9ab661ca3c20f0bb3bd3babff2a003750"
 dependencies = [
  "byteorder",
  "fwob-core",
@@ -911,9 +911,9 @@ dependencies = [
 
 [[package]]
 name = "fwob-v2"
-version = "1.8.2"
+version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3a62cb82f8a04411e564430d93720ee35556d915a44f05af2bb380cb66df4a6"
+checksum = "c19f17bda4ffd802b18171efc5801ab3c3fbc4c768c901a8fa8573bf2f8f5208"
 dependencies = [
  "byteorder",
  "crc32fast",

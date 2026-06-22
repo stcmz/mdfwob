@@ -142,7 +142,7 @@ Three subcommands analyze the tick FWOB files mdfwob produces. They share the
 fwob-family positional-token style: paths/symbols, an interval token
 (`Ns`/`Nm`/`Nh`/`Nd`/`Nw`/`Nmo`/`Ny` for seconds/minutes/hours/days/weeks/
 months/years), an output-format token (`table` default, plus `csv`, `md`,
-`json`, `jsonl`, and — for `bars`/`calc` — `fwob`), and the `rth` token
+`jsonl`, `raw`, `hex`, and — for `bars`/`calc` — `fwob`), and the `rth` token
 (equivalent to `--use-rth`). A bare symbol is resolved to
 `<output_dir>/<symbol>.fwob`; a directory contributes its immediate `*.fwob`
 files; no path uses the current directory. `--start`/`--end` accept a date
@@ -167,9 +167,12 @@ mdfwob calc bars/AAPL.fwob sma:20            # a bar file needs no interval
   flat bars; `fwob` output writes one `<symbol>.fwob` per symbol into `--output`.
 - **`calc`** computes per-bar indicator columns from composable specs —
   `sma:N`, `ema:N`, `rsi:N`, `ret:log`, `ret:simple`, `vol:N` — over a bar file,
-  or over a tick file plus an interval token (auto-resampled). `--summary`
-  appends whole-series mean return and realized volatility (`--annualize`
-  `--periods-per-year F`); `--method log|simple` selects the summary return type.
+  or over a tick file plus an interval token (auto-resampled). Columns are stored
+  as 4-byte fixed-point integers at a per-indicator precision (price-level
+  indicators use 4 decimals, returns/volatility use 8); warm-up cells with no
+  value are shown as `-`. `--summary` appends whole-series mean return and
+  realized volatility (`--annualize` `--periods-per-year F`); `--method
+  log|simple` selects the summary return type.
 
 `--use-rth` keeps only regular-trading-hours ticks. Sessions are defined in an
 exchange timezone (DST-correct), defaulting to `09:30-16:00 America/New_York`
@@ -177,9 +180,12 @@ exchange timezone (DST-correct), defaulting to `09:30-16:00 America/New_York`
 and `--tz NAME`. That timezone also anchors day/week/month/year bars even when
 `--use-rth` is off, so such a bar's timestamp is the start of the period in UTC
 (e.g. ET midnight = `05:00:00Z` in winter). Gap counting in `stat` only counts intra-day
-gaps, so the overnight/weekend boundary is never miscounted. Time is rendered as a UTC
-datetime in `table`/`md` and as raw epoch seconds in `csv`/`json`/`jsonl`. With
-more than one symbol the output gains a leading `symbol` column.
+gaps, so the overnight/weekend boundary is never miscounted. `bars` and `calc`
+render through fwob's formatter, so their output matches `fwob dump` of the
+equivalent `.fwob`: `table`/`md` show fixed-point values and a UTC RFC3339
+datetime (`Time`); `csv`/`jsonl`/`raw` carry the exact stored integers (prices
+×10⁴, epoch seconds), with absent calc values empty/`null`. With more than one
+symbol the output gains a leading `Symbol` column.
 
 The same TOML file used for downloads can carry an `[analysis]` section (see
 `contracts.example.toml`); only that section is read by the analysis commands,

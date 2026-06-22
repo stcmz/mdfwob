@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -11,7 +12,7 @@ use crate::{
         config::{AnalysisConfig, DEFAULT_EXTENDED_HOURS, DEFAULT_RTH_HOURS, ReturnMethod},
         interval::Interval,
         model::Bar,
-        output::{BarSeries, CalcSeries, OutputFormat, write_bars, write_calc, write_stat},
+        output::{AnalysisFormat, BarSeries, CalcSeries, write_bars, write_calc, write_stat},
         read::{InputKind, TickQuery, discover_inputs, input_kind, read_bars, read_ticks},
         resample::{BarClock, resample},
         session::Session,
@@ -51,7 +52,7 @@ enum Command {
     Verify(VerifyArgs),
     /// Summarize tick files: one row per file with price/volume/gap stats.
     Stat(StatArgs),
-    /// Resample ticks into OHLCV bars (table/csv/md/json/jsonl/fwob).
+    /// Resample ticks into OHLCV bars (table/csv/md/jsonl/raw/hex/fwob).
     Bars(BarsArgs),
     /// Compute per-bar indicator series (sma/ema/rsi/ret/vol) over bars or ticks.
     Calc(CalcArgs),
@@ -276,9 +277,10 @@ impl StatArgs {
             use_rth,
         } = classify_paths_format(&tokens)?;
         let use_rth = self.use_rth || use_rth;
-        if format == OutputFormat::Fwob {
-            bail!("stat does not support fwob output");
-        }
+        let frame = match format {
+            AnalysisFormat::Fwob => bail!("stat does not support fwob output"),
+            AnalysisFormat::Frame(frame) => frame,
+        };
         let session = resolve_session(&acfg, use_rth, self.session.as_deref(), self.tz.as_deref())?;
         let (start, end) = parse_bounds(self.start.as_deref(), self.end.as_deref())?;
         let max_gap = self.max_gap.unwrap_or(acfg.stat.max_gap);
@@ -314,8 +316,10 @@ impl StatArgs {
         }
 
         let stdout = std::io::stdout();
-        let mut lock = stdout.lock();
-        write_stat(&rows, format, &mut lock)
+        let mut out = std::io::BufWriter::new(stdout.lock());
+        write_stat(&rows, frame, &mut out)?;
+        out.flush()?;
+        Ok(())
     }
 }
 
@@ -380,8 +384,10 @@ impl BarsArgs {
 
         let out_dir = self.output.clone().or_else(|| acfg.output_dir.clone());
         let stdout = std::io::stdout();
-        let mut lock = stdout.lock();
-        write_bars(&series, format, out_dir.as_deref(), &mut lock)
+        let mut out = std::io::BufWriter::new(stdout.lock());
+        write_bars(&series, format, out_dir.as_deref(), &mut out)?;
+        out.flush()?;
+        Ok(())
     }
 }
 
@@ -501,8 +507,10 @@ impl CalcArgs {
 
         let out_dir = self.output.clone().or_else(|| acfg.output_dir.clone());
         let stdout = std::io::stdout();
-        let mut lock = stdout.lock();
-        write_calc(&series, format, out_dir.as_deref(), &mut lock)
+        let mut out = std::io::BufWriter::new(stdout.lock());
+        write_calc(&series, format, out_dir.as_deref(), &mut out)?;
+        out.flush()?;
+        Ok(())
     }
 }
 
@@ -523,7 +531,7 @@ const RTH_TOKEN: &str = "rth";
 
 struct StatTokens {
     paths: Vec<String>,
-    format: OutputFormat,
+    format: AnalysisFormat,
     use_rth: bool,
 }
 
@@ -534,7 +542,7 @@ fn classify_paths_format(tokens: &[String]) -> Result<StatTokens> {
     for token in tokens {
         if token == RTH_TOKEN {
             use_rth = true;
-        } else if let Some(parsed) = OutputFormat::parse(token) {
+        } else if let Some(parsed) = AnalysisFormat::parse(token) {
             if format.replace(parsed).is_some() {
                 bail!("multiple output format tokens given");
             }
@@ -552,7 +560,7 @@ fn classify_paths_format(tokens: &[String]) -> Result<StatTokens> {
 struct BarsTokens {
     paths: Vec<String>,
     interval: Option<Interval>,
-    format: OutputFormat,
+    format: AnalysisFormat,
     use_rth: bool,
 }
 
@@ -568,7 +576,7 @@ fn classify_with_interval(tokens: &[String]) -> Result<BarsTokens> {
             if interval.replace(parsed?).is_some() {
                 bail!("multiple interval tokens given");
             }
-        } else if let Some(parsed) = OutputFormat::parse(token) {
+        } else if let Some(parsed) = AnalysisFormat::parse(token) {
             if format.replace(parsed).is_some() {
                 bail!("multiple output format tokens given");
             }
@@ -588,7 +596,7 @@ struct CalcTokens {
     paths: Vec<String>,
     interval: Option<Interval>,
     specs: Vec<String>,
-    format: OutputFormat,
+    format: AnalysisFormat,
     use_rth: bool,
 }
 
@@ -608,7 +616,7 @@ fn classify_calc(tokens: &[String]) -> Result<CalcTokens> {
         } else if let Some(parsed) = parse_spec(token) {
             parsed?; // validate now; rebuilt per symbol later
             specs.push(token.clone());
-        } else if let Some(parsed) = OutputFormat::parse(token) {
+        } else if let Some(parsed) = AnalysisFormat::parse(token) {
             if format.replace(parsed).is_some() {
                 bail!("multiple output format tokens given");
             }

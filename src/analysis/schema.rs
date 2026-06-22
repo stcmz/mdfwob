@@ -26,6 +26,38 @@ pub fn unscale_price(raw: u32) -> f64 {
     f64::from(raw) / PRICE_SCALE
 }
 
+/// Sentinel stored for an absent (`None`) calc value. It is the minimum of the column's
+/// signed integer type, which fwob's formatter renders as `-` / `null` / empty.
+pub const CALC_NULL: i32 = i32::MIN;
+
+/// Scales a finite value into an `i32` fixed-point representation with `decimals` fractional
+/// digits, clamped to the representable range (never the null sentinel).
+pub fn scale_fixed(value: f64, decimals: u8) -> i32 {
+    let scaled = (value * 10f64.powi(i32::from(decimals))).round();
+    if scaled >= f64::from(i32::MAX) {
+        i32::MAX
+    } else if scaled <= f64::from(i32::MIN + 1) {
+        i32::MIN + 1
+    } else {
+        scaled as i32
+    }
+}
+
+/// Builds a render-only display schema that prepends a 1-byte `Symbol` string-table column to
+/// `base`, shifting every field by one byte. Used only for multi-symbol stdout rendering; the
+/// resulting frames are never written to a file.
+pub fn with_symbol_column(base: &Schema) -> Schema {
+    let mut fields = Vec::with_capacity(base.fields.len() + 1);
+    fields.push(Field::new("Symbol", FieldType::StringTableIndex, 1, 0));
+    for field in &base.fields {
+        let mut shifted = field.clone();
+        shifted.offset += 1;
+        fields.push(shifted);
+    }
+    Schema::new(base.frame_type.clone(), fields, base.key_field_index + 1)
+        .expect("symbol-prefixed display schema is valid")
+}
+
 /// The OHLCV bar schema used by `bars --format fwob`.
 pub fn bar_schema() -> Schema {
     Schema::new(
@@ -41,10 +73,14 @@ pub fn bar_schema() -> Schema {
                 .with_semantic(FieldSemantic::FixedPoint(4)),
             Field::new("Close", FieldType::UnsignedInteger, 4, 16)
                 .with_semantic(FieldSemantic::FixedPoint(4)),
-            Field::new("Volume", FieldType::SignedInteger, 8, 20),
+            // FixedPoint(0) is display-only: it comma-groups the integer (and never nulls,
+            // since Volume is never i64::MIN).
+            Field::new("Volume", FieldType::SignedInteger, 8, 20)
+                .with_semantic(FieldSemantic::FixedPoint(0)),
             Field::new("VWAP", FieldType::UnsignedInteger, 4, 28)
                 .with_semantic(FieldSemantic::FixedPoint(4)),
-            Field::new("Trades", FieldType::UnsignedInteger, 8, 32),
+            Field::new("Trades", FieldType::UnsignedInteger, 8, 32)
+                .with_semantic(FieldSemantic::FixedPoint(0)),
         ],
         0,
     )
@@ -79,9 +115,10 @@ pub fn decode_bar(bytes: &[u8]) -> Result<Bar> {
     })
 }
 
-/// The schema used by `calc --format fwob`: time, close, then one `f64` column
-/// per indicator. `None` values are stored as `NaN`.
-pub fn calc_schema(columns: &[String]) -> Result<Schema> {
+/// The schema used by `calc`: time, close, then one 4-byte `i32` fixed-point column per
+/// indicator (precision `decimals[i]`). Absent values are stored as [`CALC_NULL`].
+pub fn calc_schema(names: &[String], decimals: &[u8]) -> Result<Schema> {
+    assert_eq!(names.len(), decimals.len(), "names and decimals must align");
     let mut fields = vec![
         Field::new("Time", FieldType::UnsignedInteger, 4, 0)
             .with_semantic(FieldSemantic::UnixTimestamp(TimestampUnit::Seconds)),
@@ -89,19 +126,31 @@ pub fn calc_schema(columns: &[String]) -> Result<Schema> {
             .with_semantic(FieldSemantic::FixedPoint(4)),
     ];
     let mut offset = 8u32;
-    for name in columns {
-        fields.push(Field::new(name, FieldType::FloatingPoint, 8, offset));
-        offset += 8;
+    for (name, &points) in names.iter().zip(decimals) {
+        fields.push(
+            Field::new(name, FieldType::SignedInteger, 4, offset)
+                .with_semantic(FieldSemantic::FixedPoint(points)),
+        );
+        offset += 4;
     }
     Ok(Schema::new(CALC_FRAME_TYPE, fields, 0)?)
 }
 
-pub fn encode_calc_row(time: u32, close: f64, values: &[Option<f64>], out: &mut Vec<u8>) {
+pub fn encode_calc_row(
+    time: u32,
+    close: f64,
+    values: &[Option<f64>],
+    decimals: &[u8],
+    out: &mut Vec<u8>,
+) {
     out.extend_from_slice(&time.to_le_bytes());
     out.extend_from_slice(&scale_price(close).to_le_bytes());
-    for value in values {
-        let v = value.unwrap_or(f64::NAN);
-        out.extend_from_slice(&v.to_le_bytes());
+    for (value, &points) in values.iter().zip(decimals) {
+        let raw = match value {
+            Some(v) if v.is_finite() => scale_fixed(*v, points),
+            _ => CALC_NULL,
+        };
+        out.extend_from_slice(&raw.to_le_bytes());
     }
 }
 
@@ -133,8 +182,33 @@ mod tests {
 
     #[test]
     fn calc_schema_offsets_are_contiguous() {
-        let schema = calc_schema(&["sma_20".into(), "rsi_14".into()]).unwrap();
-        assert_eq!(schema.frame_len, 8 + 8 + 8);
+        let schema = calc_schema(&["sma_20".into(), "rsi_14".into()], &[4, 8]).unwrap();
+        assert_eq!(schema.frame_len, 8 + 4 + 4);
         assert_eq!(schema.fields.len(), 4);
+        assert_eq!(
+            schema.fields[3].semantic,
+            FieldSemantic::FixedPoint(8),
+            "indicator precision should be carried into the schema"
+        );
+    }
+
+    #[test]
+    fn scale_fixed_rounds_and_clamps() {
+        assert_eq!(scale_fixed(1.23456789, 8), 123_456_789);
+        assert_eq!(scale_fixed(184.7, 4), 1_847_000);
+        // Overflow clamps to the representable range, never the null sentinel.
+        assert_eq!(scale_fixed(1e9, 8), i32::MAX);
+        assert_eq!(scale_fixed(-1e9, 8), i32::MIN + 1);
+        assert_ne!(scale_fixed(-1e9, 8), CALC_NULL);
+    }
+
+    #[test]
+    fn symbol_display_schema_prepends_and_shifts() {
+        let display = with_symbol_column(&bar_schema());
+        assert_eq!(display.fields[0].name, "Symbol");
+        assert_eq!(display.fields[0].offset, 0);
+        assert_eq!(display.fields[1].name, "Time");
+        assert_eq!(display.fields[1].offset, 1);
+        assert_eq!(display.frame_len, BAR_FRAME_LEN + 1);
     }
 }

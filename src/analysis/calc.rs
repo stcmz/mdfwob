@@ -14,6 +14,11 @@ use crate::analysis::model::Bar;
 pub trait Indicator {
     fn name(&self) -> String;
     fn compute(&self, bars: &[Bar]) -> Vec<Option<f64>>;
+    /// Fixed-point decimal precision used when storing/rendering this column. Price-level
+    /// indicators keep 4 (fits i32 up to ±214,748); small-magnitude ones use 8.
+    fn decimals(&self) -> u8 {
+        4
+    }
 }
 
 fn closes(bars: &[Bar]) -> Vec<f64> {
@@ -163,6 +168,10 @@ impl Indicator for Returns {
         }
         out
     }
+
+    fn decimals(&self) -> u8 {
+        8
+    }
 }
 
 /// Rolling realized volatility: sample stdev of log returns over `period` bars.
@@ -193,6 +202,10 @@ impl Indicator for Volatility {
         }
         out
     }
+
+    fn decimals(&self) -> u8 {
+        8
+    }
 }
 
 fn sample_stdev(values: &[f64]) -> f64 {
@@ -208,6 +221,7 @@ fn sample_stdev(values: &[f64]) -> f64 {
 struct CustomIndicator<F> {
     name: String,
     func: F,
+    decimals: u8,
 }
 
 impl<F> Indicator for CustomIndicator<F>
@@ -220,6 +234,10 @@ where
 
     fn compute(&self, bars: &[Bar]) -> Vec<Option<f64>> {
         (self.func)(bars)
+    }
+
+    fn decimals(&self) -> u8 {
+        self.decimals
     }
 }
 
@@ -265,6 +283,8 @@ pub fn parse_spec(token: &str) -> Option<Result<Box<dyn Indicator>>> {
 pub struct CalcColumn {
     pub name: String,
     pub values: Vec<Option<f64>>,
+    /// Fixed-point precision used to store/render this column.
+    pub decimals: u8,
 }
 
 /// The result of running a [`Calc`] pipeline.
@@ -312,14 +332,23 @@ impl<'a> Calc<'a> {
         self
     }
 
-    /// Adds a custom column computed by a user-supplied closure.
-    pub fn with_fn<F>(mut self, name: impl Into<String>, func: F) -> Self
+    /// Adds a custom column computed by a user-supplied closure (8-decimal precision).
+    pub fn with_fn<F>(self, name: impl Into<String>, func: F) -> Self
+    where
+        F: Fn(&[Bar]) -> Vec<Option<f64>> + 'a,
+    {
+        self.with_fn_decimals(name, 8, func)
+    }
+
+    /// Adds a custom column with an explicit fixed-point precision.
+    pub fn with_fn_decimals<F>(mut self, name: impl Into<String>, decimals: u8, func: F) -> Self
     where
         F: Fn(&[Bar]) -> Vec<Option<f64>> + 'a,
     {
         self.indicators.push(Box::new(CustomIndicator {
             name: name.into(),
             func,
+            decimals,
         }));
         self
     }
@@ -332,6 +361,7 @@ impl<'a> Calc<'a> {
             .map(|indicator| CalcColumn {
                 name: indicator.name(),
                 values: indicator.compute(self.bars),
+                decimals: indicator.decimals(),
             })
             .collect();
         CalcOutput {
