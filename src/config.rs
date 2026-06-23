@@ -84,6 +84,12 @@ pub struct DownloadConfig {
     pub use_rth: bool,
     pub parallelism: usize,
     pub request_interval_ms: u64,
+    /// Exchange timezone (IANA name) used to align the download day-advance and to render the
+    /// download log timestamps. A trading day (pre-market through after-hours) lives entirely
+    /// within one local calendar day, so on an empty response advancing to the next *local*
+    /// midnight can never step over the following session — unlike a UTC-day jump, since US
+    /// after-hours crosses UTC midnight. Stored FWOB `Time` remains an absolute UTC epoch second.
+    pub timezone: String,
 }
 
 impl Default for DownloadConfig {
@@ -96,6 +102,7 @@ impl Default for DownloadConfig {
             use_rth: false,
             parallelism: 4,
             request_interval_ms: 3_000,
+            timezone: "America/New_York".into(),
         }
     }
 }
@@ -223,6 +230,19 @@ mod tests {
         let download = DownloadConfig::default();
         assert_eq!(download.provider, ProviderKind::Ibkr);
         assert_eq!(download.request_interval_ms, 3_000);
+    }
+
+    #[test]
+    fn download_timezone_defaults_to_new_york_and_overrides() {
+        assert_eq!(DownloadConfig::default().timezone, "America/New_York");
+        let config: Config = toml::from_str(
+            r#"
+                [download]
+                timezone = "Europe/London"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.download.timezone, "Europe/London");
     }
 
     #[test]

@@ -183,32 +183,68 @@ impl Accumulator {
     }
 }
 
+/// Incremental tick → bar resampler. Feed ascending ticks with [`Resampler::push`] and read the
+/// bars out with [`Resampler::finish`]; ticks are never all held in memory at once.
+pub struct Resampler {
+    interval: Interval,
+    clock: BarClock,
+    current: Option<Accumulator>,
+    /// Exclusive end of the open bucket, cached so the (potentially expensive) timezone bucket
+    /// computation runs once per bucket instead of once per tick.
+    bucket_end: u32,
+    bars: Vec<Bar>,
+}
+
+impl Resampler {
+    pub fn new(interval: Interval, clock: BarClock) -> Self {
+        Self {
+            interval,
+            clock,
+            current: None,
+            bucket_end: 0,
+            bars: Vec::new(),
+        }
+    }
+
+    pub fn push(&mut self, tick: &Tick) {
+        match &mut self.current {
+            // Ticks are ascending, so a tick belongs to the open bucket while `time < bucket_end`.
+            Some(acc) if tick.time < self.bucket_end => acc.update(tick),
+            _ => {
+                if let Some(acc) = self.current.take() {
+                    self.bars.push(acc.finish());
+                }
+                let start = self.clock.bucket_start(self.interval, tick.time);
+                self.bucket_end = self
+                    .clock
+                    .advance(self.interval, start)
+                    .max(start.saturating_add(1));
+                self.current = Some(Accumulator::new(start, tick));
+            }
+        }
+    }
+
+    pub fn finish(mut self, fill: bool) -> Vec<Bar> {
+        if let Some(acc) = self.current.take() {
+            self.bars.push(acc.finish());
+        }
+        if fill && self.bars.len() > 1 {
+            forward_fill(&self.bars, self.interval, &self.clock)
+        } else {
+            self.bars
+        }
+    }
+}
+
 /// Resamples ascending ticks into bars at `interval`, anchoring buckets per
 /// `clock`. When `fill` is set, every empty interval between the first and last
 /// bar is forward-filled (a flat bar at the previous close, zero volume).
 pub fn resample(ticks: &[Tick], interval: Interval, fill: bool, clock: &BarClock) -> Vec<Bar> {
-    let mut bars = Vec::new();
-    let mut current: Option<Accumulator> = None;
+    let mut resampler = Resampler::new(interval, clock.clone());
     for tick in ticks {
-        let bucket = clock.bucket_start(interval, tick.time);
-        match &mut current {
-            Some(acc) if acc.time == bucket => acc.update(tick),
-            _ => {
-                if let Some(acc) = current.take() {
-                    bars.push(acc.finish());
-                }
-                current = Some(Accumulator::new(bucket, tick));
-            }
-        }
+        resampler.push(tick);
     }
-    if let Some(acc) = current {
-        bars.push(acc.finish());
-    }
-
-    if fill && bars.len() > 1 {
-        bars = forward_fill(&bars, interval, clock);
-    }
-    bars
+    resampler.finish(fill)
 }
 
 fn forward_fill(bars: &[Bar], interval: Interval, clock: &BarClock) -> Vec<Bar> {

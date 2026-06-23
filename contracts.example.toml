@@ -20,6 +20,7 @@ end = "2026-06-09T00:00:00Z" # Optional fixed cutoff; omit to use the current ti
 use_rth = false # false includes all available hours; Databento currently requires false.
 parallelism = 4 # Maximum number of contracts processed concurrently.
 request_interval_ms = 3000 # Global minimum spacing between provider requests.
+timezone = "America/New_York" # Exchange tz for day-advance alignment and log timestamps (stored Time stays UTC).
 
 # Symbols in one stock group share currency and exchange properties.
 [[stocks]]

@@ -5,18 +5,22 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use fwob::{FormatVersion, detect_format};
 
+use std::collections::BTreeMap;
+
 use crate::{
     analysis::{
-        Tick,
         calc::{Calc, parse_spec, summarize},
         config::{AnalysisConfig, DEFAULT_EXTENDED_HOURS, DEFAULT_RTH_HOURS, ReturnMethod},
         interval::Interval,
         model::Bar,
         output::{AnalysisFormat, BarSeries, CalcSeries, write_bars, write_calc, write_stat},
-        read::{InputKind, TickQuery, discover_inputs, input_kind, read_bars, read_ticks},
-        resample::{BarClock, resample},
+        read::{
+            InputKind, TickQuery, discover_inputs, input_kind, open_tick_reader, read_bars,
+            stream_ticks,
+        },
+        resample::{BarClock, Resampler},
         session::Session,
-        stat::compute_stat,
+        stat::StatAccumulator,
     },
     config::{Config, StockContractConfig},
     downloader::{DownloadPlan, Downloader},
@@ -104,6 +108,11 @@ struct DownloadArgs {
     #[arg(long)]
     end: Option<String>,
 
+    /// Exchange timezone (IANA name) for day-advance alignment and log timestamps.
+    /// Defaults to the config value (America/New_York).
+    #[arg(long)]
+    timezone: Option<String>,
+
     /// Download regular trading hours only.
     #[arg(long)]
     rth: bool,
@@ -180,6 +189,9 @@ impl DownloadArgs {
         }
         if let Some(request_interval_ms) = self.request_interval_ms {
             config.download.request_interval_ms = request_interval_ms;
+        }
+        if let Some(timezone) = self.timezone {
+            config.download.timezone = timezone;
         }
 
         let mut fwob = parsed.options;
@@ -294,17 +306,15 @@ impl StatArgs {
         let mut rows = Vec::new();
         let mut failures = 0u32;
         for path in &files {
-            match read_ticks(path, &query) {
-                Ok((symbol, ticks)) => {
-                    let format_label = format_label(path)?;
-                    rows.push(compute_stat(
-                        symbol,
-                        format_label,
-                        &ticks,
-                        max_gap,
-                        &session,
-                    ));
-                }
+            let result = (|| -> Result<_> {
+                let (mut reader, symbol) = open_tick_reader(path)?;
+                let format_label = format_label(path)?;
+                let mut acc = StatAccumulator::new(max_gap, &session);
+                stream_ticks(&mut reader, &query, |tick| acc.push(&tick))?;
+                Ok(acc.finish(symbol, format_label))
+            })();
+            match result {
+                Ok(row) => rows.push(row),
                 Err(error) => {
                     failures += 1;
                     tracing::error!(path = %path.display(), error = %format!("{error:#}"), "failed to read");
@@ -373,12 +383,26 @@ impl BarsArgs {
             session: use_rth.then(|| session.clone()),
         };
 
-        let groups = load_tick_groups(&files, &query);
-        let series: Vec<BarSeries> = groups
+        // Stream each file's ticks straight into a per-symbol resampler so a file's ticks are
+        // never all held in memory (multi-GB tick files only retain the resulting bars).
+        let mut resamplers: BTreeMap<String, Resampler> = BTreeMap::new();
+        for path in &files {
+            let result = (|| -> Result<()> {
+                let (mut reader, symbol) = open_tick_reader(path)?;
+                let resampler = resamplers
+                    .entry(symbol)
+                    .or_insert_with(|| Resampler::new(interval, clock.clone()));
+                stream_ticks(&mut reader, &query, |tick| resampler.push(&tick))
+            })();
+            if let Err(error) = result {
+                tracing::error!(path = %path.display(), error = %format!("{error:#}"), "failed to read");
+            }
+        }
+        let series: Vec<BarSeries> = resamplers
             .into_iter()
-            .map(|(symbol, ticks)| BarSeries {
+            .map(|(symbol, resampler)| BarSeries {
                 symbol,
-                bars: resample(&ticks, interval, fill, &clock),
+                bars: resampler.finish(fill),
             })
             .collect();
 
@@ -469,10 +493,28 @@ impl CalcArgs {
         let (start, end) = parse_bounds(self.start.as_deref(), self.end.as_deref())?;
         let files = resolve_files(&paths, &acfg)?;
 
-        let mut groups: std::collections::BTreeMap<String, Vec<Bar>> =
-            std::collections::BTreeMap::new();
+        let mut groups: BTreeMap<String, Vec<Bar>> = BTreeMap::new();
         for path in &files {
-            match load_bars_for_calc(path, interval, fill, &filter, start, end, &clock) {
+            let result = (|| -> Result<(String, Vec<Bar>)> {
+                match input_kind(path)? {
+                    InputKind::Bar => read_bars(path),
+                    InputKind::Tick => {
+                        let interval = interval.context(
+                            "an interval token is required to resample a tick file (e.g. 5m, 1h, 1d)",
+                        )?;
+                        let (mut reader, symbol) = open_tick_reader(path)?;
+                        let query = TickQuery {
+                            start,
+                            end,
+                            session: filter.clone(),
+                        };
+                        let mut resampler = Resampler::new(interval, clock.clone());
+                        stream_ticks(&mut reader, &query, |tick| resampler.push(&tick))?;
+                        Ok((symbol, resampler.finish(fill)))
+                    }
+                }
+            })();
+            match result {
                 Ok((symbol, mut bars)) => groups.entry(symbol).or_default().append(&mut bars),
                 Err(error) => {
                     tracing::error!(path = %path.display(), error = %format!("{error:#}"), "failed to read");
@@ -709,51 +751,6 @@ fn resolve_files(paths: &[String], acfg: &AnalysisConfig) -> Result<Vec<PathBuf>
         paths.to_vec()
     };
     discover_inputs(&tokens, &analysis_output_dir(acfg))
-}
-
-fn load_tick_groups(files: &[PathBuf], query: &TickQuery) -> Vec<(String, Vec<Tick>)> {
-    let mut groups: std::collections::BTreeMap<String, Vec<Tick>> =
-        std::collections::BTreeMap::new();
-    for path in files {
-        match read_ticks(path, query) {
-            Ok((symbol, mut ticks)) => groups.entry(symbol).or_default().append(&mut ticks),
-            Err(error) => {
-                tracing::error!(path = %path.display(), error = %format!("{error:#}"), "failed to read");
-            }
-        }
-    }
-    let mut out: Vec<(String, Vec<Tick>)> = groups.into_iter().collect();
-    for (_, ticks) in &mut out {
-        ticks.sort_by_key(|tick| tick.time);
-    }
-    out
-}
-
-#[allow(clippy::too_many_arguments)]
-fn load_bars_for_calc(
-    path: &Path,
-    interval: Option<Interval>,
-    fill: bool,
-    session: &Option<Session>,
-    start: Option<u32>,
-    end: Option<u32>,
-    clock: &BarClock,
-) -> Result<(String, Vec<Bar>)> {
-    match input_kind(path)? {
-        InputKind::Bar => read_bars(path),
-        InputKind::Tick => {
-            let interval = interval.context(
-                "an interval token is required to resample a tick file (e.g. 5m, 1h, 1d)",
-            )?;
-            let query = TickQuery {
-                start,
-                end,
-                session: session.clone(),
-            };
-            let (symbol, ticks) = read_ticks(path, &query)?;
-            Ok((symbol, resample(&ticks, interval, fill, clock)))
-        }
-    }
 }
 
 #[cfg(test)]

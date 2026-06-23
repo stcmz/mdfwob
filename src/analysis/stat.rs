@@ -19,11 +19,105 @@ pub struct StatRow {
     pub gaps: u64,
 }
 
-/// Computes the summary for one file's ticks.
+/// Incrementally accumulates summary statistics from a stream of ascending ticks, so a file's
+/// ticks never need to be materialized all at once.
 ///
-/// Gaps are counted only between consecutive ticks on the **same** local day
-/// (per `session`'s timezone) whose spacing exceeds `max_gap` seconds, so the
-/// overnight/weekend inter-day boundary is never miscounted as a gap.
+/// Gaps are counted only between consecutive ticks on the **same** local day (per `session`'s
+/// timezone) whose spacing exceeds `max_gap` seconds, so the overnight/weekend inter-day boundary
+/// is never miscounted as a gap.
+pub struct StatAccumulator<'a> {
+    session: &'a Session,
+    max_gap: u32,
+    count: u64,
+    first: Option<u32>,
+    last: u32,
+    prev_time: Option<u32>,
+    min: f64,
+    max: f64,
+    price_sum: f64,
+    weighted: f64,
+    volume: i64,
+    gaps: u64,
+}
+
+impl<'a> StatAccumulator<'a> {
+    pub fn new(max_gap: u32, session: &'a Session) -> Self {
+        Self {
+            session,
+            max_gap,
+            count: 0,
+            first: None,
+            last: 0,
+            prev_time: None,
+            min: f64::INFINITY,
+            max: f64::NEG_INFINITY,
+            price_sum: 0.0,
+            weighted: 0.0,
+            volume: 0,
+            gaps: 0,
+        }
+    }
+
+    pub fn push(&mut self, tick: &Tick) {
+        if self.first.is_none() {
+            self.first = Some(tick.time);
+        }
+        self.last = tick.time;
+        self.count += 1;
+        self.min = self.min.min(tick.price);
+        self.max = self.max.max(tick.price);
+        self.price_sum += tick.price;
+        self.weighted += tick.price * f64::from(tick.size);
+        self.volume += i64::from(tick.size);
+
+        if let Some(prev) = self.prev_time {
+            let delta = tick.time.saturating_sub(prev);
+            if delta > self.max_gap && self.session.day_key(prev) == self.session.day_key(tick.time)
+            {
+                self.gaps += 1;
+            }
+        }
+        self.prev_time = Some(tick.time);
+    }
+
+    pub fn finish(self, symbol: String, format: String) -> StatRow {
+        if self.count == 0 {
+            return StatRow {
+                symbol,
+                format,
+                ticks: 0,
+                first: None,
+                last: None,
+                min: f64::NAN,
+                max: f64::NAN,
+                mean: f64::NAN,
+                vwap: f64::NAN,
+                volume: 0,
+                gaps: 0,
+            };
+        }
+        let vwap = if self.volume != 0 {
+            self.weighted / self.volume as f64
+        } else {
+            f64::NAN
+        };
+        StatRow {
+            symbol,
+            format,
+            ticks: self.count,
+            first: self.first,
+            last: Some(self.last),
+            min: self.min,
+            max: self.max,
+            mean: self.price_sum / self.count as f64,
+            vwap,
+            volume: self.volume,
+            gaps: self.gaps,
+        }
+    }
+}
+
+/// Computes the summary for one file's ticks (convenience wrapper over [`StatAccumulator`]).
 pub fn compute_stat(
     symbol: String,
     format: String,
@@ -31,65 +125,11 @@ pub fn compute_stat(
     max_gap: u32,
     session: &Session,
 ) -> StatRow {
-    if ticks.is_empty() {
-        return StatRow {
-            symbol,
-            format,
-            ticks: 0,
-            first: None,
-            last: None,
-            min: f64::NAN,
-            max: f64::NAN,
-            mean: f64::NAN,
-            vwap: f64::NAN,
-            volume: 0,
-            gaps: 0,
-        };
+    let mut acc = StatAccumulator::new(max_gap, session);
+    for tick in ticks {
+        acc.push(tick);
     }
-
-    let mut min = f64::INFINITY;
-    let mut max = f64::NEG_INFINITY;
-    let mut price_sum = 0.0;
-    let mut weighted = 0.0;
-    let mut volume: i64 = 0;
-    let mut gaps = 0u64;
-
-    for (index, tick) in ticks.iter().enumerate() {
-        min = min.min(tick.price);
-        max = max.max(tick.price);
-        price_sum += tick.price;
-        weighted += tick.price * f64::from(tick.size);
-        volume += i64::from(tick.size);
-
-        if index > 0 {
-            let prev = &ticks[index - 1];
-            let delta = tick.time.saturating_sub(prev.time);
-            if delta > max_gap && session.day_key(prev.time) == session.day_key(tick.time) {
-                gaps += 1;
-            }
-        }
-    }
-
-    let count = ticks.len() as f64;
-    let vwap = if volume != 0 {
-        weighted / volume as f64
-    } else {
-        f64::NAN
-    };
-
-    StatRow {
-        symbol,
-        format,
-        ticks: ticks.len() as u64,
-        first: Some(ticks.first().unwrap().time),
-        last: Some(ticks.last().unwrap().time),
-        min,
-        max,
-        mean: price_sum / count,
-        vwap,
-        volume,
-        gaps,
-    }
+    acc.finish(symbol, format)
 }
 
 #[cfg(test)]

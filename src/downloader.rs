@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use jiff::tz::TimeZone;
 use time::OffsetDateTime;
 use tracing::{error, info, warn};
 
@@ -28,6 +29,7 @@ pub struct DownloadPlan {
     contracts: Vec<StockContract>,
     configured_start: Option<OffsetDateTime>,
     configured_end: Option<OffsetDateTime>,
+    timezone: TimeZone,
 }
 
 impl DownloadPlan {
@@ -60,12 +62,15 @@ impl DownloadPlan {
             bail!("no stock or option contracts selected");
         }
         validate_output_titles(&contracts)?;
+        let timezone = TimeZone::get(&config.download.timezone)
+            .with_context(|| format!("invalid download.timezone {:?}", config.download.timezone))?;
         Ok(Self {
             config,
             fwob,
             contracts,
             configured_start,
             configured_end,
+            timezone,
         })
     }
 }
@@ -231,6 +236,7 @@ fn run_with_provider(
         configured_end: plan.configured_end,
         use_rth: plan.config.download.use_rth,
         reconnect_timeout_seconds: plan.config.ibkr.reconnect_timeout_seconds,
+        timezone: &plan.timezone,
         cancel,
         pacer,
     };
@@ -295,6 +301,8 @@ struct SymbolDownloader<'a, P> {
     /// IBKR reconnect retry budget: -1 retries forever, 0 disables retries, and a
     /// positive value caps the wall-clock seconds spent retrying a single request.
     reconnect_timeout_seconds: i64,
+    /// Exchange timezone that anchors the day-advance and log timestamps.
+    timezone: &'a TimeZone,
     cancel: &'a CancellationToken,
     pacer: &'a RequestPacer,
 }
@@ -317,8 +325,8 @@ impl<P: MarketDataProvider> SymbolDownloader<'_, P> {
         info!(
             symbol = %contract.symbol,
             output = %store.path().display(),
-            start = %cursor,
-            end = %self.configured_end.map_or_else(|| "dynamic-now".to_string(), |end| end.to_string()),
+            start = %fmt_in_tz(cursor, self.timezone),
+            end = %self.configured_end.map_or_else(|| "dynamic-now".to_string(), |end| fmt_in_tz(end, self.timezone)),
             "downloading symbol"
         );
 
@@ -383,8 +391,13 @@ impl<P: MarketDataProvider> SymbolDownloader<'_, P> {
                 if provider_returned_ticks {
                     break;
                 }
-                cursor += time::Duration::days(1);
-                info!(symbol = %contract.symbol, next = %cursor, "empty response; advanced one day");
+                // Advance to the start of the next calendar day in the EXCHANGE timezone. A
+                // trading day (pre-market through after-hours) lives within one local day, so its
+                // local midnight always precedes the next session's pre-market -- the advance can
+                // never step over a session. A UTC-day jump cannot guarantee this because US
+                // after-hours crosses UTC midnight (more so in winter, ending 01:00 UTC).
+                cursor = next_day_start(cursor, self.timezone)?;
+                info!(symbol = %contract.symbol, next = %fmt_in_tz(cursor, self.timezone), "empty response; advanced to next day");
                 continue;
             }
 
@@ -398,7 +411,7 @@ impl<P: MarketDataProvider> SymbolDownloader<'_, P> {
             writer.append_ticks(&frames)?;
             appended += count as u64;
             cursor = OffsetDateTime::from_unix_timestamp(i64::from(last_second) + 1)?;
-            info!(symbol = %contract.symbol, count, next = %cursor, "appended ticks");
+            info!(symbol = %contract.symbol, count, next = %fmt_in_tz(cursor, self.timezone), "appended ticks");
         }
         Ok(appended)
     }
@@ -501,6 +514,36 @@ fn validate_provider_batch(
 
 fn resolve_end(configured_end: Option<OffsetDateTime>) -> OffsetDateTime {
     configured_end.unwrap_or_else(OffsetDateTime::now_utc)
+}
+
+/// UTC instant of the start of the calendar day *after* `cursor`'s local day in `tz`. Always
+/// strictly after `cursor` (so the download loop makes progress), and — because a trading day
+/// lives within one local day — never past the next session's first tick.
+fn next_day_start(cursor: OffsetDateTime, tz: &TimeZone) -> Result<OffsetDateTime> {
+    let timestamp = jiff::Timestamp::from_second(cursor.unix_timestamp())
+        .context("cursor timestamp is out of range")?;
+    let next_date = timestamp
+        .to_zoned(tz.clone())
+        .date()
+        .tomorrow()
+        .context("date overflow while advancing past an empty day")?;
+    let start = next_date
+        .to_zoned(tz.clone())
+        .context("next local day has no valid start instant")?;
+    OffsetDateTime::from_unix_timestamp(start.timestamp().as_second())
+        .context("next day start is out of range")
+}
+
+/// Renders a UTC instant as a local wall-clock string in `tz` (with the zone abbreviation), for
+/// human-readable download logs. The stored FWOB value is unaffected — only logging.
+fn fmt_in_tz(instant: OffsetDateTime, tz: &TimeZone) -> String {
+    match jiff::Timestamp::from_second(instant.unix_timestamp()) {
+        Ok(timestamp) => timestamp
+            .to_zoned(tz.clone())
+            .strftime("%Y-%m-%d %H:%M:%S %Z")
+            .to_string(),
+        Err(_) => instant.to_string(),
+    }
 }
 
 fn provider_tick_to_short_tick(tick: ProviderTick, symbol: &str) -> Result<ShortTick> {
@@ -824,6 +867,7 @@ mod tests {
             configured_end,
             use_rth: false,
             reconnect_timeout_seconds,
+            timezone: &TimeZone::UTC,
             cancel,
             pacer,
         }
@@ -1100,6 +1144,7 @@ mod tests {
             configured_end: Some(base + time::Duration::seconds(3)),
             use_rth: false,
             reconnect_timeout_seconds: -1,
+            timezone: &TimeZone::UTC,
             cancel: &cancel,
             pacer: &pacer,
         }
@@ -1110,6 +1155,128 @@ mod tests {
         assert_eq!(
             provider.starts.lock().unwrap().as_slice(),
             &[base, base + time::Duration::seconds(2),]
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn next_day_start_aligns_to_exchange_midnight_across_dst() {
+        let tz = TimeZone::get("America/New_York").unwrap();
+        let utc = |month, day, hour, minute| {
+            time::Date::from_calendar_date(2026, month, day)
+                .unwrap()
+                .with_hms(hour, minute, 0)
+                .unwrap()
+                .assume_utc()
+        };
+        // Winter (EST, UTC-5): cursor at after-hours close 01:00 UTC Jan 7 (20:00 ET Jan 6) lands
+        // on NY date Jan 6, so the next NY midnight is 00:00 EST Jan 7 == 05:00 UTC Jan 7.
+        assert_eq!(
+            next_day_start(utc(time::Month::January, 7, 1, 0), &tz).unwrap(),
+            utc(time::Month::January, 7, 5, 0)
+        );
+        // Summer (EDT, UTC-4): cursor at 23:59 UTC Jun 16 (19:59 ET Jun 16) -> next NY midnight is
+        // 00:00 EDT Jun 17 == 04:00 UTC Jun 17.
+        assert_eq!(
+            next_day_start(utc(time::Month::June, 16, 23, 59), &tz).unwrap(),
+            utc(time::Month::June, 17, 4, 0)
+        );
+        // A cursor already at a local midnight advances a full local day (never zero).
+        let midnight = utc(time::Month::June, 17, 4, 0);
+        assert!(next_day_start(midnight, &tz).unwrap() > midnight);
+    }
+
+    #[test]
+    fn empty_response_advances_to_next_exchange_day_without_skipping_data() {
+        // Reproduces the real IBKR data-loss case in WINTER (EST): a US trading day's after-hours
+        // runs to 20:00 ET = 01:00 UTC the next day, so after a session the cursor sits at ~01:00
+        // UTC. The provider returns empty for that odd start, and the day's data only comes back
+        // when the request begins at the exchange day's local midnight (05:00 UTC in EST). A UTC
+        // day-jump would land at 00:00 UTC the *following* day, skipping that whole session;
+        // advancing to the next New York midnight lands at 05:00 UTC and captures it.
+        struct ExchangeDayProvider {
+            magic_start: OffsetDateTime,
+            data_tick: OffsetDateTime,
+            starts: Mutex<Vec<OffsetDateTime>>,
+        }
+
+        impl MarketDataProvider for ExchangeDayProvider {
+            fn head_timestamp(
+                &self,
+                _contract: &StockContract,
+                _use_rth: bool,
+            ) -> Result<OffsetDateTime> {
+                unreachable!("configured start avoids head timestamp")
+            }
+
+            fn historical_trade_ticks(
+                &self,
+                _contract: &StockContract,
+                start: OffsetDateTime,
+                _end: OffsetDateTime,
+                _max_ticks: i32,
+                _use_rth: bool,
+                _cancel: &CancellationToken,
+            ) -> Result<Vec<ProviderTick>> {
+                self.starts.lock().unwrap().push(start);
+                if start == self.magic_start {
+                    Ok(vec![ProviderTick {
+                        timestamp: self.data_tick,
+                        price: 10.0,
+                        size: 1,
+                    }])
+                } else {
+                    Ok(Vec::new())
+                }
+            }
+        }
+
+        let tz = TimeZone::get("America/New_York").unwrap();
+        let utc = |month, day, hour, minute| {
+            time::Date::from_calendar_date(2026, month, day)
+                .unwrap()
+                .with_hms(hour, minute, 0)
+                .unwrap()
+                .assume_utc()
+        };
+        // EST is UTC-5, so New York midnight 2026-01-07 == 05:00 UTC. The cursor sits at the prior
+        // session's after-hours close (20:00 ET Jan 6 == 01:00 UTC Jan 7), on New York date Jan 6.
+        let cursor = utc(time::Month::January, 7, 1, 0);
+        let magic_start = utc(time::Month::January, 7, 5, 0); // NY midnight Jan 7
+        let data_tick = utc(time::Month::January, 7, 14, 30); // 09:30 ET regular session
+        let end = utc(time::Month::January, 8, 5, 0); // NY midnight Jan 8
+
+        let provider = ExchangeDayProvider {
+            magic_start,
+            data_tick,
+            starts: Mutex::new(Vec::new()),
+        };
+        let dir = temp_dir("mdfwob-exchange-day-advance");
+        let store = TickStore::new(&dir, "MSFT", FwobOptions::default());
+        let cancel = CancellationToken::new();
+        let pacer = RequestPacer::new(Duration::ZERO);
+
+        SymbolDownloader {
+            provider: &provider,
+            configured_start: Some(cursor),
+            configured_end: Some(end),
+            use_rth: false,
+            reconnect_timeout_seconds: -1,
+            timezone: &tz,
+            cancel: &cancel,
+            pacer: &pacer,
+        }
+        .download_symbol(&test_stock("MSFT"), &store)
+        .unwrap();
+
+        // The session's tick must be captured (not skipped); a UTC-day jump would have skipped it.
+        assert_eq!(
+            store.last_timestamp().unwrap(),
+            Some(data_tick.unix_timestamp() as u32)
+        );
+        assert!(
+            provider.starts.lock().unwrap().contains(&magic_start),
+            "a request must begin at the exchange day's local midnight (05:00 UTC)"
         );
         fs::remove_dir_all(dir).unwrap();
     }
@@ -1148,6 +1315,7 @@ mod tests {
             configured_end: Some(base + time::Duration::seconds(2)),
             use_rth: false,
             reconnect_timeout_seconds: -1,
+            timezone: &TimeZone::UTC,
             cancel: &cancel,
             pacer: &pacer,
         }
@@ -1197,6 +1365,7 @@ mod tests {
             configured_end: Some(end),
             use_rth: false,
             reconnect_timeout_seconds: -1,
+            timezone: &TimeZone::UTC,
             cancel: &cancel,
             pacer: &pacer,
         }
@@ -1241,6 +1410,7 @@ mod tests {
             configured_end: Some(base + time::Duration::seconds(2)),
             use_rth: false,
             reconnect_timeout_seconds: -1,
+            timezone: &TimeZone::UTC,
             cancel: &cancel,
             pacer: &pacer,
         }
@@ -1285,6 +1455,7 @@ mod tests {
             configured_end: Some(base + time::Duration::seconds(10)),
             use_rth: false,
             reconnect_timeout_seconds: -1,
+            timezone: &TimeZone::UTC,
             cancel: &cancel,
             pacer: &pacer,
         }

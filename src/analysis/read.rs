@@ -70,51 +70,74 @@ pub fn input_kind(path: &Path) -> Result<InputKind> {
     detect_kind(&reader)
 }
 
-/// Reads ticks from a file, applying the time-range and session filters.
-/// Returns the resolved symbol and the (ascending) ticks.
-pub fn read_ticks(path: &Path, query: &TickQuery) -> Result<(String, Vec<Tick>)> {
-    let mut reader =
+/// Opens a tick file, validating that it holds ticks (not bars). Returns the open reader and the
+/// resolved symbol, ready for [`stream_ticks`].
+pub fn open_tick_reader(path: &Path) -> Result<(Reader, String)> {
+    let reader =
         Reader::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     if detect_kind(&reader)? != InputKind::Tick {
         bail!("{} is a bar file, not a tick file", path.display());
     }
     let symbol = symbol_of(path, reader.title());
+    Ok((reader, symbol))
+}
+
+/// Reads ticks from a file, applying the time-range and session filters.
+/// Returns the resolved symbol and the (ascending) ticks.
+pub fn read_ticks(path: &Path, query: &TickQuery) -> Result<(String, Vec<Tick>)> {
+    let (mut reader, symbol) = open_tick_reader(path)?;
     let mut ticks = Vec::new();
-    collect_ticks(&mut reader, query, &mut ticks)?;
+    stream_ticks(&mut reader, query, |tick| ticks.push(tick))?;
     Ok((symbol, ticks))
 }
 
-fn collect_ticks(reader: &mut Reader, query: &TickQuery, out: &mut Vec<Tick>) -> Result<()> {
-    let session = query.session.as_ref();
-    let push = |bytes: &[u8], out: &mut Vec<Tick>| {
-        let tick = decode_tick(bytes);
-        if session.is_none_or(|s| s.contains(tick.time)) {
-            out.push(tick);
-        }
+/// Target bulk-read size; reading frames in chunks avoids a per-frame heap allocation.
+const READ_CHUNK_BYTES: usize = 256 * 1024;
+
+/// Resolves the `[start, end)` frame index window for a key range, or `None` for an empty range.
+fn index_window(
+    reader: &mut Reader,
+    start: Option<u32>,
+    end: Option<u32>,
+) -> Result<Option<(u64, u64)>> {
+    let count = reader.frame_count();
+    let (lo, hi) = match (start, end) {
+        (Some(s), Some(e)) if s > e => return Ok(None),
+        (Some(s), Some(e)) => (
+            reader.lower_bound(Key::U32(s))?,
+            reader.upper_bound(Key::U32(e))?,
+        ),
+        (Some(s), None) => (reader.lower_bound(Key::U32(s))?, count),
+        (None, Some(e)) => (0, reader.upper_bound(Key::U32(e))?),
+        (None, None) => (0, count),
     };
-    match (query.start, query.end) {
-        (Some(s), Some(e)) if s > e => {}
-        (Some(s), Some(e)) => {
-            for frame in reader.frames_by_key(Key::U32(s)..=Key::U32(e))? {
-                push(frame?.bytes(), out);
+    Ok((lo < hi).then_some((lo, hi)))
+}
+
+/// Streams ticks from an open tick `reader` through `f`, applying the time-range and session
+/// filters, reading in bulk chunks so no per-frame allocation occurs and the full tick set is
+/// never materialized.
+pub fn stream_ticks(reader: &mut Reader, query: &TickQuery, mut f: impl FnMut(Tick)) -> Result<()> {
+    let session = query.session.as_ref();
+    let Some((lo, hi)) = index_window(reader, query.start, query.end)? else {
+        return Ok(());
+    };
+    let frame_len = reader.schema().frame_len as usize;
+    let batch = (READ_CHUNK_BYTES / frame_len.max(1)).max(1);
+    let mut index = lo;
+    while index < hi {
+        let want = ((hi - index) as usize).min(batch);
+        let raw = reader.read_raw_frames_chunk(index, want)?;
+        if raw.is_empty() {
+            break;
+        }
+        for bytes in raw.chunks_exact(frame_len) {
+            let tick = decode_tick(bytes);
+            if session.is_none_or(|s| s.contains(tick.time)) {
+                f(tick);
             }
         }
-        (Some(s), None) => {
-            for frame in reader.frames_after(Key::U32(s))? {
-                push(frame?.bytes(), out);
-            }
-        }
-        (None, Some(e)) => {
-            for frame in reader.frames_before(Key::U32(e))? {
-                push(frame?.bytes(), out);
-            }
-        }
-        (None, None) => {
-            let count = reader.frame_count();
-            for frame in reader.frames(0..count)? {
-                push(frame?.bytes(), out);
-            }
-        }
+        index += (raw.len() / frame_len) as u64;
     }
     Ok(())
 }
@@ -128,9 +151,20 @@ pub fn read_bars(path: &Path) -> Result<(String, Vec<Bar>)> {
     }
     let symbol = symbol_of(path, reader.title());
     let count = reader.frame_count();
+    let frame_len = reader.schema().frame_len as usize;
+    let batch = (READ_CHUNK_BYTES / frame_len.max(1)).max(1);
     let mut bars = Vec::with_capacity(count as usize);
-    for frame in reader.frames(0..count)? {
-        bars.push(decode_bar(frame?.bytes())?);
+    let mut index = 0u64;
+    while index < count {
+        let want = ((count - index) as usize).min(batch);
+        let raw = reader.read_raw_frames_chunk(index, want)?;
+        if raw.is_empty() {
+            break;
+        }
+        for bytes in raw.chunks_exact(frame_len) {
+            bars.push(decode_bar(bytes)?);
+        }
+        index += (raw.len() / frame_len) as u64;
     }
     Ok((symbol, bars))
 }
