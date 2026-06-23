@@ -150,10 +150,12 @@ files; no path uses the current directory. `--start`/`--end` accept a date
 
 ```text
 mdfwob stat data/ md rth
+mdfwob bars AAPL.fwob                  # 1d bars (the default period)
 mdfwob bars AAPL.fwob 5m
 mdfwob bars AAPL.fwob 1w               # weekly bars (calendar week, exchange tz)
 mdfwob bars data/ 1mo fwob --output bars/
-mdfwob bars AAPL.fwob 5m rth fill           # RTH bars, forward-fill gaps in-session
+mdfwob bars AAPL.fwob 5m rth fill            # RTH bars, forward-fill gaps in-session
+mdfwob bars AAPL.fwob 1h 2026-01-01..2026-02-01  # range token (exchange tz, end exclusive)
 mdfwob calc AAPL.fwob 1d rth ret:log vol:20 sma:20 rsi:14 --summary
 mdfwob calc bars/AAPL.fwob sma:20            # a bar file needs no interval
 ```
@@ -161,7 +163,8 @@ mdfwob calc bars/AAPL.fwob sma:20            # a bar file needs no interval
 - **`stat`** prints one summary row per tick file: symbol, format, tick count,
   time range, price min/max/mean, VWAP, signed volume, and intra-day gap count.
 - **`bars`** resamples ticks into OHLCV(+VWAP, trades) bars, streaming each row
-  to stdout as its bucket closes. **Sub-day intervals (s/m/h) are anchored to the
+  to stdout as its bucket closes; with no interval token it defaults to `1d`.
+  **Sub-day intervals (s/m/h) are anchored to the
   session open** in the exchange timezone, so e.g. RTH `1h` bars start 09:30,
   10:30, …; **day, week, month, and year intervals are calendar-aligned in the
   exchange timezone** (DST-correct) — week to Monday, month to the 1st, year to
@@ -185,8 +188,12 @@ exchange timezone (DST-correct), defaulting to `09:30-16:00 America/New_York`
 (extended hours default to `04:00-20:00`); override with `--session HH:MM-HH:MM`
 and `--tz NAME`. That timezone also anchors day/week/month/year bars even when
 `--use-rth` is off, so such a bar's timestamp is the start of the period in UTC
-(e.g. ET midnight = `05:00:00Z` in winter). Gap counting in `stat` only counts intra-day
-gaps, so the overnight/weekend boundary is never miscounted. `bars` and `calc`
+(e.g. ET midnight = `05:00:00Z` in winter). Restrict the time window with
+`--start`/`--end` or a positional `START..END` token (either side optional, e.g.
+`2024-01-01..2026-01-01` or `..2026-01-01`); a bare date or date-time is read in
+the exchange timezone (add `Z` or a `±HH` offset for an absolute instant), and a
+bare end date includes the whole local day. Gap counting in `stat` only counts
+intra-day gaps, so the overnight/weekend boundary is never miscounted. `bars` and `calc`
 render through fwob's formatter, so their output matches `fwob dump` of the
 equivalent `.fwob`: `table`/`md` show fixed-point values and a UTC RFC3339
 datetime (`Time`); `csv`/`jsonl`/`raw` carry the exact stored integers (prices

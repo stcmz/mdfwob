@@ -258,27 +258,36 @@ impl VerifyArgs {
 }
 
 #[derive(Debug, Args)]
-#[command(override_usage = "mdfwob stat [CONFIG.toml] [PATHS_OR_SYMBOLS...] [FORMAT] [OPTIONS]")]
+#[command(
+    override_usage = "mdfwob stat [CONFIG.toml] [PATHS_OR_SYMBOLS...] [START..END] [FORMAT] [OPTIONS]"
+)]
+#[command(after_help = "Tokens (case-sensitive, any order):
+  paths/symbols: FILE.fwob, a DIR, or a bare SYMBOL (resolved under output_dir)
+  formats: table (default), csv, md, jsonl
+  session: rth (keep only regular-trading-hours ticks)
+  time range: START..END (either side optional), e.g. 2024-01-01..2026-01-01 or ..2026-01-01
+              bare dates/times use the exchange tz; add Z or +/-HH for an absolute instant")]
 struct StatArgs {
-    /// Start of the time window (YYYY-MM-DD or RFC3339, UTC).
+    /// Window start. Bare dates/times use the exchange tz; add Z or +/-HH for an absolute
+    /// instant. Overrides the start side of a START..END token.
     #[arg(long)]
     start: Option<String>,
-    /// End of the time window (YYYY-MM-DD or RFC3339, UTC). A bare date is inclusive.
+    /// Window end (a bare date is inclusive of the whole local day). Overrides a START..END token.
     #[arg(long)]
     end: Option<String>,
     /// Keep only regular-trading-hours ticks.
     #[arg(long = "use-rth")]
     use_rth: bool,
-    /// Override the session window (HH:MM-HH:MM).
+    /// Override the session window (HH:MM-HH:MM). Default 09:30-16:00 (rth) / 04:00-20:00.
     #[arg(long)]
     session: Option<String>,
-    /// Override the session timezone (IANA name).
+    /// Override the session timezone (IANA name). Default America/New_York.
     #[arg(long)]
     tz: Option<String>,
-    /// Intra-day tick spacing (seconds) above which a gap is counted.
+    /// Intra-day tick spacing (seconds) above which a gap is counted. Default 60.
     #[arg(long = "max-gap")]
     max_gap: Option<u32>,
-    /// Optional CONFIG.toml, then files/dirs/symbols and an output format token.
+    /// Optional CONFIG.toml, then files/dirs/symbols and tokens (see below).
     #[arg(value_name = "ITEM", num_args = 0..)]
     items: Vec<String>,
 }
@@ -291,6 +300,8 @@ impl StatArgs {
             paths,
             format,
             use_rth,
+            start: range_start,
+            end: range_end,
         } = classify_paths_format(&tokens)?;
         let use_rth = self.use_rth || use_rth;
         let frame = match format {
@@ -298,7 +309,9 @@ impl StatArgs {
             AnalysisFormat::Frame(frame) => frame,
         };
         let session = resolve_session(&acfg, use_rth, self.session.as_deref(), self.tz.as_deref())?;
-        let (start, end) = parse_bounds(self.start.as_deref(), self.end.as_deref())?;
+        let start = self.start.clone().or(range_start);
+        let end = self.end.clone().or(range_end);
+        let (start, end) = parse_bounds(start.as_deref(), end.as_deref(), &session.time_zone())?;
         let max_gap = self.max_gap.unwrap_or(acfg.stat.max_gap);
         let files = resolve_files(&paths, &acfg)?;
         let query = TickQuery {
@@ -342,17 +355,31 @@ impl StatArgs {
 
 #[derive(Debug, Args)]
 #[command(
-    override_usage = "mdfwob bars [CONFIG.toml] [PATHS_OR_SYMBOLS...] INTERVAL [FORMAT] [OPTIONS]"
+    override_usage = "mdfwob bars [CONFIG.toml] [PATHS_OR_SYMBOLS...] [INTERVAL] [START..END] [FORMAT] [OPTIONS]"
 )]
+#[command(after_help = "Tokens (case-sensitive, any order):
+  paths/symbols: FILE.fwob, a DIR, or a bare SYMBOL (resolved under output_dir)
+  interval: e.g. 30s, 5m, 1h, 1d, 1w, 1mo, 1y (default 1d)
+  formats: table (default), csv, md, jsonl, raw, hex, fwob
+  session: rth (keep only regular-trading-hours ticks)
+  fill: forward-fill empty intervals within a session
+  time range: START..END (either side optional), e.g. 2024-01-01..2026-01-01 or ..2026-01-01
+              bare dates/times use the exchange tz; add Z or +/-HH for an absolute instant")]
 struct BarsArgs {
+    /// Window start. Bare dates/times use the exchange tz; add Z or +/-HH for an absolute
+    /// instant. Overrides the start side of a START..END token.
     #[arg(long)]
     start: Option<String>,
+    /// Window end (a bare date is inclusive of the whole local day). Overrides a START..END token.
     #[arg(long)]
     end: Option<String>,
+    /// Keep only regular-trading-hours ticks.
     #[arg(long = "use-rth")]
     use_rth: bool,
+    /// Override the session window (HH:MM-HH:MM). Default 09:30-16:00 (rth) / 04:00-20:00.
     #[arg(long)]
     session: Option<String>,
+    /// Override the session timezone (IANA name). Default America/New_York.
     #[arg(long)]
     tz: Option<String>,
     /// Output directory for `fwob` format (one `<symbol>.fwob` per symbol).
@@ -372,6 +399,8 @@ impl BarsArgs {
             format,
             use_rth,
             fill,
+            start: range_start,
+            end: range_end,
         } = classify_with_interval(&tokens)?;
         let use_rth = self.use_rth || use_rth;
         let interval = resolve_interval(interval_token, acfg.bars.interval.as_deref())?;
@@ -381,7 +410,9 @@ impl BarsArgs {
         let session = resolve_session(&acfg, use_rth, self.session.as_deref(), self.tz.as_deref())?;
         warn_uneven_interval(interval, &session, use_rth);
         let clock = BarClock::Session(session.clone());
-        let (start, end) = parse_bounds(self.start.as_deref(), self.end.as_deref())?;
+        let start = self.start.clone().or(range_start);
+        let end = self.end.clone().or(range_end);
+        let (start, end) = parse_bounds(start.as_deref(), end.as_deref(), &session.time_zone())?;
         let files = resolve_files(&paths, &acfg)?;
         let query = TickQuery {
             start,
@@ -506,26 +537,37 @@ fn fmt_session_len(seconds: u32) -> String {
 
 #[derive(Debug, Args)]
 #[command(
-    override_usage = "mdfwob calc [CONFIG.toml] [PATHS_OR_SYMBOLS...] [INTERVAL] SPEC... [FORMAT] [OPTIONS]"
+    override_usage = "mdfwob calc [CONFIG.toml] [PATHS_OR_SYMBOLS...] [INTERVAL] SPEC... [START..END] [FORMAT] [OPTIONS]"
 )]
-#[command(
-    after_help = "Indicator specs: sma:N ema:N rsi:N ret:log ret:simple vol:N
-INTERVAL (e.g. 5m, 1h, 1d) is required when an input is a tick file."
-)]
+#[command(after_help = "Tokens (case-sensitive, any order):
+  paths/symbols: FILE.fwob, a DIR, or a bare SYMBOL (resolved under output_dir)
+  indicator specs: sma:N ema:N rsi:N ret:log ret:simple vol:N
+  interval: e.g. 5m, 1h, 1d (resamples a tick file; default 1d; ignored for bar files)
+  formats: table (default), csv, md, jsonl, raw, hex, fwob
+  session: rth (keep only regular-trading-hours ticks)
+  fill: forward-fill empty intervals within a session
+  time range: START..END (either side optional), e.g. 2024-01-01..2026-01-01 or ..2026-01-01
+              bare dates/times use the exchange tz; add Z or +/-HH for an absolute instant")]
 struct CalcArgs {
+    /// Window start. Bare dates/times use the exchange tz; add Z or +/-HH for an absolute
+    /// instant. Overrides the start side of a START..END token.
     #[arg(long)]
     start: Option<String>,
+    /// Window end (a bare date is inclusive of the whole local day). Overrides a START..END token.
     #[arg(long)]
     end: Option<String>,
+    /// Keep only regular-trading-hours ticks.
     #[arg(long = "use-rth")]
     use_rth: bool,
+    /// Override the session window (HH:MM-HH:MM). Default 09:30-16:00 (rth) / 04:00-20:00.
     #[arg(long)]
     session: Option<String>,
+    /// Override the session timezone (IANA name). Default America/New_York.
     #[arg(long)]
     tz: Option<String>,
     #[arg(long)]
     output: Option<PathBuf>,
-    /// Return method for the --summary scalars (log|simple).
+    /// Return method for the --summary scalars (log|simple). Default log.
     #[arg(long)]
     method: Option<String>,
     /// Print a whole-series return/volatility summary footer.
@@ -534,6 +576,7 @@ struct CalcArgs {
     /// Annualize the summary realized volatility.
     #[arg(long)]
     annualize: bool,
+    /// Annualization factor for --annualize (sqrt scaling). Default 252.
     #[arg(long = "periods-per-year")]
     periods_per_year: Option<f64>,
     #[arg(value_name = "ITEM", num_args = 0..)]
@@ -551,6 +594,8 @@ impl CalcArgs {
             format,
             use_rth,
             fill,
+            start: range_start,
+            end: range_end,
         } = classify_calc(&tokens)?;
         let use_rth = self.use_rth || use_rth;
         if spec_tokens.is_empty() {
@@ -581,7 +626,9 @@ impl CalcArgs {
         }
         let clock = BarClock::Session(session.clone());
         let filter = use_rth.then(|| session.clone());
-        let (start, end) = parse_bounds(self.start.as_deref(), self.end.as_deref())?;
+        let start = self.start.clone().or(range_start);
+        let end = self.end.clone().or(range_end);
+        let (start, end) = parse_bounds(start.as_deref(), end.as_deref(), &session.time_zone())?;
         let files = resolve_files(&paths, &acfg)?;
 
         let mut groups: BTreeMap<String, Vec<Bar>> = BTreeMap::new();
@@ -679,15 +726,22 @@ struct StatTokens {
     paths: Vec<String>,
     format: AnalysisFormat,
     use_rth: bool,
+    start: Option<String>,
+    end: Option<String>,
 }
 
 fn classify_paths_format(tokens: &[String]) -> Result<StatTokens> {
     let mut paths = Vec::new();
     let mut format = None;
     let mut use_rth = false;
+    let mut range = None;
     for token in tokens {
         if token == RTH_TOKEN {
             use_rth = true;
+        } else if let Some(parsed) = parse_range_token(token) {
+            if range.replace(parsed).is_some() {
+                bail!("multiple time-range tokens given");
+            }
         } else if let Some(parsed) = AnalysisFormat::parse(token) {
             if format.replace(parsed).is_some() {
                 bail!("multiple output format tokens given");
@@ -696,10 +750,13 @@ fn classify_paths_format(tokens: &[String]) -> Result<StatTokens> {
             paths.push(token.clone());
         }
     }
+    let (start, end) = range.unwrap_or((None, None));
     Ok(StatTokens {
         paths,
         format: format.unwrap_or_default(),
         use_rth,
+        start,
+        end,
     })
 }
 
@@ -709,6 +766,8 @@ struct BarsTokens {
     format: AnalysisFormat,
     use_rth: bool,
     fill: bool,
+    start: Option<String>,
+    end: Option<String>,
 }
 
 fn classify_with_interval(tokens: &[String]) -> Result<BarsTokens> {
@@ -717,11 +776,16 @@ fn classify_with_interval(tokens: &[String]) -> Result<BarsTokens> {
     let mut format = None;
     let mut use_rth = false;
     let mut fill = false;
+    let mut range = None;
     for token in tokens {
         if token == RTH_TOKEN {
             use_rth = true;
         } else if token == FILL_TOKEN {
             fill = true;
+        } else if let Some(parsed) = parse_range_token(token) {
+            if range.replace(parsed).is_some() {
+                bail!("multiple time-range tokens given");
+            }
         } else if let Some(parsed) = Interval::parse(token) {
             if interval.replace(parsed?).is_some() {
                 bail!("multiple interval tokens given");
@@ -734,12 +798,15 @@ fn classify_with_interval(tokens: &[String]) -> Result<BarsTokens> {
             paths.push(token.clone());
         }
     }
+    let (start, end) = range.unwrap_or((None, None));
     Ok(BarsTokens {
         paths,
         interval,
         format: format.unwrap_or_default(),
         use_rth,
         fill,
+        start,
+        end,
     })
 }
 
@@ -750,6 +817,8 @@ struct CalcTokens {
     format: AnalysisFormat,
     use_rth: bool,
     fill: bool,
+    start: Option<String>,
+    end: Option<String>,
 }
 
 fn classify_calc(tokens: &[String]) -> Result<CalcTokens> {
@@ -759,11 +828,16 @@ fn classify_calc(tokens: &[String]) -> Result<CalcTokens> {
     let mut format = None;
     let mut use_rth = false;
     let mut fill = false;
+    let mut range = None;
     for token in tokens {
         if token == RTH_TOKEN {
             use_rth = true;
         } else if token == FILL_TOKEN {
             fill = true;
+        } else if let Some(parsed) = parse_range_token(token) {
+            if range.replace(parsed).is_some() {
+                bail!("multiple time-range tokens given");
+            }
         } else if let Some(parsed) = Interval::parse(token) {
             if interval.replace(parsed?).is_some() {
                 bail!("multiple interval tokens given");
@@ -779,6 +853,7 @@ fn classify_calc(tokens: &[String]) -> Result<CalcTokens> {
             paths.push(token.clone());
         }
     }
+    let (start, end) = range.unwrap_or((None, None));
     Ok(CalcTokens {
         paths,
         interval,
@@ -786,6 +861,8 @@ fn classify_calc(tokens: &[String]) -> Result<CalcTokens> {
         format: format.unwrap_or_default(),
         use_rth,
         fill,
+        start,
+        end,
     })
 }
 
@@ -798,7 +875,10 @@ fn resolve_interval(token: Option<Interval>, config: Option<&str>) -> Result<Int
             .with_context(|| format!("invalid interval in config: {text:?}"))?
             .with_context(|| format!("invalid interval in config: {text:?}"));
     }
-    bail!("an interval is required (e.g. 5m, 1h, 1d)")
+    // Default period when neither a token nor a config value is given.
+    Ok(Interval::parse("1d")
+        .expect("\"1d\" is interval-shaped")
+        .expect("\"1d\" is a valid interval"))
 }
 
 fn resolve_session(
@@ -825,24 +905,76 @@ fn resolve_session(
     Session::new(tz, hours)
 }
 
-fn parse_bounds(start: Option<&str>, end: Option<&str>) -> Result<(Option<u32>, Option<u32>)> {
-    let start = start.map(|s| parse_time_bound(s, false)).transpose()?;
-    let end = end.map(|s| parse_time_bound(s, true)).transpose()?;
+fn parse_bounds(
+    start: Option<&str>,
+    end: Option<&str>,
+    tz: &jiff::tz::TimeZone,
+) -> Result<(Option<u32>, Option<u32>)> {
+    let start = start.map(|s| parse_time_bound(s, false, tz)).transpose()?;
+    let end = end.map(|s| parse_time_bound(s, true, tz)).transpose()?;
     Ok((start, end))
 }
 
-fn parse_time_bound(value: &str, is_end: bool) -> Result<u32> {
-    use jiff::{Timestamp, civil::Date, tz::TimeZone};
+/// Parses a `--start`/`--end` (or range-token) bound into a UTC epoch second.
+///
+/// A value carrying an explicit UTC offset or `Z` is an absolute instant; a bare local date-time
+/// (`2026-01-01T09:30:00`) or a bare date (`2026-01-01`) is interpreted in the exchange timezone
+/// `tz`, which is far less surprising for exchange data than UTC. A bare *end* date is inclusive,
+/// expanding to the very end of that local day.
+fn parse_time_bound(value: &str, is_end: bool, tz: &jiff::tz::TimeZone) -> Result<u32> {
+    use jiff::{Timestamp, civil};
 
-    if let Ok(date) = value.parse::<Date>() {
-        let start = date.to_zoned(TimeZone::UTC)?.timestamp().as_second();
-        let secs = if is_end { start + 86_400 - 1 } else { start };
-        return u32::try_from(secs).map_err(|_| anyhow::anyhow!("time {value:?} is out of range"));
+    let to_u32 = |secs: i64| {
+        u32::try_from(secs).map_err(|_| anyhow::anyhow!("time {value:?} is out of range"))
+    };
+
+    // Absolute instant: carries a `Z` or numeric UTC offset.
+    if let Ok(ts) = value.parse::<Timestamp>() {
+        return to_u32(ts.as_second());
     }
-    let ts: Timestamp = value
-        .parse()
-        .with_context(|| format!("invalid date/time {value:?} (use YYYY-MM-DD or RFC3339)"))?;
-    u32::try_from(ts.as_second()).map_err(|_| anyhow::anyhow!("time {value:?} is out of range"))
+    // Bare date (no time component): exchange-tz midnight; an end date includes the whole local
+    // day. Checked before DateTime because jiff's DateTime parser also accepts a bare date.
+    if !value.contains(':')
+        && let Ok(date) = value.parse::<civil::Date>()
+    {
+        let day = if is_end { date.tomorrow()? } else { date };
+        let secs = day.to_zoned(tz.clone())?.timestamp().as_second() - i64::from(is_end);
+        return to_u32(secs);
+    }
+    // Local date-time without an offset: interpret in the exchange timezone.
+    if let Ok(dt) = value.parse::<civil::DateTime>() {
+        return to_u32(dt.to_zoned(tz.clone())?.timestamp().as_second());
+    }
+    bail!("invalid date/time {value:?} (use YYYY-MM-DD, a local date-time, or an RFC3339 instant)")
+}
+
+/// True when `value` parses as some date/datetime/instant — used to tell a `START..END` range
+/// token apart from a path like `..\AAPL.fwob`. Timezone-free; the actual conversion is deferred.
+fn looks_like_bound(value: &str) -> bool {
+    value.parse::<jiff::Timestamp>().is_ok()
+        || value.parse::<jiff::civil::DateTime>().is_ok()
+        || value.parse::<jiff::civil::Date>().is_ok()
+}
+
+/// Parses a `START..END` range token (either side optional, e.g. `2024-01-01T12:00:00Z..2026-01-01`
+/// or `..2026-01-01`) into raw bound strings. Returns `None` when the token is not range-shaped, so
+/// it falls through to path/symbol handling (e.g. a relative path `..\AAPL.fwob`). Each present
+/// side must look like a date/time; conversion to epochs happens later in [`parse_bounds`].
+fn parse_range_token(token: &str) -> Option<(Option<String>, Option<String>)> {
+    let (lhs, rhs) = token.split_once("..")?;
+    if lhs.is_empty() && rhs.is_empty() {
+        return None;
+    }
+    if !lhs.is_empty() && !looks_like_bound(lhs) {
+        return None;
+    }
+    if !rhs.is_empty() && !looks_like_bound(rhs) {
+        return None;
+    }
+    Some((
+        (!lhs.is_empty()).then(|| lhs.to_owned()),
+        (!rhs.is_empty()).then(|| rhs.to_owned()),
+    ))
 }
 
 fn format_label(path: &Path) -> Result<String> {
@@ -871,6 +1003,74 @@ fn resolve_files(paths: &[String], acfg: &AnalysisConfig) -> Result<Vec<PathBuf>
 mod tests {
     use super::*;
     use crate::config::ProviderKind;
+
+    fn ny() -> jiff::tz::TimeZone {
+        jiff::tz::TimeZone::get("America/New_York").unwrap()
+    }
+
+    fn epoch(rfc3339: &str) -> u32 {
+        rfc3339.parse::<jiff::Timestamp>().unwrap().as_second() as u32
+    }
+
+    #[test]
+    fn bare_dates_and_times_use_the_exchange_timezone() {
+        let tz = ny();
+        // Bare date -> exchange-tz midnight (winter ET = UTC-5).
+        assert_eq!(
+            parse_time_bound("2026-01-01", false, &tz).unwrap(),
+            epoch("2026-01-01T05:00:00Z")
+        );
+        // Bare end date is inclusive of the whole local day (next ET midnight minus one second).
+        assert_eq!(
+            parse_time_bound("2026-01-01", true, &tz).unwrap(),
+            epoch("2026-01-02T05:00:00Z") - 1
+        );
+        // Bare local date-time -> interpreted in the exchange tz.
+        assert_eq!(
+            parse_time_bound("2026-01-01T09:30:00", false, &tz).unwrap(),
+            epoch("2026-01-01T14:30:00Z")
+        );
+        // An explicit Z / offset is absolute, regardless of the exchange tz.
+        assert_eq!(
+            parse_time_bound("2026-01-01T05:00:00Z", false, &tz).unwrap(),
+            epoch("2026-01-01T05:00:00Z")
+        );
+        assert_eq!(
+            parse_time_bound("2026-01-01T00:00:00-05:00", false, &tz).unwrap(),
+            epoch("2026-01-01T05:00:00Z")
+        );
+    }
+
+    #[test]
+    fn range_token_parses_either_side_and_ignores_paths() {
+        assert_eq!(
+            parse_range_token("2024-01-01T12:00:00Z..2026-01-01"),
+            Some((
+                Some("2024-01-01T12:00:00Z".to_owned()),
+                Some("2026-01-01".to_owned())
+            ))
+        );
+        assert_eq!(
+            parse_range_token("..2026-01-01"),
+            Some((None, Some("2026-01-01".to_owned())))
+        );
+        assert_eq!(
+            parse_range_token("2024-01-01.."),
+            Some((Some("2024-01-01".to_owned()), None))
+        );
+        // Not range-shaped: a relative path, a plain symbol, or a bare `..`.
+        assert_eq!(parse_range_token(r"..\AAPL.fwob"), None);
+        assert_eq!(parse_range_token("../data/AAPL.fwob"), None);
+        assert_eq!(parse_range_token("AAPL"), None);
+        assert_eq!(parse_range_token(".."), None);
+    }
+
+    #[test]
+    fn interval_defaults_to_one_day() {
+        assert_eq!(resolve_interval(None, None).unwrap().label(), "1d");
+        // A config value still wins over the default.
+        assert_eq!(resolve_interval(None, Some("5m")).unwrap().label(), "5m");
+    }
 
     #[test]
     fn provider_override_is_a_positional_token_only() {
