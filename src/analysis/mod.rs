@@ -23,7 +23,9 @@ pub use calc::{
 pub use config::{AnalysisConfig, ReturnMethod};
 pub use interval::Interval;
 pub use model::{Bar, Tick};
-pub use read::{TickQuery, discover_inputs, open_tick_reader, read_bars, read_ticks, stream_ticks};
-pub use resample::{BarClock, Resampler, resample};
+pub use read::{
+    TickQuery, discover_inputs, open_tick_reader, read_bars, read_ticks, stream_ticks, tick_symbol,
+};
+pub use resample::{BarClock, ForwardFiller, Resampler, resample};
 pub use session::Session;
 pub use stat::{StatAccumulator, StatRow, compute_stat};

@@ -1,22 +1,29 @@
 //! Tick → OHLCV bar resampling.
 
+use anyhow::Result;
 use jiff::{Timestamp, ToSpan, Unit, civil, tz::TimeZone};
 
 use crate::analysis::interval::{Granularity, Interval};
 use crate::analysis::model::{Bar, Tick};
+use crate::analysis::session::Session;
 
 /// Controls how bar buckets are anchored.
 ///
-/// Sub-day intervals are always UTC-epoch aligned (which, for whole-hour UTC
-/// offsets, coincides with local clock boundaries). **Day-granular** intervals
-/// are aligned to the local civil date in the exchange timezone, so a trading
-/// day's extended-hours ticks that cross UTC midnight (e.g. US after-hours,
-/// which in winter ends at 20:00 ET = 01:00 UTC the next day) stay in the
-/// correct day's bar instead of bleeding into the next.
+/// For all variants, **day-granular and larger** intervals are aligned to the local civil date in
+/// the exchange timezone, so a trading day's extended-hours ticks that cross UTC midnight (e.g. US
+/// after-hours, which in winter ends at 20:00 ET = 01:00 UTC the next day) stay in the correct
+/// day's bar instead of bleeding into the next. **Sub-day** intervals are UTC-epoch aligned for
+/// [`BarClock::Utc`]/[`BarClock::Zoned`], but anchored to the trading-session open for
+/// [`BarClock::Session`] (what `bars`/`calc` use), so intraday bars start at 09:30/04:00 and tile
+/// the session.
 #[derive(Clone)]
 pub enum BarClock {
     Utc,
     Zoned(TimeZone),
+    /// Sub-day buckets anchored to the session **open** (e.g. 09:30) in the session timezone;
+    /// day-and-larger buckets anchored to exchange-local midnight. Used by `bars`/`calc` so
+    /// intraday bars start at the session open and tile the session.
+    Session(Session),
 }
 
 impl BarClock {
@@ -29,12 +36,18 @@ impl BarClock {
         match self {
             BarClock::Utc => TimeZone::UTC,
             BarClock::Zoned(tz) => tz.clone(),
+            BarClock::Session(session) => session.time_zone(),
         }
     }
 
     fn bucket_start(&self, interval: Interval, time: u32) -> u32 {
         match interval.granularity() {
-            Granularity::SubDay(secs) => sub_day_floor(time, secs),
+            Granularity::SubDay(secs) => match self {
+                BarClock::Session(session) => {
+                    session_floor(session, secs, time).unwrap_or_else(|| sub_day_floor(time, secs))
+                }
+                _ => sub_day_floor(time, secs),
+            },
             calendar => calendar_bucket_start(&self.time_zone(), calendar, time)
                 .unwrap_or_else(|| sub_day_floor(time, 86_400)),
         }
@@ -47,10 +60,35 @@ impl BarClock {
                 .unwrap_or_else(|| bucket_start.saturating_add(86_400)),
         }
     }
+
+    /// Exclusive upper bound for forward-fill bars: the session **close** of `prev_start`'s day,
+    /// so sub-day fill never spans the overnight gap (or whole empty days). `None` for non-session
+    /// clocks and calendar intervals, where fill is bounded only by the next real bar.
+    fn fill_stop(&self, interval: Interval, prev_start: u32) -> Option<u32> {
+        match (self, interval.granularity()) {
+            (BarClock::Session(session), Granularity::SubDay(_)) => Some(
+                session
+                    .open_epoch(prev_start)?
+                    .saturating_add(session.length_seconds()),
+            ),
+            _ => None,
+        }
+    }
 }
 
 fn sub_day_floor(time: u32, secs: u32) -> u32 {
     if secs == 0 { time } else { time - time % secs }
+}
+
+/// Floors `time` to the sub-day bucket anchored at the session open of `time`'s local day.
+fn session_floor(session: &Session, secs: u32, time: u32) -> Option<u32> {
+    if secs == 0 {
+        return Some(time);
+    }
+    let open = session.open_epoch(time)?;
+    let delta = i64::from(time) - i64::from(open);
+    let start = i64::from(open) + delta.div_euclid(i64::from(secs)) * i64::from(secs);
+    u32::try_from(start).ok()
 }
 
 fn local_date(tz: &TimeZone, time: u32) -> Option<civil::Date> {
@@ -183,8 +221,10 @@ impl Accumulator {
     }
 }
 
-/// Incremental tick → bar resampler. Feed ascending ticks with [`Resampler::push`] and read the
-/// bars out with [`Resampler::finish`]; ticks are never all held in memory at once.
+/// Incremental tick → bar resampler. Feed ascending ticks with [`Resampler::push`], passing a
+/// sink that receives each bar **the moment its bucket closes** (so rows can stream straight to
+/// the terminal); flush the final open bucket with [`Resampler::finish`]. Neither the ticks nor
+/// the resulting bars are ever all held in memory at once.
 pub struct Resampler {
     interval: Interval,
     clock: BarClock,
@@ -192,7 +232,6 @@ pub struct Resampler {
     /// Exclusive end of the open bucket, cached so the (potentially expensive) timezone bucket
     /// computation runs once per bucket instead of once per tick.
     bucket_end: u32,
-    bars: Vec<Bar>,
 }
 
 impl Resampler {
@@ -202,17 +241,18 @@ impl Resampler {
             clock,
             current: None,
             bucket_end: 0,
-            bars: Vec::new(),
         }
     }
 
-    pub fn push(&mut self, tick: &Tick) {
+    /// Folds `tick` into the open bucket, emitting the just-completed bar through `emit` when the
+    /// tick opens a new bucket. Ticks must be ascending.
+    pub fn push(&mut self, tick: &Tick, emit: &mut impl FnMut(Bar) -> Result<()>) -> Result<()> {
         match &mut self.current {
             // Ticks are ascending, so a tick belongs to the open bucket while `time < bucket_end`.
             Some(acc) if tick.time < self.bucket_end => acc.update(tick),
             _ => {
                 if let Some(acc) = self.current.take() {
-                    self.bars.push(acc.finish());
+                    emit(acc.finish())?;
                 }
                 let start = self.clock.bucket_start(self.interval, tick.time);
                 self.bucket_end = self
@@ -222,17 +262,70 @@ impl Resampler {
                 self.current = Some(Accumulator::new(start, tick));
             }
         }
+        Ok(())
     }
 
-    pub fn finish(mut self, fill: bool) -> Vec<Bar> {
+    /// Emits the final open bucket (if any).
+    pub fn finish(mut self, emit: &mut impl FnMut(Bar) -> Result<()>) -> Result<()> {
         if let Some(acc) = self.current.take() {
-            self.bars.push(acc.finish());
+            emit(acc.finish())?;
         }
-        if fill && self.bars.len() > 1 {
-            forward_fill(&self.bars, self.interval, &self.clock)
-        } else {
-            self.bars
+        Ok(())
+    }
+}
+
+/// Wraps a bar sink to optionally forward-fill empty intervals. When `fill` is set, each real bar
+/// is preceded by flat bars (previous close, zero volume) for every empty interval since the last
+/// real bar, so gaps between (but not before the first or after the last) real bar are filled.
+/// Streams: it only ever holds the previous real bar, never the whole series.
+pub struct ForwardFiller<F: FnMut(Bar) -> Result<()>> {
+    interval: Interval,
+    clock: BarClock,
+    fill: bool,
+    prev: Option<Bar>,
+    sink: F,
+}
+
+impl<F: FnMut(Bar) -> Result<()>> ForwardFiller<F> {
+    pub fn new(interval: Interval, clock: BarClock, fill: bool, sink: F) -> Self {
+        Self {
+            interval,
+            clock,
+            fill,
+            prev: None,
+            sink,
         }
+    }
+
+    /// Forwards `bar` to the sink, first emitting any flat fill bars before it. Fill never crosses
+    /// a session close (see [`BarClock::fill_stop`]), so the overnight gap and empty days stay
+    /// empty rather than being padded with flat bars.
+    pub fn push(&mut self, bar: Bar) -> Result<()> {
+        if self.fill {
+            if let Some(prev) = self.prev {
+                let cap = self.clock.fill_stop(self.interval, prev.time);
+                let mut expected = self.clock.advance(self.interval, prev.time);
+                while expected < bar.time && cap.is_none_or(|stop| expected < stop) {
+                    (self.sink)(Bar {
+                        time: expected,
+                        open: prev.close,
+                        high: prev.close,
+                        low: prev.close,
+                        close: prev.close,
+                        volume: 0,
+                        vwap: prev.close,
+                        trades: 0,
+                    })?;
+                    let next = self.clock.advance(self.interval, expected);
+                    if next <= expected {
+                        break; // guard against a non-advancing clock
+                    }
+                    expected = next;
+                }
+            }
+            self.prev = Some(bar);
+        }
+        (self.sink)(bar)
     }
 }
 
@@ -240,45 +333,23 @@ impl Resampler {
 /// `clock`. When `fill` is set, every empty interval between the first and last
 /// bar is forward-filled (a flat bar at the previous close, zero volume).
 pub fn resample(ticks: &[Tick], interval: Interval, fill: bool, clock: &BarClock) -> Vec<Bar> {
-    let mut resampler = Resampler::new(interval, clock.clone());
-    for tick in ticks {
-        resampler.push(tick);
-    }
-    resampler.finish(fill)
-}
-
-fn forward_fill(bars: &[Bar], interval: Interval, clock: &BarClock) -> Vec<Bar> {
-    let mut filled = Vec::with_capacity(bars.len());
-    let mut iter = bars.iter();
-    let Some(first) = iter.next() else {
-        return filled;
-    };
-    filled.push(*first);
-    let mut prev_close = first.close;
-    let mut expected = clock.advance(interval, first.time);
-    for bar in iter {
-        while expected < bar.time {
-            filled.push(Bar {
-                time: expected,
-                open: prev_close,
-                high: prev_close,
-                low: prev_close,
-                close: prev_close,
-                volume: 0,
-                vwap: prev_close,
-                trades: 0,
-            });
-            let next = clock.advance(interval, expected);
-            if next <= expected {
-                break; // guard against a non-advancing clock
-            }
-            expected = next;
+    let mut bars = Vec::new();
+    {
+        let mut filler = ForwardFiller::new(interval, clock.clone(), fill, |bar: Bar| {
+            bars.push(bar);
+            Ok(())
+        });
+        let mut resampler = Resampler::new(interval, clock.clone());
+        for tick in ticks {
+            resampler
+                .push(tick, &mut |bar| filler.push(bar))
+                .expect("collecting into a Vec is infallible");
         }
-        filled.push(*bar);
-        prev_close = bar.close;
-        expected = clock.advance(interval, bar.time);
+        resampler
+            .finish(&mut |bar| filler.push(bar))
+            .expect("collecting into a Vec is infallible");
     }
-    filled
+    bars
 }
 
 #[cfg(test)]
@@ -355,6 +426,63 @@ mod tests {
         // Bar 1 starts at Jan 3 ET midnight (2024-01-03 05:00:00Z = 1_704_258_000).
         assert_eq!(bars[1].time, 1_704_258_000);
         assert_eq!(bars[1].trades, 1);
+    }
+
+    #[test]
+    fn sub_day_bars_anchor_to_session_open() {
+        let interval = Interval::parse("1h").unwrap().unwrap();
+        let session = Session::new("America/New_York", "09:30-16:00").unwrap();
+        let clock = BarClock::Session(session);
+        // 2024-01-02 09:30 ET (winter, UTC-5).
+        let open = 1_704_205_800u32;
+        let ticks = vec![
+            tick(open, 10.0, 1),                      // 09:30 -> 09:30 bucket
+            tick(open + 30 * 60, 11.0, 1),            // 10:00 -> 09:30 bucket (09:30-10:30)
+            tick(open + 2 * 3600 + 15 * 60, 12.0, 1), // 11:45 -> 11:30 bucket
+            tick(open + 6 * 3600 + 15 * 60, 13.0, 1), // 15:45 -> 15:30 bucket (partial: closes 16:00)
+        ];
+        let bars = resample(&ticks, interval, false, &clock);
+        assert_eq!(bars.len(), 3);
+        assert_eq!(bars[0].time, open); // 09:30, not 09:00
+        assert_eq!(bars[0].trades, 2);
+        assert_eq!(bars[1].time, open + 2 * 3600); // 11:30
+        assert_eq!(bars[2].time, open + 6 * 3600); // 15:30 (session's short last bar)
+    }
+
+    #[test]
+    fn fill_within_session_does_not_cross_overnight_gap() {
+        let interval = Interval::parse("1h").unwrap().unwrap();
+        let session = Session::new("America/New_York", "09:30-16:00").unwrap();
+        let clock = BarClock::Session(session);
+        let day0 = 1_704_205_800u32; // 2024-01-02 09:30 ET
+        let day1 = day0 + 86_400; // 2024-01-03 09:30 ET (no DST change between)
+        let ticks = vec![
+            tick(day0, 10.0, 1),            // 09:30 day0
+            tick(day0 + 3 * 3600, 11.0, 1), // 12:30 day0
+            tick(day1, 12.0, 1),            // 09:30 day1
+        ];
+        let bars = resample(&ticks, interval, true, &clock);
+        // Day0 fills 10:30/11:30 (between real bars) and 13:30/14:30/15:30 (tail up to the 16:00
+        // close), then day1 starts fresh at 09:30 with NO overnight fill in between.
+        let times: Vec<u32> = bars.iter().map(|b| b.time).collect();
+        assert_eq!(
+            times,
+            vec![
+                day0,
+                day0 + 3600,
+                day0 + 2 * 3600,
+                day0 + 3 * 3600,
+                day0 + 4 * 3600,
+                day0 + 5 * 3600,
+                day0 + 6 * 3600,
+                day1,
+            ]
+        );
+        assert_eq!(bars[1].volume, 0); // filled
+        assert_eq!(bars[1].close, 10.0);
+        assert_eq!(bars[3].volume, 1); // real 12:30
+        assert_eq!(bars[6].volume, 0); // filled tail (15:30)
+        assert_eq!(bars[7].volume, 1); // real 09:30 day1
     }
 
     #[test]

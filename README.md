@@ -153,18 +153,24 @@ mdfwob stat data/ md rth
 mdfwob bars AAPL.fwob 5m
 mdfwob bars AAPL.fwob 1w               # weekly bars (calendar week, exchange tz)
 mdfwob bars data/ 1mo fwob --output bars/
+mdfwob bars AAPL.fwob 5m rth fill           # RTH bars, forward-fill gaps in-session
 mdfwob calc AAPL.fwob 1d rth ret:log vol:20 sma:20 rsi:14 --summary
 mdfwob calc bars/AAPL.fwob sma:20            # a bar file needs no interval
 ```
 
 - **`stat`** prints one summary row per tick file: symbol, format, tick count,
   time range, price min/max/mean, VWAP, signed volume, and intra-day gap count.
-- **`bars`** resamples ticks into OHLCV(+VWAP, trades) bars. Sub-day intervals
-  are UTC-epoch aligned; **day, week, month, and year intervals are aligned to
-  the calendar in the exchange timezone** (DST-correct) — week to Monday, month
-  to the 1st, year to Jan 1 — so extended-hours ticks that cross UTC midnight
-  stay in the correct period's bar. `--fill` forward-fills empty intervals with
-  flat bars; `fwob` output writes one `<symbol>.fwob` per symbol into `--output`.
+- **`bars`** resamples ticks into OHLCV(+VWAP, trades) bars, streaming each row
+  to stdout as its bucket closes. **Sub-day intervals (s/m/h) are anchored to the
+  session open** in the exchange timezone, so e.g. RTH `1h` bars start 09:30,
+  10:30, …; **day, week, month, and year intervals are calendar-aligned in the
+  exchange timezone** (DST-correct) — week to Monday, month to the 1st, year to
+  Jan 1 — so extended-hours ticks that cross UTC midnight stay in the correct
+  period's bar. An interval that does not evenly divide the active session
+  (RTH 6h30m, extended 16h) is warned about, since the session's last bar is then
+  shorter than the rest. The `fill` token forward-fills empty intervals within a
+  session (never across the overnight gap); `fwob` output writes one
+  `<symbol>.fwob` per symbol into `--output`.
 - **`calc`** computes per-bar indicator columns from composable specs —
   `sma:N`, `ema:N`, `rsi:N`, `ret:log`, `ret:simple`, `vol:N` — over a bar file,
   or over a tick file plus an interval token (auto-resampled). Columns are stored
@@ -198,10 +204,11 @@ The analysis engine is also a public library, so programs can read ticks,
 resample, and run indicator pipelines directly — including custom user functions:
 
 ```rust
-use mdfwob::analysis::{read_ticks, resample, Calc, Interval, Sma, TickQuery};
+use mdfwob::analysis::{read_ticks, resample, BarClock, Calc, Interval, Sma, TickQuery};
 
 let (symbol, ticks) = read_ticks("AAPL.fwob".as_ref(), &TickQuery::default())?;
-let bars = resample(&ticks, Interval::parse("5m").unwrap()?, false);
+let interval = Interval::parse("5m").unwrap()?;
+let bars = resample(&ticks, interval, false, &BarClock::Utc);
 let out = Calc::new(&bars)
     .with(Sma { period: 20 })
     .with_fn("zscore", |bars| {

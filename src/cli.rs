@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -11,14 +11,18 @@ use crate::{
     analysis::{
         calc::{Calc, parse_spec, summarize},
         config::{AnalysisConfig, DEFAULT_EXTENDED_HOURS, DEFAULT_RTH_HOURS, ReturnMethod},
-        interval::Interval,
+        interval::{Granularity, Interval},
         model::Bar,
-        output::{AnalysisFormat, BarSeries, CalcSeries, write_bars, write_calc, write_stat},
+        output::{
+            AnalysisFormat, BarStream, CalcSeries, guard_symbol_count, write_bars_fwob, write_calc,
+            write_stat,
+        },
         read::{
             InputKind, TickQuery, discover_inputs, input_kind, open_tick_reader, read_bars,
-            stream_ticks,
+            stream_ticks, tick_symbol,
         },
-        resample::{BarClock, Resampler},
+        resample::{BarClock, ForwardFiller, Resampler},
+        schema::{bar_schema, with_symbol_column},
         session::Session,
         stat::StatAccumulator,
     },
@@ -310,7 +314,10 @@ impl StatArgs {
                 let (mut reader, symbol) = open_tick_reader(path)?;
                 let format_label = format_label(path)?;
                 let mut acc = StatAccumulator::new(max_gap, &session);
-                stream_ticks(&mut reader, &query, |tick| acc.push(&tick))?;
+                stream_ticks(&mut reader, &query, |tick| {
+                    acc.push(&tick);
+                    Ok(())
+                })?;
                 Ok(acc.finish(symbol, format_label))
             })();
             match result {
@@ -351,9 +358,6 @@ struct BarsArgs {
     /// Output directory for `fwob` format (one `<symbol>.fwob` per symbol).
     #[arg(long)]
     output: Option<PathBuf>,
-    /// Forward-fill empty intervals with flat bars.
-    #[arg(long)]
-    fill: bool,
     #[arg(value_name = "ITEM", num_args = 0..)]
     items: Vec<String>,
 }
@@ -367,14 +371,16 @@ impl BarsArgs {
             interval: interval_token,
             format,
             use_rth,
+            fill,
         } = classify_with_interval(&tokens)?;
         let use_rth = self.use_rth || use_rth;
         let interval = resolve_interval(interval_token, acfg.bars.interval.as_deref())?;
-        let fill = self.fill || acfg.bars.fill;
-        // Resolve the session for its timezone (used to anchor daily bars) regardless of
-        // --use-rth; only filter ticks to the session window when --use-rth is set.
+        let fill = fill || acfg.bars.fill;
+        // Resolve the session: its timezone anchors calendar bars, its open anchors intraday
+        // buckets, and its window filters ticks only when --use-rth is set.
         let session = resolve_session(&acfg, use_rth, self.session.as_deref(), self.tz.as_deref())?;
-        let clock = BarClock::Zoned(session.time_zone());
+        warn_uneven_interval(interval, &session, use_rth);
+        let clock = BarClock::Session(session.clone());
         let (start, end) = parse_bounds(self.start.as_deref(), self.end.as_deref())?;
         let files = resolve_files(&paths, &acfg)?;
         let query = TickQuery {
@@ -383,35 +389,118 @@ impl BarsArgs {
             session: use_rth.then(|| session.clone()),
         };
 
-        // Stream each file's ticks straight into a per-symbol resampler so a file's ticks are
-        // never all held in memory (multi-GB tick files only retain the resulting bars).
-        let mut resamplers: BTreeMap<String, Resampler> = BTreeMap::new();
+        // Group input files by the symbol they report, preserving discovery order so a symbol's
+        // files feed one resampler as a single ascending stream. Only the header of each file is
+        // read here; the heavy tick scan happens during streaming.
+        let mut by_symbol: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
         for path in &files {
-            let result = (|| -> Result<()> {
-                let (mut reader, symbol) = open_tick_reader(path)?;
-                let resampler = resamplers
-                    .entry(symbol)
-                    .or_insert_with(|| Resampler::new(interval, clock.clone()));
-                stream_ticks(&mut reader, &query, |tick| resampler.push(&tick))
-            })();
-            if let Err(error) = result {
-                tracing::error!(path = %path.display(), error = %format!("{error:#}"), "failed to read");
+            match tick_symbol(path) {
+                Ok(symbol) => by_symbol.entry(symbol).or_default().push(path.clone()),
+                Err(error) => {
+                    tracing::error!(path = %path.display(), error = %format!("{error:#}"), "failed to read")
+                }
             }
         }
-        let series: Vec<BarSeries> = resamplers
-            .into_iter()
-            .map(|(symbol, resampler)| BarSeries {
-                symbol,
-                bars: resampler.finish(fill),
-            })
-            .collect();
 
         let out_dir = self.output.clone().or_else(|| acfg.output_dir.clone());
         let stdout = std::io::stdout();
         let mut out = std::io::BufWriter::new(stdout.lock());
-        write_bars(&series, format, out_dir.as_deref(), &mut out)?;
+
+        match format {
+            AnalysisFormat::Fwob => {
+                let dir = out_dir
+                    .as_deref()
+                    .context("bars --format fwob requires --output DIR")?;
+                std::fs::create_dir_all(dir)
+                    .with_context(|| format!("failed to create {}", dir.display()))?;
+                for (symbol, paths) in &by_symbol {
+                    let mut bars = Vec::new();
+                    stream_bars(paths, interval, &clock, &query, fill, |bar| {
+                        bars.push(bar);
+                        Ok(())
+                    })?;
+                    write_bars_fwob(symbol, &bars, dir)?;
+                }
+            }
+            AnalysisFormat::Frame(frame) => {
+                // Each completed bucket streams a row straight to stdout, so the table fills in
+                // bar by bar instead of appearing all at once after the whole file is processed.
+                let include_symbol = by_symbol.len() > 1;
+                guard_symbol_count(include_symbol, by_symbol.len())?;
+                let base = bar_schema();
+                let schema = if include_symbol {
+                    with_symbol_column(&base)
+                } else {
+                    base
+                };
+                let symbols: Vec<String> = by_symbol.keys().cloned().collect();
+                let strings: &[String] = if include_symbol { &symbols } else { &[] };
+                // On an interactive terminal flush each row so bars appear as their buckets close;
+                // when redirected, stay buffered for throughput.
+                let autoflush = std::io::stdout().is_terminal();
+                let mut stream = BarStream::new(&schema, strings, frame, autoflush, &mut out)?;
+                for (index, (_symbol, paths)) in by_symbol.iter().enumerate() {
+                    stream_bars(paths, interval, &clock, &query, fill, |bar| {
+                        stream.emit(index, &bar)
+                    })?;
+                }
+            }
+        }
         out.flush()?;
         Ok(())
+    }
+}
+
+/// Streams a symbol's bars to `sink` as each bucket closes, feeding all of `paths` through one
+/// resampler (so multiple files of the same symbol form a single ascending stream) and applying
+/// forward-fill when requested. Ticks are read in bulk chunks and never fully materialized.
+fn stream_bars(
+    paths: &[PathBuf],
+    interval: Interval,
+    clock: &BarClock,
+    query: &TickQuery,
+    fill: bool,
+    sink: impl FnMut(Bar) -> Result<()>,
+) -> Result<()> {
+    let mut filler = ForwardFiller::new(interval, clock.clone(), fill, sink);
+    let mut resampler = Resampler::new(interval, clock.clone());
+    for path in paths {
+        let (mut reader, _) = open_tick_reader(path)?;
+        stream_ticks(&mut reader, query, |tick| {
+            resampler.push(&tick, &mut |bar| filler.push(bar))
+        })?;
+    }
+    resampler.finish(&mut |bar| filler.push(bar))
+}
+
+/// Warns when a sub-day interval does not evenly divide the active trading session (RTH or
+/// extended hours). Since intraday buckets are anchored to the session open, an interval that
+/// tiles the session yields equal-width bars; otherwise the session's last bar is shorter than the
+/// rest. Day-and-larger intervals are calendar-anchored and never warn.
+fn warn_uneven_interval(interval: Interval, session: &Session, use_rth: bool) {
+    let Granularity::SubDay(width) = interval.granularity() else {
+        return;
+    };
+    let length = session.length_seconds();
+    if width == 0 || length.is_multiple_of(width) {
+        return;
+    }
+    let kind = if use_rth { "RTH" } else { "extended-hours" };
+    tracing::warn!(
+        "interval {} does not evenly divide the {kind} session ({}); the last bar of each session will be shorter than the rest",
+        interval.label(),
+        fmt_session_len(length)
+    );
+}
+
+/// Formats a session length in seconds as a compact `HhMm` label (e.g. `6h30m`, `16h`).
+fn fmt_session_len(seconds: u32) -> String {
+    let minutes = seconds / 60;
+    let (hours, mins) = (minutes / 60, minutes % 60);
+    match (hours, mins) {
+        (0, m) => format!("{m}m"),
+        (h, 0) => format!("{h}h"),
+        (h, m) => format!("{h}h{m}m"),
     }
 }
 
@@ -436,8 +525,6 @@ struct CalcArgs {
     tz: Option<String>,
     #[arg(long)]
     output: Option<PathBuf>,
-    #[arg(long)]
-    fill: bool,
     /// Return method for the --summary scalars (log|simple).
     #[arg(long)]
     method: Option<String>,
@@ -463,6 +550,7 @@ impl CalcArgs {
             specs: spec_tokens,
             format,
             use_rth,
+            fill,
         } = classify_calc(&tokens)?;
         let use_rth = self.use_rth || use_rth;
         if spec_tokens.is_empty() {
@@ -486,9 +574,12 @@ impl CalcArgs {
         };
         let annualize = self.annualize || acfg.calc.annualize;
         let periods_per_year = self.periods_per_year.unwrap_or(acfg.calc.periods_per_year);
-        let fill = self.fill || acfg.calc.fill;
+        let fill = fill || acfg.calc.fill;
         let session = resolve_session(&acfg, use_rth, self.session.as_deref(), self.tz.as_deref())?;
-        let clock = BarClock::Zoned(session.time_zone());
+        if let Some(iv) = interval {
+            warn_uneven_interval(iv, &session, use_rth);
+        }
+        let clock = BarClock::Session(session.clone());
         let filter = use_rth.then(|| session.clone());
         let (start, end) = parse_bounds(self.start.as_deref(), self.end.as_deref())?;
         let files = resolve_files(&paths, &acfg)?;
@@ -502,15 +593,25 @@ impl CalcArgs {
                         let interval = interval.context(
                             "an interval token is required to resample a tick file (e.g. 5m, 1h, 1d)",
                         )?;
-                        let (mut reader, symbol) = open_tick_reader(path)?;
+                        let symbol = tick_symbol(path)?;
                         let query = TickQuery {
                             start,
                             end,
                             session: filter.clone(),
                         };
-                        let mut resampler = Resampler::new(interval, clock.clone());
-                        stream_ticks(&mut reader, &query, |tick| resampler.push(&tick))?;
-                        Ok((symbol, resampler.finish(fill)))
+                        let mut bars = Vec::new();
+                        stream_bars(
+                            std::slice::from_ref(path),
+                            interval,
+                            &clock,
+                            &query,
+                            fill,
+                            |bar| {
+                                bars.push(bar);
+                                Ok(())
+                            },
+                        )?;
+                        Ok((symbol, bars))
                     }
                 }
             })();
@@ -571,6 +672,9 @@ fn load_analysis_config(path: Option<&Path>) -> Result<AnalysisConfig> {
 /// the `--use-rth` flag (either turns it on).
 const RTH_TOKEN: &str = "rth";
 
+/// The positional `fill` token forward-fills empty intervals with flat bars (`bars`/`calc`).
+const FILL_TOKEN: &str = "fill";
+
 struct StatTokens {
     paths: Vec<String>,
     format: AnalysisFormat,
@@ -604,6 +708,7 @@ struct BarsTokens {
     interval: Option<Interval>,
     format: AnalysisFormat,
     use_rth: bool,
+    fill: bool,
 }
 
 fn classify_with_interval(tokens: &[String]) -> Result<BarsTokens> {
@@ -611,9 +716,12 @@ fn classify_with_interval(tokens: &[String]) -> Result<BarsTokens> {
     let mut interval = None;
     let mut format = None;
     let mut use_rth = false;
+    let mut fill = false;
     for token in tokens {
         if token == RTH_TOKEN {
             use_rth = true;
+        } else if token == FILL_TOKEN {
+            fill = true;
         } else if let Some(parsed) = Interval::parse(token) {
             if interval.replace(parsed?).is_some() {
                 bail!("multiple interval tokens given");
@@ -631,6 +739,7 @@ fn classify_with_interval(tokens: &[String]) -> Result<BarsTokens> {
         interval,
         format: format.unwrap_or_default(),
         use_rth,
+        fill,
     })
 }
 
@@ -640,6 +749,7 @@ struct CalcTokens {
     specs: Vec<String>,
     format: AnalysisFormat,
     use_rth: bool,
+    fill: bool,
 }
 
 fn classify_calc(tokens: &[String]) -> Result<CalcTokens> {
@@ -648,9 +758,12 @@ fn classify_calc(tokens: &[String]) -> Result<CalcTokens> {
     let mut specs = Vec::new();
     let mut format = None;
     let mut use_rth = false;
+    let mut fill = false;
     for token in tokens {
         if token == RTH_TOKEN {
             use_rth = true;
+        } else if token == FILL_TOKEN {
+            fill = true;
         } else if let Some(parsed) = Interval::parse(token) {
             if interval.replace(parsed?).is_some() {
                 bail!("multiple interval tokens given");
@@ -672,6 +785,7 @@ fn classify_calc(tokens: &[String]) -> Result<CalcTokens> {
         specs,
         format: format.unwrap_or_default(),
         use_rth,
+        fill,
     })
 }
 

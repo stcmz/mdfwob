@@ -62,6 +62,26 @@ impl Session {
     pub fn time_zone(&self) -> TimeZone {
         self.tz.clone()
     }
+
+    /// The session's wall-clock length in seconds (e.g. 23 400 for RTH 09:30–16:00,
+    /// 57 600 for extended 04:00–20:00). Constant across DST since the window is local.
+    pub fn length_seconds(&self) -> u32 {
+        ((self.end_min - self.start_min) * 60).max(0) as u32
+    }
+
+    /// Absolute UTC epoch of the session open on the local day containing `epoch` (e.g. the
+    /// instant of 09:30 exchange-local on that date). Used to anchor sub-day bar buckets to the
+    /// session open. `None` only if the timestamp/zoned conversion fails.
+    pub fn open_epoch(&self, epoch: u32) -> Option<u32> {
+        let date = Timestamp::from_second(i64::from(epoch))
+            .ok()?
+            .to_zoned(self.tz.clone())
+            .date();
+        let hour = i8::try_from(self.start_min / 60).ok()?;
+        let minute = i8::try_from(self.start_min % 60).ok()?;
+        let open = date.at(hour, minute, 0, 0).to_zoned(self.tz.clone()).ok()?;
+        u32::try_from(open.timestamp().as_second()).ok()
+    }
 }
 
 fn parse_hhmm(value: &str) -> Result<i32> {
@@ -101,6 +121,25 @@ mod tests {
         let open = rth.day_key(JAN2_0930_ET);
         let later = rth.day_key(JAN2_0930_ET + 3_600);
         assert_eq!(open, later);
+    }
+
+    #[test]
+    fn length_seconds_matches_window() {
+        let rth = Session::new("America/New_York", "09:30-16:00").unwrap();
+        assert_eq!(rth.length_seconds(), 23_400); // 6h30m
+        let ext = Session::new("America/New_York", "04:00-20:00").unwrap();
+        assert_eq!(ext.length_seconds(), 57_600); // 16h
+    }
+
+    #[test]
+    fn open_epoch_is_local_session_open() {
+        let rth = Session::new("America/New_York", "09:30-16:00").unwrap();
+        // A mid-session tick (10:30 ET = JAN2_0930_ET + 1h) resolves to that day's 09:30 ET open.
+        assert_eq!(rth.open_epoch(JAN2_0930_ET + 3_600), Some(JAN2_0930_ET));
+        // The open instant maps to itself.
+        assert_eq!(rth.open_epoch(JAN2_0930_ET), Some(JAN2_0930_ET));
+        // A late-session tick on the same local day still maps back to the same open.
+        assert_eq!(rth.open_epoch(JAN2_0930_ET + 6 * 3_600), Some(JAN2_0930_ET));
     }
 
     #[test]

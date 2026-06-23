@@ -82,12 +82,22 @@ pub fn open_tick_reader(path: &Path) -> Result<(Reader, String)> {
     Ok((reader, symbol))
 }
 
+/// Resolves the symbol a tick file reports (header title, else file stem), validating it holds
+/// ticks. Cheap: it only reads the header, not the frames.
+pub fn tick_symbol(path: &Path) -> Result<String> {
+    let (_, symbol) = open_tick_reader(path)?;
+    Ok(symbol)
+}
+
 /// Reads ticks from a file, applying the time-range and session filters.
 /// Returns the resolved symbol and the (ascending) ticks.
 pub fn read_ticks(path: &Path, query: &TickQuery) -> Result<(String, Vec<Tick>)> {
     let (mut reader, symbol) = open_tick_reader(path)?;
     let mut ticks = Vec::new();
-    stream_ticks(&mut reader, query, |tick| ticks.push(tick))?;
+    stream_ticks(&mut reader, query, |tick| {
+        ticks.push(tick);
+        Ok(())
+    })?;
     Ok((symbol, ticks))
 }
 
@@ -117,7 +127,11 @@ fn index_window(
 /// Streams ticks from an open tick `reader` through `f`, applying the time-range and session
 /// filters, reading in bulk chunks so no per-frame allocation occurs and the full tick set is
 /// never materialized.
-pub fn stream_ticks(reader: &mut Reader, query: &TickQuery, mut f: impl FnMut(Tick)) -> Result<()> {
+pub fn stream_ticks(
+    reader: &mut Reader,
+    query: &TickQuery,
+    mut f: impl FnMut(Tick) -> Result<()>,
+) -> Result<()> {
     let session = query.session.as_ref();
     let Some((lo, hi)) = index_window(reader, query.start, query.end)? else {
         return Ok(());
@@ -134,7 +148,7 @@ pub fn stream_ticks(reader: &mut Reader, query: &TickQuery, mut f: impl FnMut(Ti
         for bytes in raw.chunks_exact(frame_len) {
             let tick = decode_tick(bytes);
             if session.is_none_or(|s| s.contains(tick.time)) {
-                f(tick);
+                f(tick)?;
             }
         }
         index += (raw.len() / frame_len) as u64;

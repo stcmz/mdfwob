@@ -11,6 +11,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use fwob::Writer;
 use fwob::formatting::{FrameFormat, FrameFormatter};
+use fwob_core::Schema;
 use fwob_v2::WriterOptions;
 use jiff::{Timestamp, tz::TimeZone};
 
@@ -88,37 +89,75 @@ fn render_bars(series: &[BarSeries], format: FrameFormat, out: &mut impl Write) 
     let include_symbol = series.len() > 1;
     guard_symbol_count(include_symbol, series.len())?;
     let base = bar_schema();
-
-    if include_symbol {
-        let schema = with_symbol_column(&base);
-        let strings: Vec<String> = series.iter().map(|s| s.symbol.clone()).collect();
-        let mut formatter = FrameFormatter::new(&schema, &strings, format);
-        formatter.write_header(out)?;
-        let mut frame = Vec::with_capacity(1 + BAR_FRAME_LEN as usize);
-        for (index, s) in series.iter().enumerate() {
-            for bar in &s.bars {
-                frame.clear();
-                frame.push(index as u8);
-                encode_bar(bar, &mut frame);
-                formatter.write_frame(out, &frame)?;
-            }
-        }
+    let schema = if include_symbol {
+        with_symbol_column(&base)
     } else {
-        let mut formatter = FrameFormatter::new(&base, &[], format);
-        formatter.write_header(out)?;
-        let mut frame = Vec::with_capacity(BAR_FRAME_LEN as usize);
-        for s in series {
-            for bar in &s.bars {
-                frame.clear();
-                encode_bar(bar, &mut frame);
-                formatter.write_frame(out, &frame)?;
-            }
+        base
+    };
+    let symbols: Vec<String> = series.iter().map(|s| s.symbol.clone()).collect();
+    let strings: &[String] = if include_symbol { &symbols } else { &[] };
+    let mut stream = BarStream::new(&schema, strings, format, false, out)?;
+    for (index, s) in series.iter().enumerate() {
+        for bar in &s.bars {
+            stream.emit(index, bar)?;
         }
     }
     Ok(())
 }
 
-fn write_bars_fwob(symbol: &str, bars: &[Bar], dir: &Path) -> Result<()> {
+/// Streaming bar renderer over fwob's [`FrameFormatter`]. Writes the header on construction, then
+/// one row per [`BarStream::emit`] so bars reach the terminal as soon as their bucket closes
+/// (rather than after the whole file is processed). When `strings` is non-empty the schema must be
+/// [`with_symbol_column`]'s and each row is prefixed with its symbol's index.
+pub struct BarStream<'a, W: Write> {
+    formatter: FrameFormatter<'a>,
+    include_symbol: bool,
+    /// Flush after every row so an interactive terminal shows each bar the moment its bucket
+    /// closes. Left off when stdout is redirected, so a buffered sink keeps full throughput.
+    autoflush: bool,
+    frame: Vec<u8>,
+    out: &'a mut W,
+}
+
+impl<'a, W: Write> BarStream<'a, W> {
+    pub fn new(
+        schema: &'a Schema,
+        strings: &'a [String],
+        format: FrameFormat,
+        autoflush: bool,
+        out: &'a mut W,
+    ) -> Result<Self> {
+        let include_symbol = !strings.is_empty();
+        let mut formatter = FrameFormatter::new(schema, strings, format);
+        formatter.write_header(out)?;
+        if autoflush {
+            out.flush()?;
+        }
+        Ok(Self {
+            formatter,
+            include_symbol,
+            autoflush,
+            frame: Vec::with_capacity(1 + BAR_FRAME_LEN as usize),
+            out,
+        })
+    }
+
+    /// Renders one bar row. `symbol_index` is ignored unless the stream carries a symbol column.
+    pub fn emit(&mut self, symbol_index: usize, bar: &Bar) -> Result<()> {
+        self.frame.clear();
+        if self.include_symbol {
+            self.frame.push(symbol_index as u8);
+        }
+        encode_bar(bar, &mut self.frame);
+        self.formatter.write_frame(&mut *self.out, &self.frame)?;
+        if self.autoflush {
+            self.out.flush()?;
+        }
+        Ok(())
+    }
+}
+
+pub fn write_bars_fwob(symbol: &str, bars: &[Bar], dir: &Path) -> Result<()> {
     let path = dir.join(format!("{symbol}.fwob"));
     let mut writer = Writer::create_v2(&path, bar_schema(), WriterOptions::new(symbol))
         .with_context(|| format!("failed to create {}", path.display()))?;
@@ -229,7 +268,7 @@ fn write_calc_fwob(series: &CalcSeries, dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn guard_symbol_count(include_symbol: bool, count: usize) -> Result<()> {
+pub fn guard_symbol_count(include_symbol: bool, count: usize) -> Result<()> {
     if include_symbol && count > MAX_SYMBOLS {
         bail!(
             "cannot render {count} symbols in one table; the symbol column supports at most {MAX_SYMBOLS}"
