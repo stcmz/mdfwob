@@ -103,24 +103,29 @@ provider tokens but are not implemented.
 IBKR connection resets are retried from the unchanged download cursor. Set
 `ibkr.reconnect_timeout_seconds` or `--reconnect-timeout-seconds` to `-1` for
 unlimited retries (the default), `0` to fail the symbol immediately, or a
-positive number for a wall-clock retry budget in seconds. Retries share the
-global request pacer configured by `download.request_interval_ms`.
+positive number for a wall-clock retry budget in seconds. Retry attempts are
+paced by their own global interval, `download.retry_interval_ms` /
+`--retry-interval-ms` (default 3000), independent of the normal data-fetch
+spacing in `download.request_interval_ms`.
 
 A TWS/IB Gateway upstream-connectivity blip (IBKR system codes 1100 then
 1101/1102) can silently orphan an in-flight request without dropping the API
 socket. A background watcher on the IBKR notice stream detects the restore and
 re-issues the affected request from the unchanged cursor within about a second,
-so the download resumes on its own without a gateway restart. Some interruptions
-produce neither a socket error nor a 1101/1102 restore notice — most commonly
-signing into the same IBKR account from another device, which severs TWS's link
-to the IBKR servers and wedges the request indefinitely. To cover those, a
-request that makes no progress at all for 30 seconds is treated as stalled: the
-client is rebuilt (which also respawns the connectivity watcher) and the request
-re-issued from the unchanged cursor, so the download recovers on its own once the
-competing session ends instead of hanging until `mdfwob` is restarted. A request
-that is merely slow but still receiving data or notices is never re-issued.
-Ctrl+C is honored promptly even while a request is blocked or stalled; a second
-Ctrl+C forces an immediate exit.
+so the download resumes on its own without a gateway restart. Signing into the same IBKR account from another device severs TWS's link to the
+IBKR servers and is handled two ways. A request issued while that competing
+session is active is rejected outright with IBKR code 10187 ("Trading TWS session
+is connected from a different IP address"); rather than abandoning the symbol,
+mdfwob retries it from the unchanged cursor (paced, within the reconnect budget)
+until the other session ends. A request already in flight can instead be wedged
+silently — no socket error and no 1101/1102 restore notice — so a request that
+makes no progress at all for `ibkr.stall_timeout_seconds` (default 30; set
+`--stall-timeout-seconds`, or `0` to disable) is treated as stalled: the client
+is rebuilt (which also respawns the connectivity watcher) and the request
+re-issued from the unchanged cursor, so the download recovers on its own instead
+of hanging until `mdfwob` is restarted. A request that is merely slow but still
+receiving data or notices is never re-issued. Ctrl+C is honored promptly even
+while a request is blocked or stalled; a second Ctrl+C forces an immediate exit.
 
 Databento uses its official Rust SDK and reads the API key from
 `DATABENTO_API_KEY` by default. The variable name and stock/option datasets are

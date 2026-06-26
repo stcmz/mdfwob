@@ -118,17 +118,20 @@ impl Downloader {
         let pacer = RequestPacer::new(Duration::from_millis(
             self.plan.config.download.request_interval_ms,
         ));
+        let retry_pacer = RequestPacer::new(Duration::from_millis(
+            self.plan.config.download.retry_interval_ms,
+        ));
         match self.plan.config.download.provider {
             ProviderKind::Ibkr => {
                 let provider = IbkrProvider::connect(&self.plan.config.ibkr)?;
-                run_with_provider(self.plan, &provider, &cancel, &pacer)
+                run_with_provider(self.plan, &provider, &cancel, &pacer, &retry_pacer)
             }
             ProviderKind::Databento => {
                 if self.plan.config.download.start.is_none() {
                     bail!("download.start or --start is required for provider databento");
                 }
                 let provider = DatabentoProvider::connect(&self.plan.config.databento)?;
-                run_with_provider(self.plan, &provider, &cancel, &pacer)
+                run_with_provider(self.plan, &provider, &cancel, &pacer, &retry_pacer)
             }
             provider => bail!("provider {provider} is not implemented yet"),
         }
@@ -229,6 +232,7 @@ fn run_with_provider(
     provider: &impl MarketDataProvider,
     cancel: &CancellationToken,
     pacer: &RequestPacer,
+    retry_pacer: &RequestPacer,
 ) -> Result<()> {
     let downloader = SymbolDownloader {
         provider,
@@ -239,6 +243,7 @@ fn run_with_provider(
         timezone: &plan.timezone,
         cancel,
         pacer,
+        retry_pacer,
     };
 
     let jobs = VecDeque::from(plan.contracts.clone());
@@ -304,7 +309,10 @@ struct SymbolDownloader<'a, P> {
     /// Exchange timezone that anchors the day-advance and log timestamps.
     timezone: &'a TimeZone,
     cancel: &'a CancellationToken,
+    /// Paces the first attempt of each request (normal data-fetch rate).
     pacer: &'a RequestPacer,
+    /// Paces retry attempts after a recoverable failure, independently of `pacer`.
+    retry_pacer: &'a RequestPacer,
 }
 
 impl<P: MarketDataProvider> SymbolDownloader<'_, P> {
@@ -428,10 +436,19 @@ impl<P: MarketDataProvider> SymbolDownloader<'_, P> {
         end: OffsetDateTime,
     ) -> Result<Option<Vec<ProviderTick>>> {
         let mut retry_deadline: Option<Instant> = None;
+        let mut first_attempt = true;
         loop {
-            if !self.pacer.wait(self.cancel) {
+            // The first attempt paces on the normal data-fetch rate; retries pace on the
+            // separate retry interval so a slow request cadence never throttles recovery.
+            let pacer = if first_attempt {
+                self.pacer
+            } else {
+                self.retry_pacer
+            };
+            if !pacer.wait(self.cancel) {
                 return Ok(None);
             }
+            first_attempt = false;
             let error = match self.provider.historical_trade_ticks(
                 contract,
                 cursor,
@@ -870,6 +887,8 @@ mod tests {
             timezone: &TimeZone::UTC,
             cancel,
             pacer,
+            // Tests reuse the same pacer for retries; production wires a separate one.
+            retry_pacer: pacer,
         }
         .download_symbol(&test_stock("AAPL"), store)
     }
@@ -1147,6 +1166,7 @@ mod tests {
             timezone: &TimeZone::UTC,
             cancel: &cancel,
             pacer: &pacer,
+            retry_pacer: &pacer,
         }
         .download_symbol(&contract, &store)
         .unwrap();
@@ -1265,6 +1285,7 @@ mod tests {
             timezone: &tz,
             cancel: &cancel,
             pacer: &pacer,
+            retry_pacer: &pacer,
         }
         .download_symbol(&test_stock("MSFT"), &store)
         .unwrap();
@@ -1318,6 +1339,7 @@ mod tests {
             timezone: &TimeZone::UTC,
             cancel: &cancel,
             pacer: &pacer,
+            retry_pacer: &pacer,
         }
         .download_symbol(&contract, &store)
         .unwrap();
@@ -1368,6 +1390,7 @@ mod tests {
             timezone: &TimeZone::UTC,
             cancel: &cancel,
             pacer: &pacer,
+            retry_pacer: &pacer,
         }
         .download_symbol(&contract, &store)
         .unwrap();
@@ -1413,6 +1436,7 @@ mod tests {
             timezone: &TimeZone::UTC,
             cancel: &cancel,
             pacer: &pacer,
+            retry_pacer: &pacer,
         }
         .download_symbol(&contract, &store)
         .unwrap();
@@ -1458,6 +1482,7 @@ mod tests {
             timezone: &TimeZone::UTC,
             cancel: &cancel,
             pacer: &pacer,
+            retry_pacer: &pacer,
         }
         .download_symbol(&contract, &store)
         .unwrap();
@@ -1531,6 +1556,7 @@ mod tests {
             DownloadPlan::new(config, FwobOptions::default()).unwrap(),
             &provider,
             &cancel,
+            &pacer,
             &pacer,
         )
         .unwrap();
@@ -1617,6 +1643,7 @@ mod tests {
             DownloadPlan::new(config, FwobOptions::default()).unwrap(),
             &provider,
             &cancel,
+            &pacer,
             &pacer,
         );
 

@@ -26,20 +26,19 @@ type Client = ibapi::client::blocking::Client;
 /// wait is asleep the whole time (no busy polling) and returns immediately when data arrives.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
-/// How long a single historical-ticks request may make **zero progress** (no data and no notice)
-/// before we declare it stalled and force a reconnect. A healthy request returns its ticks (or an
-/// empty result) within a second or two, so a request that produces nothing for this long is
-/// wedged — typically because TWS lost its link to the IBKR servers (e.g. a competing session was
-/// opened from another device), which orphans the in-flight request without any socket error or
-/// connectivity-restore notice to wake us. Bounding the wait lets the retry machinery rebuild the
-/// client (and respawn the connectivity watcher) and resume from the unchanged cursor instead of
-/// hanging until the process is restarted. Generous enough to never trip on a merely slow request.
-const STALL_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// True for IBKR "connectivity restored" system codes (1101 = restored, data lost; 1102 =
 /// restored, data maintained). A request in flight across one of these was orphaned by TWS.
 fn is_connectivity_restore(code: i32) -> bool {
     matches!(code, 1101 | 1102)
+}
+
+/// True for IBKR notice codes that report a transient competing-session takeover rather than a
+/// fatal request error. 10187 is "Trading TWS session is connected from a different IP address",
+/// returned when the same account signs in elsewhere; the condition clears on its own once the
+/// other session ends, so the request must be retried from the unchanged cursor rather than the
+/// symbol abandoned. Kept as a list so sibling codes (e.g. a future 10197) are easy to add.
+fn is_competing_session_notice(code: i32) -> bool {
+    matches!(code, 10187)
 }
 
 struct Versioned<T> {
@@ -105,10 +104,11 @@ enum IbkrFailure {
     /// The request was in flight across a TWS<->IBKR connectivity blip and was silently
     /// dropped by TWS; it must be re-issued from the unchanged cursor.
     Orphaned,
-    /// The request made no progress for [`STALL_TIMEOUT`]: no data, no notice, no completion, and
-    /// no connectivity-restore signal. TWS's link to the IBKR servers is wedged (e.g. a competing
-    /// session opened elsewhere). The client must be rebuilt and the request re-issued.
-    Stalled,
+    /// The request made no progress for the configured stall window (carried here, in seconds):
+    /// no data, no notice, no completion, and no connectivity-restore signal. TWS's link to the
+    /// IBKR servers is wedged (e.g. a competing session opened elsewhere). The client must be
+    /// rebuilt and the request re-issued.
+    Stalled(u64),
     /// Cancellation was requested while the request was waiting.
     Canceled,
 }
@@ -126,10 +126,9 @@ impl fmt::Display for IbkrRequestError {
             IbkrFailure::Orphaned => {
                 write!(formatter, "request orphaned by an IBKR connectivity loss")
             }
-            IbkrFailure::Stalled => write!(
+            IbkrFailure::Stalled(seconds) => write!(
                 formatter,
-                "request stalled with no response from IBKR for {}s",
-                STALL_TIMEOUT.as_secs()
+                "request stalled with no response from IBKR for {seconds}s"
             ),
             IbkrFailure::Canceled => write!(formatter, "request canceled"),
         }
@@ -138,10 +137,11 @@ impl fmt::Display for IbkrRequestError {
 
 impl StdError for IbkrRequestError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        match &self.failure {
-            IbkrFailure::Ibapi(source) => Some(source),
-            _ => None,
-        }
+        // Display already renders the underlying ibapi message in full, so exposing that same
+        // error as a `source` would make anyhow's `{:#}` chain print the message twice. The
+        // typed failure is still available via `downcast_ref::<IbkrRequestError>` for recovery
+        // classification, which is the only consumer that needs it.
+        None
     }
 }
 
@@ -174,6 +174,14 @@ fn classify_recovery(error: &anyhow::Error) -> Option<RecoveryAction> {
         IbkrFailure::Ibapi(ibapi::Error::ConnectionReset) | IbkrFailure::Orphaned => {
             Some(RecoveryAction::Retry)
         }
+        // A competing-session takeover (10187) is transient and clears when the other session
+        // ends. Retry from the unchanged cursor — without rebuilding the client — instead of
+        // abandoning the symbol, so a brief login elsewhere no longer fails the whole run.
+        IbkrFailure::Ibapi(ibapi::Error::Notice(notice))
+            if is_competing_session_notice(notice.code) =>
+        {
+            Some(RecoveryAction::Retry)
+        }
         IbkrFailure::Ibapi(ibapi::Error::ConnectionFailed | ibapi::Error::Shutdown) => {
             Some(RecoveryAction::Reconnect {
                 generation: request.generation,
@@ -182,7 +190,7 @@ fn classify_recovery(error: &anyhow::Error) -> Option<RecoveryAction> {
         // A stalled request means the current client/connection is wedged: rebuilding it (which
         // also respawns the connectivity watcher) and re-issuing from the unchanged cursor is the
         // only way forward once the upstream link recovers.
-        IbkrFailure::Stalled => Some(RecoveryAction::Reconnect {
+        IbkrFailure::Stalled(_) => Some(RecoveryAction::Reconnect {
             generation: request.generation,
         }),
         // A dropped API socket (os error 10053 / UnexpectedEof) arrives as an I/O error. Rebuild
@@ -203,6 +211,9 @@ pub struct IbkrProvider {
     /// Bumped by the background connectivity watcher on every restore (1101/1102). A request
     /// records this at start; if it advances while the request waits, the request was orphaned.
     connectivity: Arc<AtomicU64>,
+    /// How long a request may make zero progress before it is declared stalled and reconnected.
+    /// `None` disables stall detection (config `stall_timeout_seconds = 0`).
+    stall_timeout: Option<Duration>,
 }
 
 impl IbkrProvider {
@@ -213,6 +224,10 @@ impl IbkrProvider {
             config: config.clone(),
             clients: ClientSlot::new(client),
             connectivity,
+            stall_timeout: match config.stall_timeout_seconds {
+                0 => None,
+                seconds => Some(Duration::from_secs(seconds)),
+            },
         })
     }
 
@@ -288,8 +303,8 @@ impl MarketDataProvider for IbkrProvider {
 
         let mut out = Vec::new();
         // Last time the request made progress (received any message). A request that produces
-        // nothing for `STALL_TIMEOUT` is wedged and must be reconnected rather than waited on
-        // forever; the timer resets on every data tick or notice.
+        // nothing for `self.stall_timeout` is wedged and must be reconnected rather than waited
+        // on forever; the timer resets on every data tick or notice.
         let mut last_progress = Instant::now();
         loop {
             let started = Instant::now();
@@ -326,9 +341,15 @@ impl MarketDataProvider for IbkrProvider {
                     // A request that has produced nothing for the whole stall window is wedged
                     // (e.g. TWS lost its IBKR-server link to a competing session) without any
                     // socket error or restore notice to wake us. Force a reconnect instead of
-                    // hanging until the process is restarted.
-                    if last_progress.elapsed() >= STALL_TIMEOUT {
-                        return Err(Self::request_error(IbkrFailure::Stalled, generation));
+                    // hanging until the process is restarted. Skipped when stall detection is
+                    // disabled (`stall_timeout` is `None`).
+                    if let Some(stall_timeout) = self.stall_timeout
+                        && last_progress.elapsed() >= stall_timeout
+                    {
+                        return Err(Self::request_error(
+                            IbkrFailure::Stalled(stall_timeout.as_secs()),
+                            generation,
+                        ));
                     }
                     // Otherwise the connection is healthy and the request is merely slow: keep
                     // waiting rather than re-issuing a still-valid request.
@@ -416,11 +437,28 @@ mod tests {
         );
 
         // A stalled request rebuilds the client (and respawns the watcher) at its generation.
-        let stalled = IbkrProvider::request_error(IbkrFailure::Stalled, 5);
+        let stalled = IbkrProvider::request_error(IbkrFailure::Stalled(30), 5);
         assert_eq!(
             classify_recovery(&stalled),
             Some(RecoveryAction::Reconnect { generation: 5 })
         );
+
+        // A competing-session notice (10187) is transient: retry from the unchanged cursor.
+        let competing = IbkrProvider::request_error(
+            IbkrFailure::Ibapi(ibapi::Error::Notice(notice(
+                10187,
+                "Trading TWS session is connected from a different IP address",
+            ))),
+            2,
+        );
+        assert_eq!(classify_recovery(&competing), Some(RecoveryAction::Retry));
+
+        // An unrelated notice (e.g. 200 no security definition) stays fatal.
+        let no_contract = IbkrProvider::request_error(
+            IbkrFailure::Ibapi(ibapi::Error::Notice(notice(200, "No security definition found"))),
+            0,
+        );
+        assert_eq!(classify_recovery(&no_contract), None);
 
         // Cancellation is not retryable; the downloader stops cleanly via its own cancel check.
         let canceled = IbkrProvider::request_error(IbkrFailure::Canceled, 0);
@@ -428,6 +466,32 @@ mod tests {
 
         // Unrelated errors are not recoverable.
         assert_eq!(classify_recovery(&anyhow::anyhow!("nope")), None);
+    }
+
+    /// Builds a minimal TWS notice for classification tests (no wire timestamp or reject JSON).
+    fn notice(code: i32, message: &str) -> ibapi::Notice {
+        ibapi::Notice {
+            code,
+            message: message.to_owned(),
+            error_time: None,
+            advanced_order_reject_json: String::new(),
+        }
+    }
+
+    /// The doubled-message regression: `IbkrRequestError` renders the ibapi message once, so
+    /// anyhow's `{:#}` chain must not repeat it.
+    #[test]
+    fn ibapi_failure_display_is_not_duplicated_in_the_anyhow_chain() {
+        let error = IbkrProvider::request_error(
+            IbkrFailure::Ibapi(ibapi::Error::Notice(notice(
+                10187,
+                "Trading TWS session is connected from a different IP address",
+            ))),
+            0,
+        );
+        let rendered = format!("{error:#}");
+        let occurrences = rendered.matches("different IP address").count();
+        assert_eq!(occurrences, 1, "message duplicated: {rendered}");
     }
 
     #[test]

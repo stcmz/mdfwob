@@ -61,6 +61,10 @@ pub struct IbkrConfig {
     pub port: u16,
     pub client_id: i32,
     pub reconnect_timeout_seconds: i64,
+    /// Seconds a single request may make zero progress (no data or notice) before it is declared
+    /// stalled and force-reconnected. Guards against a competing session silently orphaning an
+    /// in-flight request. `0` disables stall detection.
+    pub stall_timeout_seconds: u64,
 }
 
 impl Default for IbkrConfig {
@@ -70,6 +74,7 @@ impl Default for IbkrConfig {
             port: 4002,
             client_id: 0,
             reconnect_timeout_seconds: -1,
+            stall_timeout_seconds: 30,
         }
     }
 }
@@ -84,6 +89,10 @@ pub struct DownloadConfig {
     pub use_rth: bool,
     pub parallelism: usize,
     pub request_interval_ms: u64,
+    /// Minimum interval between retry attempts after a recoverable provider error, in
+    /// milliseconds. Separate from `request_interval_ms` so the retry cadence can be tuned
+    /// independently of the normal data-fetch pace.
+    pub retry_interval_ms: u64,
     /// Exchange timezone (IANA name) used to align the download day-advance and to render the
     /// download log timestamps. A trading day (pre-market through after-hours) lives entirely
     /// within one local calendar day, so on an empty response advancing to the next *local*
@@ -102,6 +111,7 @@ impl Default for DownloadConfig {
             use_rth: false,
             parallelism: 4,
             request_interval_ms: 3_000,
+            retry_interval_ms: 3_000,
             timezone: "America/New_York".into(),
         }
     }
@@ -230,6 +240,7 @@ mod tests {
         let download = DownloadConfig::default();
         assert_eq!(download.provider, ProviderKind::Ibkr);
         assert_eq!(download.request_interval_ms, 3_000);
+        assert_eq!(download.retry_interval_ms, 3_000);
     }
 
     #[test]
@@ -274,6 +285,7 @@ mod tests {
         assert_eq!(config.ibkr.port, 7496);
         assert_eq!(config.ibkr.client_id, 42);
         assert_eq!(config.ibkr.reconnect_timeout_seconds, -1);
+        assert_eq!(config.ibkr.stall_timeout_seconds, 30);
     }
 
     #[test]

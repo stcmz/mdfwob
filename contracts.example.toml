@@ -4,6 +4,7 @@ host = "127.0.0.1" # Host running TWS or IB Gateway.
 port = 4002 # Common defaults: Gateway paper 4002, Gateway live 4001.
 client_id = 0 # Must be unique among API clients connected to this session.
 reconnect_timeout_seconds = -1 # -1 retries forever; 0 fails immediately; positive values are seconds.
+stall_timeout_seconds = 30 # Force a reconnect if a request makes no progress for this many seconds; 0 disables.
 
 # Databento authentication and dataset selection. Ignored by other providers.
 [databento]
@@ -20,6 +21,7 @@ end = "2026-06-09T00:00:00Z" # Optional fixed cutoff; omit to use the current ti
 use_rth = false # false includes all available hours; Databento currently requires false.
 parallelism = 4 # Maximum number of contracts processed concurrently.
 request_interval_ms = 3000 # Global minimum spacing between provider requests.
+retry_interval_ms = 3000 # Global minimum spacing between retry attempts after a recoverable error.
 timezone = "America/New_York" # Exchange tz for day-advance alignment and log timestamps (stored Time stays UTC).
 
 # Symbols in one stock group share currency and exchange properties.

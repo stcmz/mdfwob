@@ -100,6 +100,11 @@ struct DownloadArgs {
     #[arg(long, allow_hyphen_values = true)]
     reconnect_timeout_seconds: Option<i64>,
 
+    /// Seconds a request may stall with no data before forcing a reconnect. 0 disables stall
+    /// detection. Defaults to 30.
+    #[arg(long)]
+    stall_timeout_seconds: Option<u64>,
+
     /// Default primary exchange for ad hoc stock symbols.
     #[arg(long)]
     primary_exchange: Option<String>,
@@ -137,6 +142,11 @@ struct DownloadArgs {
     #[arg(long)]
     request_interval_ms: Option<u64>,
 
+    /// Minimum interval between retry attempts after a recoverable error, in milliseconds.
+    /// Independent of --request-interval-ms. Defaults to 3000.
+    #[arg(long)]
+    retry_interval_ms: Option<u64>,
+
     /// Optional CONFIG.toml, symbols, and FWOB tokens.
     #[arg(value_name = "ITEM", num_args = 0..)]
     items: Vec<String>,
@@ -170,6 +180,9 @@ impl DownloadArgs {
         if let Some(reconnect_timeout_seconds) = self.reconnect_timeout_seconds {
             config.ibkr.reconnect_timeout_seconds = reconnect_timeout_seconds;
         }
+        if let Some(stall_timeout_seconds) = self.stall_timeout_seconds {
+            config.ibkr.stall_timeout_seconds = stall_timeout_seconds;
+        }
         if let Some(start) = self.start {
             config.download.start = Some(start);
         }
@@ -193,6 +206,9 @@ impl DownloadArgs {
         }
         if let Some(request_interval_ms) = self.request_interval_ms {
             config.download.request_interval_ms = request_interval_ms;
+        }
+        if let Some(retry_interval_ms) = self.retry_interval_ms {
+            config.download.retry_interval_ms = retry_interval_ms;
         }
         if let Some(timezone) = self.timezone {
             config.download.timezone = timezone;
@@ -1105,6 +1121,19 @@ mod tests {
     }
 
     #[test]
+    fn retry_interval_is_accepted_as_an_ad_hoc_override() {
+        let cli =
+            Cli::try_parse_from(["mdfwob", "download", "SPCX", "--retry-interval-ms", "5000"])
+                .unwrap();
+        let Command::Download(args) = cli.command else {
+            panic!("expected download command");
+        };
+
+        assert_eq!(args.retry_interval_ms, Some(5_000));
+        assert_eq!(args.items, ["SPCX"]);
+    }
+
+    #[test]
     fn reconnect_timeout_is_accepted_as_an_ibkr_override() {
         for (value, expected) in [("-1", -1), ("0", 0), ("1234", 1234)] {
             let cli = Cli::try_parse_from([
@@ -1119,6 +1148,19 @@ mod tests {
                 panic!("expected download command");
             };
             assert_eq!(args.reconnect_timeout_seconds, Some(expected));
+        }
+    }
+
+    #[test]
+    fn stall_timeout_is_accepted_as_an_ibkr_override() {
+        for (value, expected) in [("0", 0u64), ("45", 45)] {
+            let cli =
+                Cli::try_parse_from(["mdfwob", "download", "SPCX", "--stall-timeout-seconds", value])
+                    .unwrap();
+            let Command::Download(args) = cli.command else {
+                panic!("expected download command");
+            };
+            assert_eq!(args.stall_timeout_seconds, Some(expected));
         }
     }
 }
