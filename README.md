@@ -266,6 +266,14 @@ Copy `contracts.example.toml` to a local `contracts.toml` and adjust provider,
 output, and contract settings. `contracts.toml`, downloaded FWOB files, logs,
 and scratch directories are intentionally excluded from Git.
 
+The repository ships a tracked pre-commit hook (`.githooks/pre-commit`) that runs
+`cargo fmt --check`, matching the CI formatting gate so a style slip fails locally
+instead of on a pushed commit. Enable it once per clone with:
+
+```text
+git config core.hooksPath .githooks
+```
+
 ## License
 
 Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).
