@@ -111,10 +111,12 @@ impl TickStore {
         Ok(())
     }
 
-    /// Opens a session that keeps a single writer open across many appended batches.
+    /// Opens a session that keeps a single writer open across appended batches.
     ///
-    /// The whole point is to avoid the open→append→finish churn of one cycle per batch: callers
-    /// append every batch into the same `TickWriter` and `finish()` once at the end of a symbol.
+    /// Avoids the open→append→finish churn of one cycle per batch: callers append every batch into
+    /// the same `TickWriter`. Call [`TickWriter::commit`] periodically to durably flush the file
+    /// mid-download (it reopens lazily on the next append) and [`TickWriter::finish`] once at the
+    /// end.
     pub fn writer(&self) -> TickWriter<'_> {
         TickWriter {
             store: self,
@@ -202,6 +204,17 @@ impl TickWriter<'_> {
             tick.encode(&mut encoded);
         }
         Ok(writer.append_frames_transactional(&encoded)?)
+    }
+
+    /// Durably commits everything appended so far by finishing the open writer, leaving the session
+    /// ready to continue: the next [`append_ticks`](Self::append_ticks) lazily reopens the file for
+    /// append. Lets a long download advance the on-disk file mid-run and keeps writer memory
+    /// bounded, instead of buffering the whole symbol until [`finish`](Self::finish).
+    pub fn commit(&mut self) -> Result<()> {
+        if let Some(writer) = self.writer.take() {
+            writer.finish()?;
+        }
+        Ok(())
     }
 
     pub fn finish(self) -> Result<()> {
@@ -461,6 +474,31 @@ mod tests {
         assert_eq!(store.last_timestamp().unwrap(), Some(49));
         let report = Maintenance::verify(store.path(), ReaderOptions::default()).unwrap();
         assert_eq!(report.frame_count, total);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn commit_flushes_mid_session_and_reopens_for_more() {
+        let dir = temp_dir("mdfwob-commit");
+        let store = TickStore::new(&dir, "AAPL", FwobOptions::default());
+
+        let mut writer = store.writer();
+        writer
+            .append_ticks(&[ShortTick::new(10, 1.23, 100).unwrap()])
+            .unwrap();
+        // A commit (no final finish yet) must make the first batch durably readable.
+        writer.commit().unwrap();
+        assert_eq!(store.last_timestamp().unwrap(), Some(10));
+
+        // The same writer keeps going: the next append reopens the file lazily.
+        writer
+            .append_ticks(&[ShortTick::new(11, 1.24, 200).unwrap()])
+            .unwrap();
+        writer.finish().unwrap();
+        assert_eq!(store.last_timestamp().unwrap(), Some(11));
+
+        let report = Maintenance::verify(store.path(), ReaderOptions::default()).unwrap();
+        assert_eq!(report.frame_count, 2);
         fs::remove_dir_all(dir).unwrap();
     }
 

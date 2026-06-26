@@ -74,7 +74,7 @@ impl Default for IbkrConfig {
             port: 4002,
             client_id: 0,
             reconnect_timeout_seconds: -1,
-            stall_timeout_seconds: 30,
+            stall_timeout_seconds: 60,
         }
     }
 }
@@ -93,6 +93,11 @@ pub struct DownloadConfig {
     /// milliseconds. Separate from `request_interval_ms` so the retry cadence can be tuned
     /// independently of the normal data-fetch pace.
     pub retry_interval_ms: u64,
+    /// How often, in seconds, an in-progress symbol download commits its open writer to disk so
+    /// the file advances live and memory stays bounded. `-1` keeps the whole symbol in one writer
+    /// and commits only at the end; `0` commits after every batch; a positive value commits at
+    /// most that often.
+    pub commit_interval_seconds: i64,
     /// Exchange timezone (IANA name) used to align the download day-advance and to render the
     /// download log timestamps. A trading day (pre-market through after-hours) lives entirely
     /// within one local calendar day, so on an empty response advancing to the next *local*
@@ -110,8 +115,9 @@ impl Default for DownloadConfig {
             end: None,
             use_rth: false,
             parallelism: 4,
-            request_interval_ms: 3_000,
-            retry_interval_ms: 3_000,
+            request_interval_ms: 1_000,
+            retry_interval_ms: 10_000,
+            commit_interval_seconds: 60,
             timezone: "America/New_York".into(),
         }
     }
@@ -236,11 +242,12 @@ mod tests {
     }
 
     #[test]
-    fn download_defaults_use_three_second_request_interval() {
+    fn download_interval_defaults() {
         let download = DownloadConfig::default();
         assert_eq!(download.provider, ProviderKind::Ibkr);
-        assert_eq!(download.request_interval_ms, 3_000);
-        assert_eq!(download.retry_interval_ms, 3_000);
+        assert_eq!(download.request_interval_ms, 1_000);
+        assert_eq!(download.retry_interval_ms, 10_000);
+        assert_eq!(download.commit_interval_seconds, 60);
     }
 
     #[test]
@@ -285,7 +292,7 @@ mod tests {
         assert_eq!(config.ibkr.port, 7496);
         assert_eq!(config.ibkr.client_id, 42);
         assert_eq!(config.ibkr.reconnect_timeout_seconds, -1);
-        assert_eq!(config.ibkr.stall_timeout_seconds, 30);
+        assert_eq!(config.ibkr.stall_timeout_seconds, 60);
     }
 
     #[test]

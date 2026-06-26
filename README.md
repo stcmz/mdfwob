@@ -84,7 +84,7 @@ or `P`). Currency, exchange, and multiplier default to `USD`, `SMART`, and
 `100`; `trading_class` and `local_symbol` can disambiguate weekly or nonstandard
 contracts. Option output names include the expiry, right, and strike, for
 example `MSFT_20260717_C_450.fwob`. See `contracts.example.toml` for the
-complete schema. Historical request starts are globally spaced by 3 seconds by
+complete schema. Historical request starts are globally spaced by 1 second by
 default; set `download.request_interval_ms` to override this. Unknown config
 keys, unsafe output names, and contracts that map to the same output filename
 are rejected before a provider connection is opened.
@@ -105,8 +105,15 @@ IBKR connection resets are retried from the unchanged download cursor. Set
 unlimited retries (the default), `0` to fail the symbol immediately, or a
 positive number for a wall-clock retry budget in seconds. Retry attempts are
 paced by their own global interval, `download.retry_interval_ms` /
-`--retry-interval-ms` (default 3000), independent of the normal data-fetch
-spacing in `download.request_interval_ms`.
+`--retry-interval-ms` (default 10000), independent of the normal data-fetch
+spacing in `download.request_interval_ms` (default 1000).
+
+A download keeps one writer open per symbol and commits it to disk periodically so
+the output advances live and writer memory stays bounded, rather than buffering a
+whole multi-month backlog until the symbol completes. `download.commit_interval_seconds`
+/ `--commit-interval-seconds` controls the cadence (default 60): `-1` commits only at
+the end (and on Ctrl+C), `0` commits after every batch, and a positive value commits
+at most that often.
 
 A TWS/IB Gateway upstream-connectivity blip (IBKR system codes 1100 then
 1101/1102) can silently orphan an in-flight request without dropping the API
@@ -119,13 +126,16 @@ is connected from a different IP address"); rather than abandoning the symbol,
 mdfwob retries it from the unchanged cursor (paced, within the reconnect budget)
 until the other session ends. A request already in flight can instead be wedged
 silently — no socket error and no 1101/1102 restore notice — so a request that
-makes no progress at all for `ibkr.stall_timeout_seconds` (default 30; set
-`--stall-timeout-seconds`, or `0` to disable) is treated as stalled: the client
-is rebuilt (which also respawns the connectivity watcher) and the request
-re-issued from the unchanged cursor, so the download recovers on its own instead
-of hanging until `mdfwob` is restarted. A request that is merely slow but still
-receiving data or notices is never re-issued. Ctrl+C is honored promptly even
-while a request is blocked or stalled; a second Ctrl+C forces an immediate exit.
+makes no progress at all for `ibkr.stall_timeout_seconds` (default 60; set
+`--stall-timeout-seconds`, or `0` to disable) is treated as stalled and re-issued
+on the existing connection from the unchanged cursor, so the download recovers on
+its own instead of hanging until `mdfwob` is restarted. (A stalled request is not
+reconnected: the socket is usually still alive — it is serving other symbols — and
+the orphan is upstream, so a reconnect with the same client id would only collide
+with itself; a genuinely dead socket instead surfaces a connection-loss error that
+does trigger a reconnect.) A request that is merely slow but still receiving data
+or notices is never re-issued. Ctrl+C is honored promptly even while a request is
+blocked or stalled; a second Ctrl+C forces an immediate exit.
 
 Databento uses its official Rust SDK and reads the API key from
 `DATABENTO_API_KEY` by default. The variable name and stock/option datasets are

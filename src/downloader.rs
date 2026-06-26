@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
+    path::Path,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -244,6 +245,7 @@ fn run_with_provider(
         cancel,
         pacer,
         retry_pacer,
+        commit_interval_seconds: plan.config.download.commit_interval_seconds,
     };
 
     let jobs = VecDeque::from(plan.contracts.clone());
@@ -313,6 +315,9 @@ struct SymbolDownloader<'a, P> {
     pacer: &'a RequestPacer,
     /// Paces retry attempts after a recoverable failure, independently of `pacer`.
     retry_pacer: &'a RequestPacer,
+    /// How often to commit the open writer mid-download: `-1` only at the end, `0` after every
+    /// batch, `>0` at most every N seconds.
+    commit_interval_seconds: i64,
 }
 
 impl<P: MarketDataProvider> SymbolDownloader<'_, P> {
@@ -332,15 +337,16 @@ impl<P: MarketDataProvider> SymbolDownloader<'_, P> {
 
         info!(
             symbol = %contract.symbol,
-            output = %store.path().display(),
+            output = %display_path(store.path()),
             start = %fmt_in_tz(cursor, self.timezone),
             end = %self.configured_end.map_or_else(|| "dynamic-now".to_string(), |end| fmt_in_tz(end, self.timezone)),
             "downloading symbol"
         );
 
-        // Keep one writer open for the whole symbol instead of reopening/finishing per batch, then
-        // finish exactly once. `finish` runs on every exit path (normal completion, cancellation, and
-        // the error from a rejected batch) so all previously appended batches are committed.
+        // Keep one writer open across batches, committing periodically (see commit_interval_seconds)
+        // so the file advances live and writer memory stays bounded. `finish` still runs on every
+        // exit path (normal completion, cancellation, and the error from a rejected batch) to commit
+        // the trailing segment.
         let mut writer = store.writer();
         let appended = match self.download_symbol_batches(contract, &mut writer, cursor) {
             Ok(appended) => appended,
@@ -351,7 +357,7 @@ impl<P: MarketDataProvider> SymbolDownloader<'_, P> {
                     bail!(
                         "download failed for {}: {download_error:#}; additionally failed to finalize {}: {finish_error:#}",
                         contract.symbol,
-                        store.path().display()
+                        display_path(store.path())
                     );
                 }
                 return Err(download_error);
@@ -359,7 +365,7 @@ impl<P: MarketDataProvider> SymbolDownloader<'_, P> {
         };
         writer
             .finish()
-            .with_context(|| format!("failed to finalize {}", store.path().display()))?;
+            .with_context(|| format!("failed to finalize {}", display_path(store.path())))?;
 
         if self.cancel.is_canceled() {
             info!(symbol = %contract.symbol, appended, "stopped after cancellation");
@@ -378,6 +384,7 @@ impl<P: MarketDataProvider> SymbolDownloader<'_, P> {
         mut cursor: OffsetDateTime,
     ) -> Result<u64> {
         let mut appended = 0u64;
+        let mut last_commit = Instant::now();
         loop {
             let end = resolve_end(self.configured_end);
             if cursor >= end {
@@ -420,6 +427,18 @@ impl<P: MarketDataProvider> SymbolDownloader<'_, P> {
             appended += count as u64;
             cursor = OffsetDateTime::from_unix_timestamp(i64::from(last_second) + 1)?;
             info!(symbol = %contract.symbol, count, next = %fmt_in_tz(cursor, self.timezone), "appended ticks");
+
+            // Periodically commit so the on-disk file advances live and writer memory stays
+            // bounded: -1 = only at the end, 0 = every batch, >0 = at most every N seconds.
+            let commit_now = match self.commit_interval_seconds {
+                n if n < 0 => false,
+                0 => true,
+                n => last_commit.elapsed() >= Duration::from_secs(n as u64),
+            };
+            if commit_now {
+                writer.commit()?;
+                last_commit = Instant::now();
+            }
         }
         Ok(appended)
     }
@@ -499,6 +518,7 @@ impl<P: MarketDataProvider> SymbolDownloader<'_, P> {
                 if let Err(reconnect_error) = self.provider.reconnect(generation) {
                     warn!(
                         symbol = %contract.symbol,
+                        generation,
                         error = %format!("{reconnect_error:#}"),
                         "reconnect attempt failed; will retry"
                     );
@@ -714,10 +734,42 @@ fn parse_time(value: &str) -> Result<OffsetDateTime> {
     {
         return Ok(value);
     }
+    // A bare integer (optionally comma-grouped) is a raw Unix epoch second / FWOB key.
+    if let Some(epoch) = parse_epoch_seconds(value) {
+        return OffsetDateTime::from_unix_timestamp(epoch)
+            .map_err(|_| anyhow::anyhow!("epoch second out of range: {value}"));
+    }
     let format = time::macros::format_description!("[year]-[month]-[day]");
     let date = time::Date::parse(value, format)
         .map_err(|_| anyhow::anyhow!("invalid date/time: {value}"))?;
     Ok(date.midnight().assume_utc())
+}
+
+/// Parses a string of ASCII digits with optional thousands separators (commas) and an optional
+/// leading `-` as a signed integer. Used to accept a raw FWOB key / Unix epoch second anywhere a
+/// time bound is taken (e.g. `1,778,078,433`). Returns `None` for anything not purely
+/// digits/commas, so RFC3339 and `YYYY-MM-DD` forms fall through to their own parsers.
+pub(crate) fn parse_epoch_seconds(value: &str) -> Option<i64> {
+    let trimmed = value.trim();
+    let (negative, digits) = match trimmed.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, trimmed),
+    };
+    if !digits.bytes().all(|b| b.is_ascii_digit() || b == b',')
+        || !digits.bytes().any(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let cleaned: String = digits.chars().filter(|c| *c != ',').collect();
+    let magnitude = cleaned.parse::<i64>().ok()?;
+    Some(if negative { -magnitude } else { magnitude })
+}
+
+/// Renders a filesystem path for logging with forward slashes, so a mix of config-supplied `/`
+/// and platform `\` separators (e.g. `C:/Users/...\AAPL.fwob` on Windows) is shown consistently.
+/// Display only — actual file operations use the unmodified `Path`.
+pub(crate) fn display_path(path: &Path) -> String {
+    path.display().to_string().replace('\\', "/")
 }
 
 #[cfg(test)]
@@ -889,6 +941,7 @@ mod tests {
             pacer,
             // Tests reuse the same pacer for retries; production wires a separate one.
             retry_pacer: pacer,
+            commit_interval_seconds: -1,
         }
         .download_symbol(&test_stock("AAPL"), store)
     }
@@ -1167,6 +1220,7 @@ mod tests {
             cancel: &cancel,
             pacer: &pacer,
             retry_pacer: &pacer,
+            commit_interval_seconds: -1,
         }
         .download_symbol(&contract, &store)
         .unwrap();
@@ -1175,6 +1229,101 @@ mod tests {
         assert_eq!(
             provider.starts.lock().unwrap().as_slice(),
             &[base, base + time::Duration::seconds(2),]
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn commit_interval_zero_flushes_each_batch_mid_download() {
+        // With commit-every-batch, batch 1 must be durably readable by the time batch 2 is
+        // requested — proving the writer commits mid-download instead of only at the end.
+        struct CommitProbe {
+            base: OffsetDateTime,
+            dir: std::path::PathBuf,
+            batch1_seen_at_batch2: Mutex<Option<Option<u32>>>,
+            calls: Mutex<u32>,
+        }
+
+        impl MarketDataProvider for CommitProbe {
+            fn head_timestamp(
+                &self,
+                _contract: &StockContract,
+                _use_rth: bool,
+            ) -> Result<OffsetDateTime> {
+                unreachable!("configured start avoids head timestamp")
+            }
+
+            fn historical_trade_ticks(
+                &self,
+                _contract: &StockContract,
+                start: OffsetDateTime,
+                _end: OffsetDateTime,
+                _max_ticks: i32,
+                _use_rth: bool,
+                _cancel: &CancellationToken,
+            ) -> Result<Vec<ProviderTick>> {
+                let call = {
+                    let mut calls = self.calls.lock().unwrap();
+                    *calls += 1;
+                    *calls
+                };
+                match call {
+                    1 => Ok(vec![ProviderTick {
+                        timestamp: self.base,
+                        price: 10.0,
+                        size: 1,
+                    }]),
+                    2 => {
+                        let committed = TickStore::new(&self.dir, "AAPL", FwobOptions::default())
+                            .last_timestamp()
+                            .unwrap();
+                        *self.batch1_seen_at_batch2.lock().unwrap() = Some(committed);
+                        Ok(vec![ProviderTick {
+                            timestamp: start,
+                            price: 10.1,
+                            size: 2,
+                        }])
+                    }
+                    _ => Ok(Vec::new()),
+                }
+            }
+        }
+
+        let base = OffsetDateTime::from_unix_timestamp(1_700_900_000).unwrap();
+        let dir = temp_dir("mdfwob-commit-cadence");
+        let store = TickStore::new(&dir, "AAPL", FwobOptions::default());
+        let provider = CommitProbe {
+            base,
+            dir: dir.clone(),
+            batch1_seen_at_batch2: Mutex::new(None),
+            calls: Mutex::new(0),
+        };
+        let cancel = CancellationToken::new();
+        let pacer = RequestPacer::new(Duration::ZERO);
+
+        SymbolDownloader {
+            provider: &provider,
+            configured_start: Some(base),
+            configured_end: Some(base + time::Duration::seconds(3)),
+            use_rth: false,
+            reconnect_timeout_seconds: -1,
+            timezone: &TimeZone::UTC,
+            cancel: &cancel,
+            pacer: &pacer,
+            retry_pacer: &pacer,
+            commit_interval_seconds: 0,
+        }
+        .download_symbol(&test_stock("AAPL"), &store)
+        .unwrap();
+
+        assert_eq!(
+            *provider.batch1_seen_at_batch2.lock().unwrap(),
+            Some(Some(base.unix_timestamp() as u32)),
+            "batch 1 must be committed before batch 2 is requested"
+        );
+        assert_eq!(
+            store.last_timestamp().unwrap(),
+            Some((base + time::Duration::seconds(1)).unix_timestamp() as u32)
         );
         fs::remove_dir_all(dir).unwrap();
     }
@@ -1286,6 +1435,7 @@ mod tests {
             cancel: &cancel,
             pacer: &pacer,
             retry_pacer: &pacer,
+            commit_interval_seconds: -1,
         }
         .download_symbol(&test_stock("MSFT"), &store)
         .unwrap();
@@ -1340,6 +1490,7 @@ mod tests {
             cancel: &cancel,
             pacer: &pacer,
             retry_pacer: &pacer,
+            commit_interval_seconds: -1,
         }
         .download_symbol(&contract, &store)
         .unwrap();
@@ -1391,6 +1542,7 @@ mod tests {
             cancel: &cancel,
             pacer: &pacer,
             retry_pacer: &pacer,
+            commit_interval_seconds: -1,
         }
         .download_symbol(&contract, &store)
         .unwrap();
@@ -1437,6 +1589,7 @@ mod tests {
             cancel: &cancel,
             pacer: &pacer,
             retry_pacer: &pacer,
+            commit_interval_seconds: -1,
         }
         .download_symbol(&contract, &store)
         .unwrap();
@@ -1483,6 +1636,7 @@ mod tests {
             cancel: &cancel,
             pacer: &pacer,
             retry_pacer: &pacer,
+            commit_interval_seconds: -1,
         }
         .download_symbol(&contract, &store)
         .unwrap();
@@ -1796,6 +1950,35 @@ mod tests {
         let parsed = parse_time("2024-03-10").unwrap();
         let expected = parse_time("2024-03-10T00:00:00Z").unwrap();
         assert_eq!(parsed, expected);
+    }
+
+    #[test]
+    fn bare_epoch_seconds_parse_with_optional_commas() {
+        let plain = parse_time("1778078433").unwrap();
+        assert_eq!(plain.unix_timestamp(), 1_778_078_433);
+        assert_eq!(parse_time("1,778,078,433").unwrap(), plain);
+        // Non-numeric junk still falls through to the date/RFC3339 error.
+        assert!(parse_time("12-34").is_err());
+    }
+
+    #[test]
+    fn display_path_normalizes_mixed_separators_to_forward_slashes() {
+        let path = Path::new(r"C:/Users/mc/Downloads/StockDataV2\AAPL.fwob");
+        assert_eq!(
+            display_path(path),
+            "C:/Users/mc/Downloads/StockDataV2/AAPL.fwob"
+        );
+    }
+
+    #[test]
+    fn parse_epoch_seconds_accepts_commas_and_rejects_non_numeric() {
+        assert_eq!(parse_epoch_seconds("1778078433"), Some(1_778_078_433));
+        assert_eq!(parse_epoch_seconds("1,778,078,433"), Some(1_778_078_433));
+        assert_eq!(parse_epoch_seconds("-42"), Some(-42));
+        assert_eq!(parse_epoch_seconds("2026-01-01"), None);
+        assert_eq!(parse_epoch_seconds(","), None);
+        assert_eq!(parse_epoch_seconds(""), None);
+        assert_eq!(parse_epoch_seconds("12a"), None);
     }
 
     #[test]

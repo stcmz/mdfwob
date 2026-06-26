@@ -106,8 +106,9 @@ enum IbkrFailure {
     Orphaned,
     /// The request made no progress for the configured stall window (carried here, in seconds):
     /// no data, no notice, no completion, and no connectivity-restore signal. TWS's link to the
-    /// IBKR servers is wedged (e.g. a competing session opened elsewhere). The client must be
-    /// rebuilt and the request re-issued.
+    /// IBKR servers is wedged (e.g. a competing session opened elsewhere). The request is re-issued
+    /// on the existing client (the socket is usually still alive; a genuinely dead one surfaces an
+    /// `Io` error on the retry, which routes to Reconnect).
     Stalled(u64),
     /// Cancellation was requested while the request was waiting.
     Canceled,
@@ -187,12 +188,13 @@ fn classify_recovery(error: &anyhow::Error) -> Option<RecoveryAction> {
                 generation: request.generation,
             })
         }
-        // A stalled request means the current client/connection is wedged: rebuilding it (which
-        // also respawns the connectivity watcher) and re-issuing from the unchanged cursor is the
-        // only way forward once the upstream link recovers.
-        IbkrFailure::Stalled(_) => Some(RecoveryAction::Reconnect {
-            generation: request.generation,
-        }),
+        // A stalled request is re-issued on the *existing* client, not reconnected. The socket is
+        // typically still alive (it is serving other workers) and the request was orphaned
+        // upstream, so a reconnect can't help and — because the live client still holds the
+        // configured client id — would only collide with itself (IBKR error 326). If the socket is
+        // genuinely dead, the re-issued request surfaces an `Io` connection-loss error that then
+        // routes to Reconnect, by which point the id is free.
+        IbkrFailure::Stalled(_) => Some(RecoveryAction::Retry),
         // A dropped API socket (os error 10053 / UnexpectedEof) arrives as an I/O error. Rebuild
         // the client and retry rather than abandoning the symbol, so a connection that recovers
         // (or a disclaimer that gets accepted) resumes the download instead of failing the run.
@@ -249,7 +251,12 @@ fn connect_client(config: &IbkrConfig, connectivity: &Arc<AtomicU64>) -> Result<
         .address(connection_url.clone())
         .client_id(config.client_id)
         .connect_with_notice_stream()
-        .with_context(|| format!("failed to connect to IBKR at {connection_url}"))?;
+        .with_context(|| {
+            format!(
+                "failed to connect to IBKR at {connection_url} (client_id {})",
+                config.client_id
+            )
+        })?;
 
     let epoch = Arc::clone(connectivity);
     std::thread::Builder::new()
@@ -319,7 +326,7 @@ impl MarketDataProvider for IbkrProvider {
                 }
                 Some(Ok(SubscriptionItem::Notice(notice))) => {
                     last_progress = Instant::now();
-                    warn!(symbol = %contract.symbol, %notice, "IBKR notice during historical tick request");
+                    warn!(client_id = self.config.client_id, generation, symbol = %contract.symbol, %notice, "IBKR notice during historical tick request");
                 }
                 Some(Err(error)) => {
                     return Err(Self::request_error(IbkrFailure::Ibapi(error), generation));
@@ -346,6 +353,13 @@ impl MarketDataProvider for IbkrProvider {
                     if let Some(stall_timeout) = self.stall_timeout
                         && last_progress.elapsed() >= stall_timeout
                     {
+                        warn!(
+                            client_id = self.config.client_id,
+                            generation,
+                            symbol = %contract.symbol,
+                            stall_seconds = stall_timeout.as_secs(),
+                            "historical request stalled; recovering on the existing client"
+                        );
                         return Err(Self::request_error(
                             IbkrFailure::Stalled(stall_timeout.as_secs()),
                             generation,
@@ -436,12 +450,9 @@ mod tests {
             Some(RecoveryAction::Reconnect { generation: 9 })
         );
 
-        // A stalled request rebuilds the client (and respawns the watcher) at its generation.
+        // A stalled request retries on the existing client (no reconnect → no 326 self-collision).
         let stalled = IbkrProvider::request_error(IbkrFailure::Stalled(30), 5);
-        assert_eq!(
-            classify_recovery(&stalled),
-            Some(RecoveryAction::Reconnect { generation: 5 })
-        );
+        assert_eq!(classify_recovery(&stalled), Some(RecoveryAction::Retry));
 
         // A competing-session notice (10187) is transient: retry from the unchanged cursor.
         let competing = IbkrProvider::request_error(

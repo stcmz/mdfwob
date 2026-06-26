@@ -27,7 +27,7 @@ use crate::{
         stat::StatAccumulator,
     },
     config::{Config, StockContractConfig},
-    downloader::{DownloadPlan, Downloader},
+    downloader::{DownloadPlan, Downloader, parse_epoch_seconds},
     fwob_options::{parse_tokens, validate_zstd_level},
 };
 
@@ -100,8 +100,8 @@ struct DownloadArgs {
     #[arg(long, allow_hyphen_values = true)]
     reconnect_timeout_seconds: Option<i64>,
 
-    /// Seconds a request may stall with no data before forcing a reconnect. 0 disables stall
-    /// detection. Defaults to 30.
+    /// Seconds a request may stall with no data before it is aborted and retried. 0 disables
+    /// stall detection. Defaults to 60.
     #[arg(long)]
     stall_timeout_seconds: Option<u64>,
 
@@ -138,14 +138,19 @@ struct DownloadArgs {
     #[arg(long)]
     parallelism: Option<usize>,
 
-    /// Minimum interval between provider requests in milliseconds. Defaults to 3000.
+    /// Minimum interval between provider requests in milliseconds. Defaults to 1000.
     #[arg(long)]
     request_interval_ms: Option<u64>,
 
     /// Minimum interval between retry attempts after a recoverable error, in milliseconds.
-    /// Independent of --request-interval-ms. Defaults to 3000.
+    /// Independent of --request-interval-ms. Defaults to 10000.
     #[arg(long)]
     retry_interval_ms: Option<u64>,
+
+    /// How often (seconds) to commit an in-progress download to disk. -1 commits only at the end;
+    /// 0 commits after every batch; positive commits at most that often. Defaults to 60.
+    #[arg(long, allow_hyphen_values = true)]
+    commit_interval_seconds: Option<i64>,
 
     /// Optional CONFIG.toml, symbols, and FWOB tokens.
     #[arg(value_name = "ITEM", num_args = 0..)]
@@ -209,6 +214,9 @@ impl DownloadArgs {
         }
         if let Some(retry_interval_ms) = self.retry_interval_ms {
             config.download.retry_interval_ms = retry_interval_ms;
+        }
+        if let Some(commit_interval_seconds) = self.commit_interval_seconds {
+            config.download.commit_interval_seconds = commit_interval_seconds;
         }
         if let Some(timezone) = self.timezone {
             config.download.timezone = timezone;
@@ -948,6 +956,11 @@ fn parse_time_bound(value: &str, is_end: bool, tz: &jiff::tz::TimeZone) -> Resul
     if let Ok(ts) = value.parse::<Timestamp>() {
         return to_u32(ts.as_second());
     }
+    // A bare integer (optionally comma-grouped, e.g. `1,778,078,433`) is a raw Unix epoch second /
+    // FWOB key — an exact instant, so an end value is not expanded like a bare date.
+    if let Some(epoch) = parse_epoch_seconds(value) {
+        return to_u32(epoch);
+    }
     // Bare date (no time component): exchange-tz midnight; an end date includes the whole local
     // day. Checked before DateTime because jiff's DateTime parser also accepts a bare date.
     if !value.contains(':')
@@ -961,13 +974,18 @@ fn parse_time_bound(value: &str, is_end: bool, tz: &jiff::tz::TimeZone) -> Resul
     if let Ok(dt) = value.parse::<civil::DateTime>() {
         return to_u32(dt.to_zoned(tz.clone())?.timestamp().as_second());
     }
-    bail!("invalid date/time {value:?} (use YYYY-MM-DD, a local date-time, or an RFC3339 instant)")
+    bail!(
+        "invalid date/time {value:?} (use YYYY-MM-DD, a local date-time, an RFC3339 instant, or a \
+         Unix epoch second like 1778078433)"
+    )
 }
 
-/// True when `value` parses as some date/datetime/instant — used to tell a `START..END` range
-/// token apart from a path like `..\AAPL.fwob`. Timezone-free; the actual conversion is deferred.
+/// True when `value` parses as some date/datetime/instant or a bare epoch second — used to tell a
+/// `START..END` range token apart from a path like `..\AAPL.fwob`. Timezone-free; the actual
+/// conversion is deferred.
 fn looks_like_bound(value: &str) -> bool {
-    value.parse::<jiff::Timestamp>().is_ok()
+    parse_epoch_seconds(value).is_some()
+        || value.parse::<jiff::Timestamp>().is_ok()
         || value.parse::<jiff::civil::DateTime>().is_ok()
         || value.parse::<jiff::civil::Date>().is_ok()
 }
@@ -1058,6 +1076,21 @@ mod tests {
     }
 
     #[test]
+    fn bare_epoch_bounds_accept_optional_commas() {
+        let tz = ny();
+        let plain = parse_time_bound("1778078433", false, &tz).unwrap();
+        assert_eq!(plain, 1_778_078_433);
+        // Thousands separators are accepted and yield the same exact key.
+        assert_eq!(
+            parse_time_bound("1,778,078,433", false, &tz).unwrap(),
+            plain
+        );
+        assert_eq!(plain, epoch("2026-05-06T14:40:33Z"));
+        // An epoch is exact: the `is_end` flag does not expand it like a bare date.
+        assert_eq!(parse_time_bound("1778078433", true, &tz).unwrap(), plain);
+    }
+
+    #[test]
     fn range_token_parses_either_side_and_ignores_paths() {
         assert_eq!(
             parse_range_token("2024-01-01T12:00:00Z..2026-01-01"),
@@ -1073,6 +1106,22 @@ mod tests {
         assert_eq!(
             parse_range_token("2024-01-01.."),
             Some((Some("2024-01-01".to_owned()), None))
+        );
+        // Epoch-second ranges, with and without thousands separators.
+        assert_eq!(
+            parse_range_token("1778078433..1778086276"),
+            Some((Some("1778078433".to_owned()), Some("1778086276".to_owned())))
+        );
+        assert_eq!(
+            parse_range_token("1,778,078,433..1,778,086,276"),
+            Some((
+                Some("1,778,078,433".to_owned()),
+                Some("1,778,086,276".to_owned())
+            ))
+        );
+        assert_eq!(
+            parse_range_token("1778078433.."),
+            Some((Some("1778078433".to_owned()), None))
         );
         // Not range-shaped: a relative path, a plain symbol, or a bare `..`.
         assert_eq!(parse_range_token(r"..\AAPL.fwob"), None);
@@ -1131,6 +1180,24 @@ mod tests {
 
         assert_eq!(args.retry_interval_ms, Some(5_000));
         assert_eq!(args.items, ["SPCX"]);
+    }
+
+    #[test]
+    fn commit_interval_is_accepted_as_an_ad_hoc_override() {
+        for (value, expected) in [("-1", -1), ("0", 0), ("120", 120)] {
+            let cli = Cli::try_parse_from([
+                "mdfwob",
+                "download",
+                "SPCX",
+                "--commit-interval-seconds",
+                value,
+            ])
+            .unwrap();
+            let Command::Download(args) = cli.command else {
+                panic!("expected download command");
+            };
+            assert_eq!(args.commit_interval_seconds, Some(expected));
+        }
     }
 
     #[test]
