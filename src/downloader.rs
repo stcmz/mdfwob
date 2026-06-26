@@ -384,6 +384,7 @@ impl<P: MarketDataProvider> SymbolDownloader<'_, P> {
         mut cursor: OffsetDateTime,
     ) -> Result<u64> {
         let mut appended = 0u64;
+        let mut buffered_since_commit = 0u64;
         let mut last_commit = Instant::now();
         loop {
             let end = resolve_end(self.configured_end);
@@ -425,18 +426,25 @@ impl<P: MarketDataProvider> SymbolDownloader<'_, P> {
             let last_second = frames.last().expect("frames is non-empty").time;
             writer.append_ticks(&frames)?;
             appended += count as u64;
+            buffered_since_commit += count as u64;
             cursor = OffsetDateTime::from_unix_timestamp(i64::from(last_second) + 1)?;
-            info!(symbol = %contract.symbol, count, next = %fmt_in_tz(cursor, self.timezone), "appended ticks");
+            // "buffered" because the batch is appended into the open writer but not yet durable;
+            // it becomes durable only at the "flushed" commit below or the final finish().
+            info!(symbol = %contract.symbol, count, next = %fmt_in_tz(cursor, self.timezone), "appended buffered ticks");
 
-            // Periodically commit so the on-disk file advances live and writer memory stays
-            // bounded: -1 = only at the end, 0 = every batch, >0 = at most every N seconds.
-            let commit_now = match self.commit_interval_seconds {
+            // Periodically flush the buffered ticks to disk so the file advances live and writer
+            // memory stays bounded: -1 = only at the end, 0 = every batch, >0 = at most every N
+            // seconds. This runs only after a batch lands, so an idle/stalled symbol never flushes
+            // mid-stall — but it also has nothing new to flush then.
+            let flush_now = match self.commit_interval_seconds {
                 n if n < 0 => false,
                 0 => true,
                 n => last_commit.elapsed() >= Duration::from_secs(n as u64),
             };
-            if commit_now {
+            if flush_now {
                 writer.commit()?;
+                info!(symbol = %contract.symbol, flushed = buffered_since_commit, next = %fmt_in_tz(cursor, self.timezone), "flushed buffered ticks to disk");
+                buffered_since_commit = 0;
                 last_commit = Instant::now();
             }
         }
