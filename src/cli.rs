@@ -1154,9 +1154,14 @@ mod tests {
     #[test]
     fn stall_timeout_is_accepted_as_an_ibkr_override() {
         for (value, expected) in [("0", 0u64), ("45", 45)] {
-            let cli =
-                Cli::try_parse_from(["mdfwob", "download", "SPCX", "--stall-timeout-seconds", value])
-                    .unwrap();
+            let cli = Cli::try_parse_from([
+                "mdfwob",
+                "download",
+                "SPCX",
+                "--stall-timeout-seconds",
+                value,
+            ])
+            .unwrap();
             let Command::Download(args) = cli.command else {
                 panic!("expected download command");
             };

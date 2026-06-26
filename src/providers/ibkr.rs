@@ -455,7 +455,10 @@ mod tests {
 
         // An unrelated notice (e.g. 200 no security definition) stays fatal.
         let no_contract = IbkrProvider::request_error(
-            IbkrFailure::Ibapi(ibapi::Error::Notice(notice(200, "No security definition found"))),
+            IbkrFailure::Ibapi(ibapi::Error::Notice(notice(
+                200,
+                "No security definition found",
+            ))),
             0,
         );
         assert_eq!(classify_recovery(&no_contract), None);
