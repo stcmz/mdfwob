@@ -115,8 +115,8 @@ impl TickStore {
     ///
     /// Avoids the open→append→finish churn of one cycle per batch: callers append every batch into
     /// the same `TickWriter`. Call [`TickWriter::commit`] periodically to durably flush the file
-    /// mid-download (it reopens lazily on the next append) and [`TickWriter::finish`] once at the
-    /// end.
+    /// mid-download (the writer stays open, so the file is never reopened) and
+    /// [`TickWriter::finish`] once at the end.
     pub fn writer(&self) -> TickWriter<'_> {
         TickWriter {
             store: self,
@@ -206,13 +206,15 @@ impl TickWriter<'_> {
         Ok(writer.append_frames_transactional(&encoded)?)
     }
 
-    /// Durably commits everything appended so far by finishing the open writer, leaving the session
-    /// ready to continue: the next [`append_ticks`](Self::append_ticks) lazily reopens the file for
-    /// append. Lets a long download advance the on-disk file mid-run and keeps writer memory
-    /// bounded, instead of buffering the whole symbol until [`finish`](Self::finish).
+    /// Durably commits everything appended so far without closing the writer: it flushes the open
+    /// writer to disk (via `fwob::Writer::sync`) and keeps it open for the next batch. A commit is a
+    /// checkpoint, never a change to the eventual file — the bytes are identical whether or not (and
+    /// however often) `commit` is called, so the download's commit cadence cannot affect the output.
+    /// Lets a long download advance the on-disk file mid-run so a crash loses at most the ticks
+    /// appended since the last commit.
     pub fn commit(&mut self) -> Result<()> {
-        if let Some(writer) = self.writer.take() {
-            writer.finish()?;
+        if let Some(writer) = self.writer.as_mut() {
+            writer.sync()?;
         }
         Ok(())
     }
@@ -478,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_flushes_mid_session_and_reopens_for_more() {
+    fn commit_flushes_mid_session_without_closing_the_writer() {
         let dir = temp_dir("mdfwob-commit");
         let store = TickStore::new(&dir, "AAPL", FwobOptions::default());
 
@@ -490,7 +492,7 @@ mod tests {
         writer.commit().unwrap();
         assert_eq!(store.last_timestamp().unwrap(), Some(10));
 
-        // The same writer keeps going: the next append reopens the file lazily.
+        // The same writer keeps going on the still-open handle (no reopen).
         writer
             .append_ticks(&[ShortTick::new(11, 1.24, 200).unwrap()])
             .unwrap();
@@ -500,6 +502,47 @@ mod tests {
         let report = Maintenance::verify(store.path(), ReaderOptions::default()).unwrap();
         assert_eq!(report.frame_count, 2);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn commit_cadence_does_not_change_the_file() {
+        // The on-disk bytes must be identical whether the session commits after every batch or only
+        // finishes once at the end — the commit cadence is a durability checkpoint, never a change
+        // to the output. Use many batches of noisy ticks so v2 forms several compressed pages plus
+        // a raw residual, exercising the reclaim/recompaction path on each commit.
+        let batches: Vec<Vec<ShortTick>> = (0..40)
+            .map(|batch: u32| {
+                (0..50)
+                    .map(|i| {
+                        let time = batch * 50 + i;
+                        let price = 1.0 + f64::from(time.wrapping_mul(2_654_435_761)) / 1.0e6;
+                        ShortTick::new(time, price, (time as i32).wrapping_mul(7) + 1).unwrap()
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let build = |commit_every_batch: bool| -> Vec<u8> {
+            let dir = temp_dir(&format!("mdfwob-cadence-{commit_every_batch}"));
+            let store = TickStore::new(&dir, "AAPL", FwobOptions::default());
+            let mut writer = store.writer();
+            for batch in &batches {
+                writer.append_ticks(batch).unwrap();
+                if commit_every_batch {
+                    writer.commit().unwrap();
+                }
+            }
+            writer.finish().unwrap();
+            let bytes = fs::read(store.path()).unwrap();
+            fs::remove_dir_all(dir).unwrap();
+            bytes
+        };
+
+        assert_eq!(
+            build(true),
+            build(false),
+            "committing every batch changed the resulting file"
+        );
     }
 
     #[test]

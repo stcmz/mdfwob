@@ -108,12 +108,14 @@ paced by their own global interval, `download.retry_interval_ms` /
 `--retry-interval-ms` (default 10000), independent of the normal data-fetch
 spacing in `download.request_interval_ms` (default 1000).
 
-A download keeps one writer open per symbol and commits it to disk periodically so
-the output advances live and writer memory stays bounded, rather than buffering a
-whole multi-month backlog until the symbol completes. `download.commit_interval_seconds`
-/ `--commit-interval-seconds` controls the cadence (default 60): `-1` commits only at
-the end (and on Ctrl+C), `0` commits after every batch, and a positive value commits
-at most that often.
+A download keeps one writer open per symbol and durably flushes it to disk
+periodically so the output advances live and a crash loses at most the ticks since
+the last commit, rather than buffering a whole multi-month backlog until the symbol
+completes. A commit is a checkpoint on the still-open writer (never a reopen), so the
+resulting file is byte-for-byte identical regardless of how often it commits.
+`download.commit_interval_seconds` / `--commit-interval-seconds` controls the cadence
+(default 60): `-1` commits only at the end (and on Ctrl+C), `0` commits after every
+batch, and a positive value commits at most that often.
 
 A TWS/IB Gateway upstream-connectivity blip (IBKR system codes 1100 then
 1101/1102) can silently orphan an in-flight request without dropping the API
