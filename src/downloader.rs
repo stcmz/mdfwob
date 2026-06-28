@@ -14,7 +14,9 @@ use time::OffsetDateTime;
 use tracing::{error, info, warn};
 
 use crate::{
-    config::{Config, OptionContractConfig, OptionRight, ProviderKind, StockContractConfig},
+    config::{
+        Config, IbkrConfig, OptionContractConfig, OptionRight, ProviderKind, StockContractConfig,
+    },
     fwob_options::FwobOptions,
     providers::{DatabentoProvider, IbkrProvider, MarketDataProvider, RecoveryAction},
     storage::{TickStore, TickWriter},
@@ -124,7 +126,19 @@ impl Downloader {
         ));
         match self.plan.config.download.provider {
             ProviderKind::Ibkr => {
-                let provider = IbkrProvider::connect(&self.plan.config.ibkr)?;
+                // Wait for the gateway to become ready at startup the same way a mid-download
+                // reconnect waits: a fresh `connect` can fail while TWS/IB Gateway is still coming
+                // up or has yet to accept the paper-trading disclaimer, so retry on the configured
+                // budget/cadence instead of exiting on the first failure.
+                let provider = match connect_ibkr_with_retry(
+                    &self.plan.config.ibkr,
+                    self.plan.config.ibkr.reconnect_timeout_seconds,
+                    Duration::from_millis(self.plan.config.download.retry_interval_ms),
+                    &cancel,
+                )? {
+                    Some(provider) => provider,
+                    None => return Ok(()),
+                };
                 run_with_provider(self.plan, &provider, &cancel, &pacer, &retry_pacer)
             }
             ProviderKind::Databento => {
@@ -154,6 +168,87 @@ fn install_ctrlc_handler(cancel: CancellationToken) -> Result<()> {
         }
     })
     .context("failed to install Ctrl+C handler")
+}
+
+/// Connects to IBKR at startup, waiting for the gateway to become ready instead of failing on the
+/// first error. Mirrors the mid-download recovery budget: `reconnect_timeout_seconds` of `0` fails
+/// immediately (no waiting), `-1` waits indefinitely, and a positive value caps the wall-clock wait
+/// from the first failure. Returns `Ok(None)` if cancelled (Ctrl+C) before a connection succeeded.
+fn connect_ibkr_with_retry(
+    config: &IbkrConfig,
+    reconnect_timeout_seconds: i64,
+    retry_interval: Duration,
+    cancel: &CancellationToken,
+) -> Result<Option<IbkrProvider>> {
+    connect_with_retry(
+        || IbkrProvider::connect(config),
+        reconnect_timeout_seconds,
+        retry_interval,
+        cancel,
+    )
+}
+
+/// The connect-retry loop, generic over the connect step so the budget/cadence/cancellation logic
+/// can be unit-tested without a live gateway.
+fn connect_with_retry<T>(
+    mut connect: impl FnMut() -> Result<T>,
+    reconnect_timeout_seconds: i64,
+    retry_interval: Duration,
+    cancel: &CancellationToken,
+) -> Result<Option<T>> {
+    let mut retry_deadline: Option<Instant> = None;
+    loop {
+        if cancel.is_canceled() {
+            return Ok(None);
+        }
+        let error = match connect() {
+            Ok(provider) => return Ok(Some(provider)),
+            Err(error) => error,
+        };
+        if cancel.is_canceled() {
+            return Ok(None);
+        }
+        // 0 disables waiting entirely; surface the connection error like any other startup failure.
+        if reconnect_timeout_seconds == 0 {
+            return Err(error);
+        }
+        // A positive budget caps the wall-clock wait from the first failure.
+        if reconnect_timeout_seconds > 0 {
+            let deadline = *retry_deadline.get_or_insert_with(|| {
+                Instant::now() + Duration::from_secs(reconnect_timeout_seconds as u64)
+            });
+            if Instant::now() >= deadline {
+                return Err(error).with_context(|| {
+                    format!(
+                        "exhausted {reconnect_timeout_seconds}s budget waiting for the IBKR gateway to become ready"
+                    )
+                });
+            }
+        }
+        warn!(
+            error = %format!("{error:#}"),
+            "failed to connect to IBKR; waiting for the gateway to become ready and retrying"
+        );
+        if !sleep_cancellable(retry_interval, cancel) {
+            return Ok(None);
+        }
+    }
+}
+
+/// Sleeps for up to `duration`, waking every 100ms to honor cancellation. Returns `false` if
+/// cancellation was requested.
+fn sleep_cancellable(duration: Duration, cancel: &CancellationToken) -> bool {
+    let deadline = Instant::now() + duration;
+    loop {
+        if cancel.is_canceled() {
+            return false;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return true;
+        }
+        std::thread::sleep((deadline - now).min(Duration::from_millis(100)));
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2046,5 +2141,86 @@ mod tests {
             primary_exchange: Some("NASDAQ".into()),
             option: None,
         }
+    }
+
+    #[test]
+    fn connect_with_retry_waits_through_transient_failures() {
+        let attempts = std::cell::Cell::new(0);
+        let cancel = CancellationToken::new();
+        let provider = connect_with_retry(
+            || {
+                let attempt = attempts.get() + 1;
+                attempts.set(attempt);
+                if attempt < 3 {
+                    Err(anyhow::anyhow!("gateway not ready"))
+                } else {
+                    Ok(42)
+                }
+            },
+            -1,
+            Duration::ZERO,
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(provider, Some(42));
+        assert_eq!(attempts.get(), 3);
+    }
+
+    #[test]
+    fn connect_with_retry_zero_budget_fails_immediately() {
+        let attempts = std::cell::Cell::new(0);
+        let cancel = CancellationToken::new();
+        let result = connect_with_retry(
+            || {
+                attempts.set(attempts.get() + 1);
+                Err::<i32, _>(anyhow::anyhow!("gateway not ready"))
+            },
+            0,
+            Duration::ZERO,
+            &cancel,
+        );
+        assert!(result.is_err());
+        assert_eq!(attempts.get(), 1, "zero budget must not retry");
+    }
+
+    #[test]
+    fn connect_with_retry_stops_when_canceled() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let attempts = std::cell::Cell::new(0);
+        let result = connect_with_retry(
+            || {
+                attempts.set(attempts.get() + 1);
+                Err::<i32, _>(anyhow::anyhow!("gateway not ready"))
+            },
+            -1,
+            Duration::ZERO,
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(result, None);
+        assert_eq!(
+            attempts.get(),
+            0,
+            "cancellation must short-circuit before connecting"
+        );
+    }
+
+    #[test]
+    fn connect_with_retry_gives_up_after_positive_budget() {
+        let attempts = std::cell::Cell::new(0);
+        let cancel = CancellationToken::new();
+        let error = connect_with_retry(
+            || {
+                attempts.set(attempts.get() + 1);
+                Err::<i32, _>(anyhow::anyhow!("gateway not ready"))
+            },
+            1,
+            Duration::from_millis(100),
+            &cancel,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("budget"), "{error}");
+        assert!(attempts.get() >= 1);
     }
 }

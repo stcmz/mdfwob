@@ -108,6 +108,12 @@ paced by their own global interval, `download.retry_interval_ms` /
 `--retry-interval-ms` (default 10000), independent of the normal data-fetch
 spacing in `download.request_interval_ms` (default 1000).
 
+The same budget governs the initial connection: if TWS/IB Gateway is still
+starting up or has yet to accept the paper-trading disclaimer, mdfwob waits and
+retries on the `retry_interval_ms` cadence rather than exiting on the first
+failure, so it can be launched alongside the gateway. With the default `-1` it
+waits indefinitely for the gateway to become ready; `0` fails fast.
+
 A download keeps one writer open per symbol and durably flushes it to disk
 periodically so the output advances live and a crash loses at most the ticks since
 the last commit, rather than buffering a whole multi-month backlog until the symbol
