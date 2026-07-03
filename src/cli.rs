@@ -70,6 +70,27 @@ enum Command {
     Plot(PlotArgs),
 }
 
+/// Shared help text describing every built-in indicator spec (what it is good for and how it is
+/// computed). Appended to both the `calc` and `plot` usage via `concat!` so they stay in sync.
+macro_rules! indicator_guide {
+    () => {
+        "\n\nIndicators (N = number of bars; computed on close unless noted):
+  sma:N       Simple moving average: the mean of the last N closes. A smoothed
+              trend baseline; lags price by ~N/2 bars. Warms up over N-1 bars.
+  ema:N       Exponential moving average: alpha = 2/(N+1), seeded with the N-bar
+              SMA. Weights recent closes more, so it turns faster than sma:N.
+  rsi:N       Wilder's Relative Strength Index (0-100): 100 - 100/(1+RS), where
+              RS = Wilder-smoothed avg gain / avg loss over N bars. A momentum
+              oscillator; >70 is often overbought, <30 oversold.
+  vol:N       Rolling realized volatility: the sample stdev of the last N log
+              returns. Gauges how much price is swinging (risk); rises when choppy.
+  ret:log     Per-bar log return, ln(close/prev_close). Time-additive, the right
+              input for volatility and multi-period return math.
+  ret:simple  Per-bar simple return, (close-prev_close)/prev_close: the plain
+              percentage change between bars."
+    };
+}
+
 #[derive(Debug, Args)]
 #[command(override_usage = "mdfwob download [OPTIONS] [CONFIG.toml] [SYMBOLS...] [FWOB_TOKENS...]")]
 #[command(after_help = "FWOB tokens:
@@ -514,7 +535,7 @@ impl BarsArgs {
 #[command(
     override_usage = "mdfwob plot [CONFIG.toml] [PATHS_OR_SYMBOLS...] [INTERVAL] [START..END] [OPTIONS]"
 )]
-#[command(after_help = "Tokens (case-sensitive, any order):
+#[command(after_help = concat!("Tokens (case-sensitive, any order):
   paths/symbols: a tick or bar FILE.fwob, a DIR, or a bare SYMBOL (resolved under output_dir)
   interval: e.g. 30s, 5m, 1h, 1d, 1w, 1mo, 1y (default 1d; resamples tick files, ignored for bars)
   indicator specs: sma:N ema:N (overlaid on price); rsi:N ret:log ret:simple vol:N (own panel)
@@ -522,11 +543,11 @@ impl BarsArgs {
   session: rth (keep only regular-trading-hours ticks)
   fill: forward-fill empty intervals within a session
   time range: START..END (either side optional), e.g. 2024-01-01..2026-01-01 or ..2026-01-01
-              bare dates/times use the exchange tz; add Z or +/-HH for an absolute instant
-
-With no indicator specs, a default sma:20 overlay is drawn. By default the chart is written to the
-console as a Sixel image (renders inline in Windows Terminal, WezTerm, xterm, iTerm2, ...). Pass
---output to write a file instead: a .png (default) or a .six/.sixel raw Sixel dump.")]
+              bare dates/times use the exchange tz; add Z or +/-HH for an absolute instant",
+    indicator_guide!(),
+    "\n\nWith no indicator specs, a default sma:20 overlay is drawn. By default the chart is written
+to the console as a Sixel image (renders inline in Windows Terminal, WezTerm, xterm, iTerm2, ...).
+Pass --output to write a file instead: a .png (default) or a .six/.sixel raw Sixel dump."))]
 struct PlotArgs {
     /// Window start. Bare dates/times use the exchange tz; add Z or +/-HH for an absolute
     /// instant. Overrides the start side of a START..END token.
@@ -804,7 +825,7 @@ fn fmt_session_len(seconds: u32) -> String {
 #[command(
     override_usage = "mdfwob calc [CONFIG.toml] [PATHS_OR_SYMBOLS...] [INTERVAL] SPEC... [START..END] [FORMAT] [OPTIONS]"
 )]
-#[command(after_help = "Tokens (case-sensitive, any order):
+#[command(after_help = concat!("Tokens (case-sensitive, any order):
   paths/symbols: FILE.fwob, a DIR, or a bare SYMBOL (resolved under output_dir)
   indicator specs: sma:N ema:N rsi:N ret:log ret:simple vol:N
   interval: e.g. 5m, 1h, 1d (resamples a tick file; default 1d; ignored for bar files)
@@ -812,7 +833,8 @@ fn fmt_session_len(seconds: u32) -> String {
   session: rth (keep only regular-trading-hours ticks)
   fill: forward-fill empty intervals within a session
   time range: START..END (either side optional), e.g. 2024-01-01..2026-01-01 or ..2026-01-01
-              bare dates/times use the exchange tz; add Z or +/-HH for an absolute instant")]
+              bare dates/times use the exchange tz; add Z or +/-HH for an absolute instant",
+    indicator_guide!()))]
 struct CalcArgs {
     /// Window start. Bare dates/times use the exchange tz; add Z or +/-HH for an absolute
     /// instant. Overrides the start side of a START..END token.
