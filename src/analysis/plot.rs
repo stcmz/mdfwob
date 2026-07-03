@@ -27,17 +27,37 @@ const GRID: u8 = 1;
 const TEXT: u8 = 2;
 const UP: u8 = 3;
 const DOWN: u8 = 4;
-const SMA: u8 = 5;
+/// First series/overlay color; indicator lines cycle through [`SERIES_COUNT`] of them.
+const SERIES0: u8 = 5;
+const SERIES_COUNT: u8 = 6;
 
 /// RGB for each palette index (0..=255 per channel).
-const PALETTE: [(u8, u8, u8); 6] = [
+const PALETTE: [(u8, u8, u8); 11] = [
     (18, 18, 24),    // 0 background
     (44, 46, 56),    // 1 grid
     (170, 174, 190), // 2 text
     (38, 194, 129),  // 3 up (green)
     (235, 77, 75),   // 4 down (red)
-    (90, 160, 255),  // 5 sma (blue)
+    (90, 160, 255),  // 5 series: blue
+    (240, 150, 60),  // 6 series: orange
+    (185, 130, 245), // 7 series: purple
+    (70, 200, 200),  // 8 series: teal
+    (220, 205, 90),  // 9 series: yellow
+    (240, 120, 180), // 10 series: pink
 ];
+
+/// The palette index for the `i`-th indicator series, cycling through the series colors.
+fn series_color(i: usize) -> u8 {
+    SERIES0 + (i % SERIES_COUNT as usize) as u8
+}
+
+/// A named per-bar series (e.g. an `sma_20` overlay or an `rsi_14` panel). `values` aligns to the
+/// bars (one entry per bar; `None`/non-finite during warm-up).
+#[derive(Debug, Clone)]
+pub struct Series {
+    pub label: String,
+    pub values: Vec<Option<f64>>,
+}
 
 /// Default chart width in pixels.
 pub const DEFAULT_WIDTH: u32 = 1920;
@@ -49,14 +69,18 @@ pub const DEFAULT_HEIGHT: u32 = 1080;
 pub struct PlotOptions {
     pub width: u32,
     pub height: u32,
-    /// Simple-moving-average window over closes, drawn as an overlay. `0` disables it.
-    pub sma_period: usize,
     /// Title drawn at the top-left (e.g. `"AAPL 1d"`).
     pub title: String,
     /// Timezone the x-axis calendar boundaries and clock labels are expressed in. This should match
     /// the session tz the bars were aggregated against, so day/month/year ticks land on the same
     /// local boundaries the buckets were anchored to.
     pub tz: TimeZone,
+    /// Price-scale overlays (e.g. `sma`/`ema`), drawn as lines on the main price panel.
+    pub overlays: Vec<Series>,
+    /// Own-scale indicators (e.g. `rsi`/`ret`/`vol`), each drawn in its own stacked lower panel.
+    pub panels: Vec<Series>,
+    /// Add a volume sub-panel below the price panel.
+    pub volume: bool,
 }
 
 impl Default for PlotOptions {
@@ -64,9 +88,11 @@ impl Default for PlotOptions {
         Self {
             width: DEFAULT_WIDTH,
             height: DEFAULT_HEIGHT,
-            sma_period: 20,
             title: String::new(),
             tz: TimeZone::UTC,
+            overlays: Vec::new(),
+            panels: Vec::new(),
+            volume: false,
         }
     }
 }
@@ -128,6 +154,23 @@ impl Canvas {
             if e2 <= dx {
                 err += dx;
                 y += sy;
+            }
+        }
+    }
+
+    /// Draws a `t`-thick polyline through `points`, connecting consecutive `Some` points and
+    /// breaking the line at any `None` (an indicator's warm-up gap).
+    fn polyline(&mut self, points: &[Option<(i32, i32)>], t: i32, color: u8) {
+        let mut prev: Option<(i32, i32)> = None;
+        for point in points {
+            match point {
+                Some(p) => {
+                    if let Some(q) = prev {
+                        self.line(q.0, q.1, p.0, p.1, t, color);
+                    }
+                    prev = Some(*p);
+                }
+                None => prev = None,
             }
         }
     }
@@ -202,58 +245,120 @@ pub fn render(bars: &[Bar], opts: &PlotOptions) -> Canvas {
     let ds = (h as f32 / DEFAULT_HEIGHT as f32).min(w as f32 / DEFAULT_WIDTH as f32);
     let text_scale = ((1.6 * ds).round() as i32).max(1);
     let char_w = 8 * text_scale;
+    let grid_t = (ds.round() as i32).max(1);
+    let pen_t = grid_t;
+    let line_t = ((2.0 * ds).round() as i32).max(1);
+    let label_gap = (8.0 * ds) as i32;
+    let text_h = 8 * text_scale;
 
-    // Price extent with a small headroom pad.
-    let mut min = f64::INFINITY;
-    let mut max = f64::NEG_INFINITY;
+    // Price extent (candles plus any price-scale overlays) with a small headroom pad.
+    let mut pmin = f64::INFINITY;
+    let mut pmax = f64::NEG_INFINITY;
     for bar in bars {
-        min = min.min(bar.low);
-        max = max.max(bar.high);
+        pmin = pmin.min(bar.low);
+        pmax = pmax.max(bar.high);
     }
-    if !min.is_finite() || !max.is_finite() {
+    for s in &opts.overlays {
+        for v in s.values.iter().flatten() {
+            if v.is_finite() {
+                pmin = pmin.min(*v);
+                pmax = pmax.max(*v);
+            }
+        }
+    }
+    if !pmin.is_finite() || !pmax.is_finite() {
         return canvas;
     }
-    let pad = ((max - min) * 0.04).max(f64::MIN_POSITIVE);
-    min -= pad;
-    max += pad;
-    let range = (max - min).max(1e-9);
+    let ppad = ((pmax - pmin) * 0.04).max(f64::MIN_POSITIVE);
+    pmin -= ppad;
+    pmax += ppad;
 
-    // Price gutter labels, computed up front so the left margin can be sized to the widest one
-    // (otherwise long prices like "1,234.56" overflow a fixed gutter and get clipped).
-    let levels = 6;
-    let labels: Vec<String> = (0..=levels)
-        .map(|k| format!("{:.2}", min + range * k as f64 / levels as f64))
+    // Lower sub-panels: an optional volume panel, then one per indicator *kind*. Indicators that
+    // share a scale (e.g. rsi:14 and rsi:28, or ret:log and ret:simple) go in the same pane as
+    // separate colored lines rather than in stacked panes.
+    let mut subs: Vec<SubPanel> = Vec::new();
+    if opts.volume {
+        let vmax = bars.iter().map(|b| b.volume).max().unwrap_or(0).max(0) as f64;
+        subs.push(SubPanel {
+            title: "volume".to_string(),
+            kind: SubKind::Volume,
+            vmin: 0.0,
+            vmax: if vmax <= 0.0 { 1.0 } else { vmax * 1.05 },
+        });
+    }
+    // Group panel indicators by kind (the label prefix: rsi/ret/vol/...), preserving first-seen
+    // order, so each kind gets a single shared pane.
+    for (key, idxs) in group_panels(&opts.panels) {
+        let (vmin, vmax) = group_range(&opts.panels, &idxs, &key);
+        subs.push(SubPanel {
+            title: key,
+            kind: SubKind::Lines(idxs),
+            vmin,
+            vmax,
+        });
+    }
+
+    // Left gutter sized to the widest label across every panel (prices are usually widest, but a
+    // volume "1.2B" or a bare "100" must fit too).
+    let price_levels: Vec<f64> = (0..=6)
+        .map(|k| pmin + (pmax - pmin) * k as f64 / 6.0)
         .collect();
-    let label_gap = (8.0 * ds) as i32;
-    let max_label_w = labels
+    let mut max_label_w = price_levels
         .iter()
-        .map(|l| l.chars().count() as i32 * char_w)
+        .map(|v| fmt_price(*v).chars().count() as i32 * char_w)
         .max()
         .unwrap_or(0);
+    for sub in &subs {
+        for (_, label) in sub.grid_labels() {
+            max_label_w = max_label_w.max(label.chars().count() as i32 * char_w);
+        }
+    }
 
     let left = max_label_w + label_gap * 2;
     let right = (14.0 * ds) as i32;
     let top = (22.0 * ds) as i32;
     let bottom = (34.0 * ds) as i32;
     let plot_w = (w as i32 - left - right).max(1);
-    let plot_h = (h as i32 - top - bottom).max(1);
 
-    let y_of = |p: f64| -> i32 { (top as f64 + (max - p) / range * plot_h as f64).round() as i32 };
+    let content_top = top;
+    let content_bottom = h as i32 - bottom;
+    let content_h = (content_bottom - content_top).max(1);
+
+    // Vertical split: the price panel on top, sub-panels stacked below sharing up to ~60%.
+    let n_sub = subs.len() as i32;
+    let panel_gap = (12.0 * ds) as i32;
+    let sub_frac = (0.18 * n_sub as f32).min(0.6);
+    let subs_total = (content_h as f32 * sub_frac) as i32;
+    let each_sub = if n_sub > 0 {
+        ((subs_total - panel_gap * n_sub) / n_sub).max((30.0 * ds) as i32)
+    } else {
+        0
+    };
+    let subs_used = each_sub.saturating_mul(n_sub) + panel_gap * n_sub;
+    let price_h = (content_h - subs_used).max((60.0 * ds) as i32);
+    let price = Panel {
+        top: content_top,
+        height: price_h,
+        vmin: pmin,
+        vmax: pmax,
+    };
+
+    let style = Style {
+        char_w,
+        text_scale,
+        grid_t,
+        line_t,
+        left,
+        plot_w,
+        label_gap,
+    };
     let x_of =
         |i: usize| -> i32 { left + ((i as f64 + 0.5) * (plot_w as f64 / n as f64)).round() as i32 };
 
-    let grid_t = ((ds).round() as i32).max(1);
-    let pen_t = grid_t;
-    let sma_t = ((2.0 * ds).round() as i32).max(1);
-
-    // Time-axis boundaries (positions only), chosen to suit the visible span (years for a
-    // multi-year view down to minutes for an intraday one), expressed in the configured timezone.
+    // Time-axis boundaries (positions only), chosen to suit the visible span, in the configured tz.
     let (gran, time_ticks) = time_axis_ticks(bars, &opts.tz);
-
-    // Resolve label geometry and drop collisions so labels never overprint each other. Two labels
-    // can collide when the first bar sits mid-period (a leading partial tick right next to the
-    // first real boundary) or when a coarse label is simply wider than the tick spacing.
-    let min_gap = char_w; // keep at least one blank character between labels
+    // Resolve label geometry and drop collisions so labels never overprint each other.
+    let min_gap = char_w;
     let all: Vec<usize> = (0..time_ticks.len()).collect();
     let boxes: Vec<(i32, i32)> = label_ticks(gran, &time_ticks, &all)
         .iter()
@@ -264,8 +369,8 @@ pub fn render(bars: &[Bar], opts: &PlotOptions) -> Canvas {
         })
         .collect();
     // Label the kept ticks using the previous *kept* tick as context, so whichever tick becomes
-    // first-visible after a collision drop still carries the year (the dropped leading tick took
-    // its year with it otherwise). Recompute geometry from the final label widths.
+    // first-visible after a collision drop still carries the year. Recompute geometry from the
+    // final label widths.
     let keep = select_nonoverlapping(&boxes, min_gap);
     let placed: Vec<(usize, i32, String)> = label_ticks(gran, &time_ticks, &keep)
         .into_iter()
@@ -276,69 +381,112 @@ pub fn render(bars: &[Bar], opts: &PlotOptions) -> Canvas {
         })
         .collect();
 
-    // Grid first (both axes), so the candles and overlays paint on top of it.
-    // Horizontal price grid + right-aligned labels in the gutter.
-    for (k, label) in labels.iter().enumerate() {
-        let p = min + range * k as f64 / levels as f64;
-        let y = y_of(p);
-        canvas.fill_rect(left, y, plot_w, grid_t, GRID);
-        let tw = label.chars().count() as i32 * char_w;
-        canvas.text(
-            left - label_gap - tw,
-            y - 4 * text_scale,
-            label,
-            TEXT,
-            text_scale,
-        );
-    }
-    // Vertical time-axis grid lines, at the same boundaries as the (kept) labels.
+    // Vertical time grid lines span every panel; drawn first so candles/lines paint on top.
     for (i, _, _) in &placed {
-        canvas.fill_rect(x_of(*i), top, grid_t, plot_h, GRID);
+        canvas.fill_rect(x_of(*i), content_top, grid_t, content_h, GRID);
     }
 
-    // Candles: high-low wick, then the open-close body.
+    // ---- price panel: horizontal grid, candles, overlays, legend ----
+    let price_grid: Vec<(f64, String)> = price_levels.iter().map(|v| (*v, fmt_price(*v))).collect();
+    draw_panel_grid(&mut canvas, &style, &price, &price_grid);
+
     let body_w = ((plot_w as f64 / n as f64) * 0.62).max(1.5 * ds as f64) as i32;
     let min_body = (1.5 * ds).max(1.0) as i32;
     for (i, bar) in bars.iter().enumerate() {
         let x = x_of(i);
         let up = bar.close >= bar.open;
         let color = if up { UP } else { DOWN };
-        // Wick.
-        let yh = y_of(bar.high);
-        let yl = y_of(bar.low);
+        let yh = price.y(bar.high);
+        let yl = price.y(bar.low);
         canvas.fill_rect(x - pen_t / 2, yh, pen_t.max(1), (yl - yh).max(1), color);
-        // Body.
-        let yo = y_of(bar.open);
-        let yc = y_of(bar.close);
+        let yo = price.y(bar.open);
+        let yc = price.y(bar.close);
         let bt = yo.min(yc);
         let bh = (yo - yc).abs().max(min_body);
         canvas.fill_rect(x - body_w / 2, bt, body_w.max(1), bh, color);
     }
-
-    // SMA(close) overlay.
-    if opts.sma_period >= 2 && opts.sma_period <= n {
-        let period = opts.sma_period;
-        let mut sum = 0.0;
-        let mut prev: Option<(i32, i32)> = None;
-        for (i, bar) in bars.iter().enumerate() {
-            sum += bar.close;
-            if i >= period {
-                sum -= bars[i - period].close;
-            }
-            if i + 1 >= period {
-                let avg = sum / period as f64;
-                let pt = (x_of(i), y_of(avg));
-                if let Some(prev) = prev {
-                    canvas.line(prev.0, prev.1, pt.0, pt.1, sma_t, SMA);
-                }
-                prev = Some(pt);
-            }
-        }
+    for (j, s) in opts.overlays.iter().enumerate() {
+        draw_series(
+            &mut canvas,
+            &style,
+            &price,
+            &x_of,
+            &s.values,
+            series_color(j),
+        );
+    }
+    // Overlay legend at the price panel's top-left, each entry in its line color.
+    let mut ly = content_top + (4.0 * ds) as i32;
+    for (j, s) in opts.overlays.iter().enumerate() {
+        canvas.text(
+            left + (6.0 * ds) as i32,
+            ly,
+            &s.label,
+            series_color(j),
+            text_scale,
+        );
+        ly += text_h + (2.0 * ds) as i32;
     }
 
-    // Time-axis labels along the bottom (on top of the grid and candles), using the collision-free
-    // set and pixel positions resolved above.
-    let label_y = h as i32 - bottom + (6.0 * ds) as i32;
+    // ---- sub-panels ----
+    let mut y = content_top + price_h;
+    for sub in &subs {
+        y += panel_gap;
+        let panel = Panel {
+            top: y,
+            height: each_sub,
+            vmin: sub.vmin,
+            vmax: sub.vmax,
+        };
+        draw_panel_grid(&mut canvas, &style, &panel, &sub.grid_labels());
+        // Legend/title stacked at the panel's top-left. Volume is a single labeled series; an
+        // indicator pane lists each of its lines in that line's color.
+        let legend_x = left + (6.0 * ds) as i32;
+        let mut legend_y = panel.top + (2.0 * ds) as i32;
+        match &sub.kind {
+            SubKind::Volume => {
+                let vbottom = panel.top + panel.height;
+                for (i, bar) in bars.iter().enumerate() {
+                    let x = x_of(i);
+                    let yv = panel.y(bar.volume.max(0) as f64);
+                    let color = if bar.close >= bar.open { UP } else { DOWN };
+                    canvas.fill_rect(
+                        x - body_w / 2,
+                        yv,
+                        body_w.max(1),
+                        (vbottom - yv).max(1),
+                        color,
+                    );
+                }
+                canvas.text(legend_x, legend_y, &sub.title, TEXT, text_scale);
+            }
+            SubKind::Lines(idxs) => {
+                for &idx in idxs {
+                    let color = series_color(opts.overlays.len() + idx);
+                    draw_series(
+                        &mut canvas,
+                        &style,
+                        &panel,
+                        &x_of,
+                        &opts.panels[idx].values,
+                        color,
+                    );
+                    canvas.text(
+                        legend_x,
+                        legend_y,
+                        &opts.panels[idx].label,
+                        color,
+                        text_scale,
+                    );
+                    legend_y += text_h + (2.0 * ds) as i32;
+                }
+            }
+        }
+        y += each_sub;
+    }
+
+    // Time-axis labels along the bottom (on top of everything).
+    let label_y = content_bottom + (6.0 * ds) as i32;
     for (_, lx, label) in &placed {
         canvas.text(*lx, label_y, label, TEXT, text_scale);
     }
@@ -349,6 +497,197 @@ pub fn render(bars: &[Bar], opts: &PlotOptions) -> Canvas {
     }
 
     canvas
+}
+
+/// Shared geometry/style passed to the panel drawing helpers.
+struct Style {
+    char_w: i32,
+    text_scale: i32,
+    grid_t: i32,
+    line_t: i32,
+    left: i32,
+    plot_w: i32,
+    label_gap: i32,
+}
+
+/// A drawable panel region with its own value range.
+struct Panel {
+    top: i32,
+    height: i32,
+    vmin: f64,
+    vmax: f64,
+}
+
+impl Panel {
+    /// Maps a value to a y pixel within the panel (`vmax` at the top, `vmin` at the bottom).
+    fn y(&self, v: f64) -> i32 {
+        let range = (self.vmax - self.vmin).max(1e-12);
+        self.top + ((self.vmax - v) / range * self.height as f64).round() as i32
+    }
+}
+
+/// What a lower sub-panel draws.
+#[derive(Debug, Clone)]
+enum SubKind {
+    /// Volume bars colored by candle direction.
+    Volume,
+    /// One or more lines for `opts.panels[i]` that share this pane's scale.
+    Lines(Vec<usize>),
+}
+
+/// A lower sub-panel: a title/kind label, its content kind, and value range.
+struct SubPanel {
+    title: String,
+    kind: SubKind,
+    vmin: f64,
+    vmax: f64,
+}
+
+impl SubPanel {
+    /// The `(value, label)` pairs for the panel's horizontal grid lines / gutter labels.
+    fn grid_labels(&self) -> Vec<(f64, String)> {
+        match self.kind {
+            SubKind::Volume => {
+                let mx = self.vmax;
+                vec![
+                    (0.0, fmt_compact(0.0)),
+                    (mx * 0.5, fmt_compact(mx * 0.5)),
+                    (mx, fmt_compact(mx)),
+                ]
+            }
+            SubKind::Lines(_) if self.title == "rsi" => vec![
+                (30.0, "30".to_string()),
+                (50.0, "50".to_string()),
+                (70.0, "70".to_string()),
+            ],
+            SubKind::Lines(_) => {
+                let mid = (self.vmin + self.vmax) / 2.0;
+                vec![
+                    (self.vmin, fmt_indicator(self.vmin)),
+                    (mid, fmt_indicator(mid)),
+                    (self.vmax, fmt_indicator(self.vmax)),
+                ]
+            }
+        }
+    }
+}
+
+/// The grouping key for an indicator panel: the label prefix before the first `_`/`:` (so
+/// `rsi_14` and `rsi_28` share the pane keyed `rsi`).
+fn panel_key(label: &str) -> &str {
+    label.split(['_', ':']).next().unwrap_or(label)
+}
+
+/// Groups panel indicators by [`panel_key`], preserving first-seen order. Returns `(key, indices)`
+/// where `indices` point into `panels`; each group becomes one shared sub-panel.
+fn group_panels(panels: &[Series]) -> Vec<(String, Vec<usize>)> {
+    let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+    for (i, s) in panels.iter().enumerate() {
+        let key = panel_key(&s.label).to_string();
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, idxs)) => idxs.push(i),
+            None => groups.push((key, vec![i])),
+        }
+    }
+    groups
+}
+
+/// The auto-scaled `(min, max)` value range shared by the panel series at `idxs`. `rsi` is pinned
+/// to `0..100`; everything else fits the combined finite values with a small pad.
+fn group_range(panels: &[Series], idxs: &[usize], key: &str) -> (f64, f64) {
+    if key == "rsi" {
+        return (0.0, 100.0);
+    }
+    let mut mn = f64::INFINITY;
+    let mut mx = f64::NEG_INFINITY;
+    for &i in idxs {
+        for v in panels[i].values.iter().flatten() {
+            if v.is_finite() {
+                mn = mn.min(*v);
+                mx = mx.max(*v);
+            }
+        }
+    }
+    if !mn.is_finite() || !mx.is_finite() {
+        return (0.0, 1.0);
+    }
+    if (mx - mn).abs() < 1e-12 {
+        let e = mx.abs().max(1.0) * 0.1;
+        return (mn - e, mx + e);
+    }
+    let pad = (mx - mn) * 0.08;
+    (mn - pad, mx + pad)
+}
+
+/// Draws a panel's horizontal grid lines and right-aligned gutter labels. Each label is clamped to
+/// stay fully within the panel's vertical band, so the bottom label of one panel and the top label
+/// of the panel below (separated only by the inter-panel gap) never overlap.
+fn draw_panel_grid(canvas: &mut Canvas, st: &Style, panel: &Panel, labels: &[(f64, String)]) {
+    let text_h = 8 * st.text_scale;
+    let y_lo = panel.top;
+    let y_hi = panel.top + panel.height - text_h;
+    for (v, label) in labels {
+        let y = panel.y(*v);
+        canvas.fill_rect(st.left, y, st.plot_w, st.grid_t, GRID);
+        let tw = label.chars().count() as i32 * st.char_w;
+        let ty = (y - text_h / 2).clamp(y_lo, y_hi.max(y_lo));
+        canvas.text(st.left - st.label_gap - tw, ty, label, TEXT, st.text_scale);
+    }
+}
+
+/// Draws a value series as a polyline within a panel, breaking at warm-up gaps.
+fn draw_series(
+    canvas: &mut Canvas,
+    st: &Style,
+    panel: &Panel,
+    x_of: &dyn Fn(usize) -> i32,
+    values: &[Option<f64>],
+    color: u8,
+) {
+    let pts: Vec<Option<(i32, i32)>> = values
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (*v).and_then(|x| x.is_finite().then(|| (x_of(i), panel.y(x)))))
+        .collect();
+    canvas.polyline(&pts, st.line_t, color);
+}
+
+/// Formats a price-axis label (two decimals).
+fn fmt_price(v: f64) -> String {
+    format!("{v:.2}")
+}
+
+/// Formats a large count compactly (`1.2B`, `340.0M`, `12k`, `950`).
+fn fmt_compact(v: f64) -> String {
+    let a = v.abs();
+    let (val, suffix) = if a >= 1e12 {
+        (v / 1e12, "T")
+    } else if a >= 1e9 {
+        (v / 1e9, "B")
+    } else if a >= 1e6 {
+        (v / 1e6, "M")
+    } else if a >= 1e3 {
+        (v / 1e3, "k")
+    } else {
+        (v, "")
+    };
+    if suffix.is_empty() {
+        format!("{v:.0}")
+    } else {
+        format!("{val:.1}{suffix}")
+    }
+}
+
+/// Formats an indicator-axis label, picking precision from the magnitude.
+fn fmt_indicator(v: f64) -> String {
+    let a = v.abs();
+    if a >= 100.0 {
+        format!("{v:.0}")
+    } else if a >= 1.0 {
+        format!("{v:.2}")
+    } else {
+        format!("{v:.4}")
+    }
 }
 
 /// The granularity of a time-axis tick, chosen from the visible span.
@@ -663,9 +1002,9 @@ mod tests {
         let opts = PlotOptions {
             width: 640,
             height: 360,
-            sma_period: 5,
             title: "TEST 1d".into(),
             tz: jiff::tz::TimeZone::UTC,
+            ..Default::default()
         };
         let canvas = render(&sample(), &opts);
         assert_eq!(canvas.width, 640);
@@ -674,17 +1013,30 @@ mod tests {
     }
 
     #[test]
-    fn render_draws_candles_and_overlays() {
+    fn render_draws_candles_overlays_and_panels() {
+        let bars = sample();
+        // An sma overlay (price panel), an rsi panel, and the volume panel exercise the series
+        // colors and the sub-panel plumbing.
+        let sma = crate::analysis::calc::parse_spec("sma:5").unwrap().unwrap();
+        let rsi = crate::analysis::calc::parse_spec("rsi:5").unwrap().unwrap();
         let opts = PlotOptions {
-            width: 640,
-            height: 360,
-            sma_period: 5,
+            width: 800,
+            height: 500,
             title: "TEST 1d".into(),
-            tz: jiff::tz::TimeZone::UTC,
+            overlays: vec![Series {
+                label: sma.name(),
+                values: sma.compute(&bars),
+            }],
+            panels: vec![Series {
+                label: rsi.name(),
+                values: rsi.compute(&bars),
+            }],
+            volume: true,
+            ..Default::default()
         };
-        let canvas = render(&sample(), &opts);
-        // Every non-background palette color should appear somewhere.
-        for color in [GRID, TEXT, UP, DOWN, SMA] {
+        let canvas = render(&bars, &opts);
+        // Candles (up/down), grid, text, and the first two series colors must all appear.
+        for color in [GRID, TEXT, UP, DOWN, series_color(0), series_color(1)] {
             assert!(
                 canvas.px.contains(&color),
                 "expected palette color {color} to be drawn"
@@ -702,9 +1054,9 @@ mod tests {
         let opts = PlotOptions {
             width: 640,
             height: 360,
-            sma_period: 0,
             title: String::new(),
             tz: jiff::tz::TimeZone::UTC,
+            ..Default::default()
         };
         let canvas = render(&bars, &opts);
         // The far-left column must be entirely background: labels keep a gap and never clip.
@@ -727,9 +1079,9 @@ mod tests {
             &PlotOptions {
                 width: 800,
                 height: 400,
-                sma_period: 0,
                 title: String::new(),
                 tz: jiff::tz::TimeZone::UTC,
+                ..Default::default()
             },
         );
         let w = canvas.width as usize;
@@ -750,9 +1102,9 @@ mod tests {
             &PlotOptions {
                 width: 800,
                 height: 400,
-                sma_period: 0,
                 title: String::new(),
                 tz: jiff::tz::TimeZone::UTC,
+                ..Default::default()
             },
         );
         let w = canvas.width as usize;
@@ -974,9 +1326,9 @@ mod tests {
         let opts = PlotOptions {
             width: 1280,
             height: 720,
-            sma_period: 0,
             title: String::new(),
             tz: jiff::tz::TimeZone::UTC,
+            ..Default::default()
         };
         // Recompute the label boxes the way render() does and assert the kept set is overlap-free.
         let ticks = labeled(&bars, &jiff::tz::TimeZone::UTC);
@@ -1013,13 +1365,116 @@ mod tests {
     }
 
     #[test]
+    fn panels_group_by_indicator_kind() {
+        assert_eq!(panel_key("rsi_14"), "rsi");
+        assert_eq!(panel_key("ret_log"), "ret");
+        let panels = vec![
+            Series {
+                label: "rsi_14".into(),
+                values: vec![],
+            },
+            Series {
+                label: "vol_20".into(),
+                values: vec![],
+            },
+            Series {
+                label: "rsi_28".into(),
+                values: vec![],
+            },
+            Series {
+                label: "ret_log".into(),
+                values: vec![],
+            },
+        ];
+        // rsi_14 and rsi_28 share one pane; order of first appearance is preserved.
+        assert_eq!(
+            group_panels(&panels),
+            vec![
+                ("rsi".to_string(), vec![0, 2]),
+                ("vol".to_string(), vec![1]),
+                ("ret".to_string(), vec![3]),
+            ]
+        );
+    }
+
+    #[test]
+    fn shared_rsi_pane_draws_both_lines() {
+        // Two RSI periods must render as two differently-colored lines (one shared pane).
+        let bars = sample();
+        let mut panels = Vec::new();
+        for spec in ["rsi:3", "rsi:5"] {
+            let ind = crate::analysis::calc::parse_spec(spec).unwrap().unwrap();
+            panels.push(Series {
+                label: ind.name(),
+                values: ind.compute(&bars),
+            });
+        }
+        let opts = PlotOptions {
+            width: 800,
+            height: 500,
+            panels,
+            ..Default::default()
+        };
+        let canvas = render(&bars, &opts);
+        // The two panel lines take the first two series colors (no overlays here).
+        assert!(
+            canvas.px.contains(&series_color(0)),
+            "first rsi line missing"
+        );
+        assert!(
+            canvas.px.contains(&series_color(1)),
+            "second rsi line missing"
+        );
+    }
+
+    #[test]
+    fn panel_labels_stay_within_the_panel_band() {
+        // A panel's gutter labels must not spill above or below its own band, so the bottom label
+        // of one panel and the top label of the next never collide across the inter-panel gap.
+        let mut c = Canvas::new(200, 200, BG);
+        let st = Style {
+            char_w: 8,
+            text_scale: 1,
+            grid_t: 1,
+            line_t: 1,
+            left: 60,
+            plot_w: 130,
+            label_gap: 8,
+        };
+        let panel = Panel {
+            top: 50,
+            height: 40,
+            vmin: 0.0,
+            vmax: 100.0,
+        };
+        let labels = vec![
+            (0.0, "0".to_string()),
+            (50.0, "50".to_string()),
+            (100.0, "100".to_string()),
+        ];
+        draw_panel_grid(&mut c, &st, &panel, &labels);
+        let w = c.width as usize;
+        for y in 0..c.height as i32 {
+            let row_has_text = (0..w).any(|x| c.px[y as usize * w + x] == TEXT);
+            if row_has_text {
+                assert!(
+                    y >= panel.top && y < panel.top + panel.height,
+                    "label text at row {y} is outside the panel band [{}, {})",
+                    panel.top,
+                    panel.top + panel.height
+                );
+            }
+        }
+    }
+
+    #[test]
     fn empty_series_yields_blank_canvas_of_requested_size() {
         let opts = PlotOptions {
             width: 320,
             height: 200,
-            sma_period: 0,
             title: String::new(),
             tz: jiff::tz::TimeZone::UTC,
+            ..Default::default()
         };
         let canvas = render(&[], &opts);
         assert_eq!(canvas.px.len(), 320 * 200);
@@ -1031,9 +1486,9 @@ mod tests {
         let opts = PlotOptions {
             width: 120,
             height: 80,
-            sma_period: 5,
             title: String::new(),
             tz: jiff::tz::TimeZone::UTC,
+            ..Default::default()
         };
         let sixel = render(&sample(), &opts).to_sixel();
         assert!(
@@ -1055,9 +1510,9 @@ mod tests {
         let opts = PlotOptions {
             width: 200,
             height: 120,
-            sma_period: 5,
             title: "PNG".into(),
             tz: jiff::tz::TimeZone::UTC,
+            ..Default::default()
         };
         render(&sample(), &opts).write_png(&path).unwrap();
 

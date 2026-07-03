@@ -17,7 +17,7 @@ use crate::{
             AnalysisFormat, BarStream, CalcSeries, guard_symbol_count, write_bars_fwob, write_calc,
             write_stat,
         },
-        plot::{Canvas, PlotOptions, render},
+        plot::{Canvas, PlotOptions, Series, render},
         read::{
             InputKind, TickQuery, discover_inputs, input_kind, open_tick_reader, read_bars,
             stream_ticks, tick_symbol,
@@ -517,14 +517,16 @@ impl BarsArgs {
 #[command(after_help = "Tokens (case-sensitive, any order):
   paths/symbols: FILE.fwob, a DIR, or a bare SYMBOL (resolved under output_dir)
   interval: e.g. 30s, 5m, 1h, 1d, 1w, 1mo, 1y (default 1d)
+  indicator specs: sma:N ema:N (overlaid on price); rsi:N ret:log ret:simple vol:N (own panel)
+  volume: add a volume panel below the candles (same as --volume)
   session: rth (keep only regular-trading-hours ticks)
   fill: forward-fill empty intervals within a session
   time range: START..END (either side optional), e.g. 2024-01-01..2026-01-01 or ..2026-01-01
               bare dates/times use the exchange tz; add Z or +/-HH for an absolute instant
 
-By default the chart is written to the console as a Sixel image (renders inline in Windows
-Terminal, WezTerm, xterm, iTerm2, ...). Pass --output to write a file instead: a .png (default) or
-a .six/.sixel raw Sixel dump.")]
+With no indicator specs, a default sma:20 overlay is drawn. By default the chart is written to the
+console as a Sixel image (renders inline in Windows Terminal, WezTerm, xterm, iTerm2, ...). Pass
+--output to write a file instead: a .png (default) or a .six/.sixel raw Sixel dump.")]
 struct PlotArgs {
     /// Window start. Bare dates/times use the exchange tz; add Z or +/-HH for an absolute
     /// instant. Overrides the start side of a START..END token.
@@ -552,9 +554,9 @@ struct PlotArgs {
     /// Image height in pixels.
     #[arg(long, default_value_t = crate::analysis::plot::DEFAULT_HEIGHT)]
     height: u32,
-    /// SMA overlay period over closes (0 disables the overlay).
-    #[arg(long, default_value_t = 20)]
-    sma: usize,
+    /// Add a volume panel below the candles (same as the positional `volume` token).
+    #[arg(long)]
+    volume: bool,
     #[arg(value_name = "ITEM", num_args = 0..)]
     items: Vec<String>,
 }
@@ -563,15 +565,31 @@ impl PlotArgs {
     fn run(self) -> Result<()> {
         let (config_path, tokens) = split_config_target(self.items)?;
         let acfg = load_analysis_config(config_path.as_deref())?;
-        let BarsTokens {
+        // A bare `volume` token toggles the volume panel (like `rth`/`fill`); pull it out before
+        // token classification so it is not mistaken for a symbol.
+        let mut volume = self.volume;
+        let tokens: Vec<String> = tokens
+            .into_iter()
+            .filter(|token| {
+                if token == VOLUME_TOKEN {
+                    volume = true;
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
+        // `plot` shares `calc`'s token grammar so it accepts the same indicator specs.
+        let CalcTokens {
             paths,
             interval: interval_token,
+            specs,
             format,
             use_rth,
             fill,
             start: range_start,
             end: range_end,
-        } = classify_with_interval(&tokens)?;
+        } = classify_calc(&tokens)?;
         // `plot` renders an image; a table/csv/fwob format token is meaningless here.
         if format != AnalysisFormat::default() {
             bail!("plot does not take an output format token; use --output to write a file");
@@ -623,18 +641,52 @@ impl PlotArgs {
                 tracing::warn!(symbol = %symbol, "no bars in range; nothing to plot");
                 continue;
             }
-            let title = if self.sma >= 2 {
-                format!("{symbol}  {}  SMA{}", interval.label(), self.sma)
-            } else {
-                format!("{symbol}  {}", interval.label())
-            };
+
+            // Compute each indicator spec against this symbol's bars, routing price-scale
+            // indicators (sma/ema) to overlays and the rest (rsi/ret/vol) to their own panels.
+            let mut overlays: Vec<Series> = Vec::new();
+            let mut panels: Vec<Series> = Vec::new();
+            for spec in &specs {
+                let indicator = parse_spec(spec).expect("spec token validated during parsing")?;
+                let series = Series {
+                    label: indicator.name(),
+                    values: indicator.compute(&bars),
+                };
+                match spec.split(':').next() {
+                    Some("sma") | Some("ema") => overlays.push(series),
+                    _ => panels.push(series),
+                }
+            }
+            // With no specs, keep the previous default: a single SMA(20) overlay.
+            if specs.is_empty() {
+                let sma = parse_spec("sma:20")
+                    .expect("valid spec")
+                    .expect("valid period");
+                overlays.push(Series {
+                    label: sma.name(),
+                    values: sma.compute(&bars),
+                });
+            }
+
+            let mut label_parts: Vec<String> = overlays
+                .iter()
+                .chain(panels.iter())
+                .map(|s| s.label.clone())
+                .collect();
+            if volume {
+                label_parts.push("vol".to_string());
+            }
+            let title = format!("{symbol}  {}   {}", interval.label(), label_parts.join(" "));
+
             let opts = PlotOptions {
                 width: self.width,
                 height: self.height,
-                sma_period: self.sma,
                 title,
                 // Label the axis in the same session tz the bars were anchored to.
                 tz: session.time_zone(),
+                overlays,
+                panels,
+                volume,
             };
             let canvas = render(&bars, &opts);
             match &self.output {
@@ -906,6 +958,9 @@ const RTH_TOKEN: &str = "rth";
 
 /// The positional `fill` token forward-fills empty intervals with flat bars (`bars`/`calc`).
 const FILL_TOKEN: &str = "fill";
+
+/// The positional `volume` token toggles the volume panel (`plot`).
+const VOLUME_TOKEN: &str = "volume";
 
 struct StatTokens {
     paths: Vec<String>,
@@ -1363,31 +1418,32 @@ mod tests {
 
     #[test]
     fn plot_defaults_to_console_hd_and_accepts_overrides() {
-        // Defaults: 1920x1080, SMA 20, no output file (console Sixel).
+        // Defaults: 1920x1080, no volume, no output file (console Sixel).
         let cli = Cli::try_parse_from(["mdfwob", "plot", "AAPL"]).unwrap();
         let Command::Plot(args) = cli.command else {
             panic!("expected plot command");
         };
         assert_eq!(args.width, 1920);
         assert_eq!(args.height, 1080);
-        assert_eq!(args.sma, 20);
+        assert!(!args.volume);
         assert!(args.output.is_none());
         assert_eq!(args.items, ["AAPL"]);
 
-        // An explicit file and dimensions override the defaults.
+        // An explicit file, dimensions, indicator specs, and volume flag override the defaults.
         let cli = Cli::try_parse_from([
             "mdfwob",
             "plot",
             "AAPL",
             "1d",
+            "sma:50",
+            "rsi:14",
             "-o",
             "chart.png",
             "--width",
             "3840",
             "--height",
             "2160",
-            "--sma",
-            "0",
+            "--volume",
         ])
         .unwrap();
         let Command::Plot(args) = cli.command else {
@@ -1395,8 +1451,20 @@ mod tests {
         };
         assert_eq!(args.width, 3840);
         assert_eq!(args.height, 2160);
-        assert_eq!(args.sma, 0);
+        assert!(args.volume);
         assert_eq!(args.output.as_deref(), Some(Path::new("chart.png")));
+        assert_eq!(args.items, ["AAPL", "1d", "sma:50", "rsi:14"]);
+    }
+
+    #[test]
+    fn plot_accepts_volume_as_a_positional_token() {
+        let cli = Cli::try_parse_from(["mdfwob", "plot", "AAPL", "volume"]).unwrap();
+        let Command::Plot(args) = cli.command else {
+            panic!("expected plot command");
+        };
+        // The token stays in `items`; run() strips it. The flag itself defaults off here.
+        assert!(!args.volume);
+        assert_eq!(args.items, ["AAPL", "volume"]);
     }
 
     #[test]
