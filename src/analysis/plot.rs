@@ -463,15 +463,21 @@ pub fn render(bars: &[Bar], opts: &PlotOptions) -> Canvas {
                         color,
                     );
                 }
-                // Volume MA overlays (vsma/vema) share the volume scale, drawn over the bars. Their
-                // colors continue the cycle after the price overlays and indicator panels.
+                // Volume MA overlays (vsma/vema/vdema) share the volume scale, drawn over the bars.
+                // Their colors continue the cycle after the price overlays and indicator panels.
                 let vol_base = opts.overlays.len() + opts.panels.len();
                 canvas.text(legend_x, legend_y, &sub.title, TEXT, text_scale);
                 legend_y += text_h + (2.0 * ds) as i32;
                 for (k, s) in opts.volume_overlays.iter().enumerate() {
                     let color = series_color(vol_base + k);
                     draw_series(&mut canvas, &style, &panel, &x_of, &s.values, color);
-                    canvas.text(legend_x, legend_y, &s.label, color, text_scale);
+                    canvas.text(
+                        legend_x,
+                        legend_y,
+                        volume_ma_legend(&s.label),
+                        color,
+                        text_scale,
+                    );
                     legend_y += text_h + (2.0 * ds) as i32;
                 }
             }
@@ -585,6 +591,13 @@ impl SubPanel {
             }
         }
     }
+}
+
+/// The legend text for a volume-MA overlay. Inside the volume pane the `v` prefix is redundant, so
+/// it is dropped (`vsma_20` -> `sma_20`, `vema_50` -> `ema_50`, `vdema_30` -> `dema_30`); these
+/// specs are just how the same MA types are parameterized against volume instead of price.
+fn volume_ma_legend(label: &str) -> &str {
+    label.strip_prefix('v').unwrap_or(label)
 }
 
 /// The grouping key for an indicator panel: the label prefix before the first `_`/`:` (so
@@ -1377,6 +1390,14 @@ mod tests {
         }
         // And the render path itself must not panic on this data.
         let _ = render(&bars, &opts);
+    }
+
+    #[test]
+    fn volume_legend_drops_the_v_prefix() {
+        // In the volume pane, vsma/vema/vdema show as sma/ema/dema (the v is just parameterization).
+        assert_eq!(volume_ma_legend("vsma_20"), "sma_20");
+        assert_eq!(volume_ma_legend("vema_50"), "ema_50");
+        assert_eq!(volume_ma_legend("vdema_30"), "dema_30");
     }
 
     #[test]
