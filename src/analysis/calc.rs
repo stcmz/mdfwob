@@ -1,8 +1,8 @@
 //! Per-bar derived series: the [`Indicator`] trait, built-ins, custom functions,
 //! and the [`Calc`] pipeline.
 //!
-//! Built-in specs are `sma:N`, `ema:N`, `rsi:N`, `ret:log`, `ret:simple`, `vol:N`.
-//! API users can also register arbitrary closures with [`Calc::with_fn`].
+//! Built-in specs are `sma:N`, `ema:N`, `vsma:N`, `vema:N`, `rsi:N`, `ret:log`,
+//! `ret:simple`, `vol:N`. API users can also register arbitrary closures with [`Calc::with_fn`].
 
 use anyhow::{Result, bail};
 
@@ -108,7 +108,7 @@ pub struct VolumeSma {
 
 impl Indicator for VolumeSma {
     fn name(&self) -> String {
-        format!("vma_{}", self.period)
+        format!("vsma_{}", self.period)
     }
 
     fn compute(&self, bars: &[Bar]) -> Vec<Option<f64>> {
@@ -296,7 +296,10 @@ pub fn parse_spec(token: &str) -> Option<Result<Box<dyn Indicator>>> {
     let (kind, arg) = token.split_once(':')?;
     // Only claim tokens whose prefix is a known indicator, so paths that contain
     // a colon (e.g. a Windows drive letter `C:\...`) fall through to path tokens.
-    if !matches!(kind, "sma" | "ema" | "vma" | "vema" | "rsi" | "vol" | "ret") {
+    if !matches!(
+        kind,
+        "sma" | "ema" | "vsma" | "vema" | "rsi" | "vol" | "ret"
+    ) {
         return None;
     }
     let result = (|| -> Result<Box<dyn Indicator>> {
@@ -312,7 +315,7 @@ pub fn parse_spec(token: &str) -> Option<Result<Box<dyn Indicator>>> {
         match kind {
             "sma" => Ok(Box::new(Sma { period: period()? })),
             "ema" => Ok(Box::new(Ema { period: period()? })),
-            "vma" => Ok(Box::new(VolumeSma { period: period()? })),
+            "vsma" => Ok(Box::new(VolumeSma { period: period()? })),
             "vema" => Ok(Box::new(VolumeEma { period: period()? })),
             "rsi" => Ok(Box::new(Rsi { period: period()? })),
             "vol" => Ok(Box::new(Volatility { period: period()? })),
@@ -529,7 +532,7 @@ mod tests {
             })
             .collect();
         let sma = VolumeSma { period: 2 };
-        assert_eq!(sma.name(), "vma_2");
+        assert_eq!(sma.name(), "vsma_2");
         assert_eq!(sma.decimals(), 0);
         assert_eq!(
             sma.compute(&bars),
@@ -547,7 +550,7 @@ mod tests {
     #[test]
     fn parse_spec_classifies() {
         assert!(parse_spec("sma:20").unwrap().is_ok());
-        assert!(parse_spec("vma:20").unwrap().is_ok());
+        assert!(parse_spec("vsma:20").unwrap().is_ok());
         assert!(parse_spec("vema:20").unwrap().is_ok());
         assert!(parse_spec("ret:log").unwrap().is_ok());
         assert!(parse_spec("vol:0").unwrap().is_err());

@@ -79,10 +79,10 @@ macro_rules! indicator_guide {
               trend baseline; lags price by ~N/2 bars. Warms up over N-1 bars.
   ema:N       Exponential moving average: alpha = 2/(N+1), seeded with the N-bar
               SMA. Weights recent closes more, so it turns faster than sma:N.
-  vma:N       Simple moving average of volume over N bars (drawn on the volume
+  vsma:N      Simple moving average of volume over N bars (drawn on the volume
               panel). Smooths volume to reveal participation trends.
   vema:N      Exponential moving average of volume (alpha = 2/(N+1)); reacts to a
-              volume spike faster than vma:N.
+              volume spike faster than vsma:N.
   rsi:N       Wilder's Relative Strength Index (0-100): 100 - 100/(1+RS), where
               RS = Wilder-smoothed avg gain / avg loss over N bars. A momentum
               oscillator; >70 is often overbought, <30 oversold.
@@ -542,8 +542,8 @@ impl BarsArgs {
 #[command(after_help = concat!("Tokens (case-sensitive, any order):
   paths/symbols: a tick or bar FILE.fwob, a DIR, or a bare SYMBOL (resolved under output_dir)
   interval: e.g. 30s, 5m, 1h, 1d, 1w, 1mo, 1y (default 1d; resamples tick files, ignored for bars)
-  indicator specs: sma:N ema:N (on price); vma:N vema:N (on volume); rsi:N ret:log ret:simple vol:N (own panel)
-  volume: add a volume panel below the candles (same as --volume; implied by vma/vema)
+  indicator specs: sma:N ema:N (on price); vsma:N vema:N (on volume); rsi:N ret:log ret:simple vol:N (own panel)
+  volume: add a volume panel below the candles (same as --volume; implied by vsma/vema)
   session: rth (keep only regular-trading-hours ticks)
   fill: forward-fill empty intervals within a session
   time range: START..END (either side optional), e.g. 2024-01-01..2026-01-01 or ..2026-01-01
@@ -696,7 +696,7 @@ impl PlotArgs {
             }
 
             // Compute each indicator spec against this symbol's bars and route it by kind: sma/ema
-            // overlay the price panel, vma/vema overlay the volume panel, and the rest (rsi/ret/vol)
+            // overlay the price panel, vsma/vema overlay the volume panel, and the rest (rsi/ret/vol)
             // get their own stacked panel.
             let mut overlays: Vec<Series> = Vec::new();
             let mut panels: Vec<Series> = Vec::new();
@@ -709,7 +709,7 @@ impl PlotArgs {
                 };
                 match spec.split(':').next() {
                     Some("sma") | Some("ema") => overlays.push(series),
-                    Some("vma") | Some("vema") => volume_overlays.push(series),
+                    Some("vsma") | Some("vema") => volume_overlays.push(series),
                     _ => panels.push(series),
                 }
             }

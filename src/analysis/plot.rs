@@ -81,7 +81,7 @@ pub struct PlotOptions {
     pub panels: Vec<Series>,
     /// Add a volume sub-panel below the price panel.
     pub volume: bool,
-    /// Volume-scale overlays (e.g. `vma`/`vema`), drawn as lines on the volume panel. A non-empty
+    /// Volume-scale overlays (e.g. `vsma`/`vema`), drawn as lines on the volume panel. A non-empty
     /// list implies the volume panel even when [`Self::volume`] is `false`.
     pub volume_overlays: Vec<Series>,
 }
@@ -281,7 +281,7 @@ pub fn render(bars: &[Bar], opts: &PlotOptions) -> Canvas {
     // share a scale (e.g. rsi:14 and rsi:28, or ret:log and ret:simple) go in the same pane as
     // separate colored lines rather than in stacked panes.
     let mut subs: Vec<SubPanel> = Vec::new();
-    // A volume MA (vma/vema) implies the volume panel even without an explicit --volume.
+    // A volume MA (vsma/vema) implies the volume panel even without an explicit --volume.
     if opts.volume || !opts.volume_overlays.is_empty() {
         let vmax = bars.iter().map(|b| b.volume).max().unwrap_or(0).max(0) as f64;
         subs.push(SubPanel {
@@ -463,7 +463,7 @@ pub fn render(bars: &[Bar], opts: &PlotOptions) -> Canvas {
                         color,
                     );
                 }
-                // Volume MA overlays (vma/vema) share the volume scale, drawn over the bars. Their
+                // Volume MA overlays (vsma/vema) share the volume scale, drawn over the bars. Their
                 // colors continue the cycle after the price overlays and indicator panels.
                 let vol_base = opts.overlays.len() + opts.panels.len();
                 canvas.text(legend_x, legend_y, &sub.title, TEXT, text_scale);
@@ -1444,7 +1444,7 @@ mod tests {
 
     #[test]
     fn volume_ma_draws_on_the_volume_pane_and_enables_it() {
-        // Bars with real volume so both the bars and the vma line are meaningful.
+        // Bars with real volume so both the bars and the vsma line are meaningful.
         let bars: Vec<Bar> = (0..30u32)
             .map(|i| {
                 let mut b = bar(1_735_700_000 + i * 86_400, 100.0, 101.0, 99.0, 100.5);
@@ -1452,19 +1452,21 @@ mod tests {
                 b
             })
             .collect();
-        let vma = crate::analysis::calc::parse_spec("vma:5").unwrap().unwrap();
+        let vsma = crate::analysis::calc::parse_spec("vsma:5")
+            .unwrap()
+            .unwrap();
         let opts = PlotOptions {
             width: 800,
             height: 500,
             volume_overlays: vec![Series {
-                label: vma.name(),
-                values: vma.compute(&bars),
+                label: vsma.name(),
+                values: vsma.compute(&bars),
             }],
             // Note: volume is left false; a volume overlay must auto-enable the pane.
             ..Default::default()
         };
         let canvas = render(&bars, &opts);
-        // The volume pane appears (direction-colored bars) and the vma line uses the first series
+        // The volume pane appears (direction-colored bars) and the vsma line uses the first series
         // color (no price overlays or indicator panels precede it).
         assert!(
             canvas.px.contains(&UP) || canvas.px.contains(&DOWN),
@@ -1472,7 +1474,7 @@ mod tests {
         );
         assert!(
             canvas.px.contains(&series_color(0)),
-            "vma overlay line missing"
+            "vsma overlay line missing"
         );
     }
 
