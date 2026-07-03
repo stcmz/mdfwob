@@ -79,6 +79,10 @@ macro_rules! indicator_guide {
               trend baseline; lags price by ~N/2 bars. Warms up over N-1 bars.
   ema:N       Exponential moving average: alpha = 2/(N+1), seeded with the N-bar
               SMA. Weights recent closes more, so it turns faster than sma:N.
+  vma:N       Simple moving average of volume over N bars (drawn on the volume
+              panel). Smooths volume to reveal participation trends.
+  vema:N      Exponential moving average of volume (alpha = 2/(N+1)); reacts to a
+              volume spike faster than vma:N.
   rsi:N       Wilder's Relative Strength Index (0-100): 100 - 100/(1+RS), where
               RS = Wilder-smoothed avg gain / avg loss over N bars. A momentum
               oscillator; >70 is often overbought, <30 oversold.
@@ -538,8 +542,8 @@ impl BarsArgs {
 #[command(after_help = concat!("Tokens (case-sensitive, any order):
   paths/symbols: a tick or bar FILE.fwob, a DIR, or a bare SYMBOL (resolved under output_dir)
   interval: e.g. 30s, 5m, 1h, 1d, 1w, 1mo, 1y (default 1d; resamples tick files, ignored for bars)
-  indicator specs: sma:N ema:N (overlaid on price); rsi:N ret:log ret:simple vol:N (own panel)
-  volume: add a volume panel below the candles (same as --volume)
+  indicator specs: sma:N ema:N (on price); vma:N vema:N (on volume); rsi:N ret:log ret:simple vol:N (own panel)
+  volume: add a volume panel below the candles (same as --volume; implied by vma/vema)
   session: rth (keep only regular-trading-hours ticks)
   fill: forward-fill empty intervals within a session
   time range: START..END (either side optional), e.g. 2024-01-01..2026-01-01 or ..2026-01-01
@@ -691,10 +695,12 @@ impl PlotArgs {
                 continue;
             }
 
-            // Compute each indicator spec against this symbol's bars, routing price-scale
-            // indicators (sma/ema) to overlays and the rest (rsi/ret/vol) to their own panels.
+            // Compute each indicator spec against this symbol's bars and route it by kind: sma/ema
+            // overlay the price panel, vma/vema overlay the volume panel, and the rest (rsi/ret/vol)
+            // get their own stacked panel.
             let mut overlays: Vec<Series> = Vec::new();
             let mut panels: Vec<Series> = Vec::new();
+            let mut volume_overlays: Vec<Series> = Vec::new();
             for spec in &specs {
                 let indicator = parse_spec(spec).expect("spec token validated during parsing")?;
                 let series = Series {
@@ -703,11 +709,14 @@ impl PlotArgs {
                 };
                 match spec.split(':').next() {
                     Some("sma") | Some("ema") => overlays.push(series),
+                    Some("vma") | Some("vema") => volume_overlays.push(series),
                     _ => panels.push(series),
                 }
             }
-            // With no specs, keep the previous default: a single SMA(20) overlay.
-            if specs.is_empty() {
+            // A volume MA implies the volume panel.
+            let volume = volume || !volume_overlays.is_empty();
+            // With no overlays/panels at all, keep the previous default: a single SMA(20) overlay.
+            if overlays.is_empty() && panels.is_empty() && volume_overlays.is_empty() {
                 let sma = parse_spec("sma:20")
                     .expect("valid spec")
                     .expect("valid period");
@@ -720,9 +729,10 @@ impl PlotArgs {
             let mut label_parts: Vec<String> = overlays
                 .iter()
                 .chain(panels.iter())
+                .chain(volume_overlays.iter())
                 .map(|s| s.label.clone())
                 .collect();
-            if volume {
+            if volume && volume_overlays.is_empty() {
                 label_parts.push("vol".to_string());
             }
             let title = format!("{symbol}  {}   {}", interval.label(), label_parts.join(" "));
@@ -736,6 +746,7 @@ impl PlotArgs {
                 overlays,
                 panels,
                 volume,
+                volume_overlays,
             };
             let canvas = render(&bars, &opts);
             match &self.output {

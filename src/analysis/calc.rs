@@ -25,6 +25,45 @@ fn closes(bars: &[Bar]) -> Vec<f64> {
     bars.iter().map(|b| b.close).collect()
 }
 
+fn volumes(bars: &[Bar]) -> Vec<f64> {
+    bars.iter().map(|b| b.volume as f64).collect()
+}
+
+/// Simple moving average over `period` bars of the values produced by `select` (close or volume).
+fn simple_ma(values: &[f64], period: usize) -> Vec<Option<f64>> {
+    let mut out = vec![None; values.len()];
+    if period == 0 {
+        return out;
+    }
+    let mut sum = 0.0;
+    for i in 0..values.len() {
+        sum += values[i];
+        if i >= period {
+            sum -= values[i - period];
+        }
+        if i + 1 >= period {
+            out[i] = Some(sum / period as f64);
+        }
+    }
+    out
+}
+
+/// Exponential moving average of `values`, seeded with the `period`-bar SMA at index `period-1`.
+fn exp_ma(values: &[f64], period: usize) -> Vec<Option<f64>> {
+    let mut out = vec![None; values.len()];
+    if period == 0 || values.len() < period {
+        return out;
+    }
+    let alpha = 2.0 / (period as f64 + 1.0);
+    let mut ema = values[..period].iter().sum::<f64>() / period as f64;
+    out[period - 1] = Some(ema);
+    for i in period..values.len() {
+        ema = alpha * values[i] + (1.0 - alpha) * ema;
+        out[i] = Some(ema);
+    }
+    out
+}
+
 fn one_return(method: ReturnMethod, prev: f64, cur: f64) -> f64 {
     match method {
         ReturnMethod::Log => (cur / prev).ln(),
@@ -43,23 +82,7 @@ impl Indicator for Sma {
     }
 
     fn compute(&self, bars: &[Bar]) -> Vec<Option<f64>> {
-        let closes = closes(bars);
-        let n = self.period;
-        let mut out = vec![None; bars.len()];
-        if n == 0 {
-            return out;
-        }
-        let mut sum = 0.0;
-        for i in 0..closes.len() {
-            sum += closes[i];
-            if i >= n {
-                sum -= closes[i - n];
-            }
-            if i + 1 >= n {
-                out[i] = Some(sum / n as f64);
-            }
-        }
-        out
+        simple_ma(&closes(bars), self.period)
     }
 }
 
@@ -74,21 +97,45 @@ impl Indicator for Ema {
     }
 
     fn compute(&self, bars: &[Bar]) -> Vec<Option<f64>> {
-        let closes = closes(bars);
-        let n = self.period;
-        let mut out = vec![None; bars.len()];
-        if n == 0 || closes.len() < n {
-            return out;
-        }
-        let alpha = 2.0 / (n as f64 + 1.0);
-        // Seed with the SMA of the first `n` closes at index n-1.
-        let mut ema = closes[..n].iter().sum::<f64>() / n as f64;
-        out[n - 1] = Some(ema);
-        for i in n..closes.len() {
-            ema = alpha * closes[i] + (1.0 - alpha) * ema;
-            out[i] = Some(ema);
-        }
-        out
+        exp_ma(&closes(bars), self.period)
+    }
+}
+
+/// Simple moving average of volume over `period` bars.
+pub struct VolumeSma {
+    pub period: usize,
+}
+
+impl Indicator for VolumeSma {
+    fn name(&self) -> String {
+        format!("vma_{}", self.period)
+    }
+
+    fn compute(&self, bars: &[Bar]) -> Vec<Option<f64>> {
+        simple_ma(&volumes(bars), self.period)
+    }
+
+    fn decimals(&self) -> u8 {
+        0
+    }
+}
+
+/// Exponential moving average of volume, seeded with the `period`-SMA.
+pub struct VolumeEma {
+    pub period: usize,
+}
+
+impl Indicator for VolumeEma {
+    fn name(&self) -> String {
+        format!("vema_{}", self.period)
+    }
+
+    fn compute(&self, bars: &[Bar]) -> Vec<Option<f64>> {
+        exp_ma(&volumes(bars), self.period)
+    }
+
+    fn decimals(&self) -> u8 {
+        0
     }
 }
 
@@ -249,7 +296,7 @@ pub fn parse_spec(token: &str) -> Option<Result<Box<dyn Indicator>>> {
     let (kind, arg) = token.split_once(':')?;
     // Only claim tokens whose prefix is a known indicator, so paths that contain
     // a colon (e.g. a Windows drive letter `C:\...`) fall through to path tokens.
-    if !matches!(kind, "sma" | "ema" | "rsi" | "vol" | "ret") {
+    if !matches!(kind, "sma" | "ema" | "vma" | "vema" | "rsi" | "vol" | "ret") {
         return None;
     }
     let result = (|| -> Result<Box<dyn Indicator>> {
@@ -265,6 +312,8 @@ pub fn parse_spec(token: &str) -> Option<Result<Box<dyn Indicator>>> {
         match kind {
             "sma" => Ok(Box::new(Sma { period: period()? })),
             "ema" => Ok(Box::new(Ema { period: period()? })),
+            "vma" => Ok(Box::new(VolumeSma { period: period()? })),
+            "vema" => Ok(Box::new(VolumeEma { period: period()? })),
             "rsi" => Ok(Box::new(Rsi { period: period()? })),
             "vol" => Ok(Box::new(Volatility { period: period()? })),
             "ret" => {
@@ -464,8 +513,42 @@ mod tests {
     }
 
     #[test]
+    fn volume_moving_averages_run_on_volume() {
+        let bars: Vec<Bar> = [10i64, 20, 30, 40]
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| Bar {
+                time: i as u32 * 60,
+                open: 1.0,
+                high: 1.0,
+                low: 1.0,
+                close: 1.0,
+                volume: v,
+                vwap: 1.0,
+                trades: 0,
+            })
+            .collect();
+        let sma = VolumeSma { period: 2 };
+        assert_eq!(sma.name(), "vma_2");
+        assert_eq!(sma.decimals(), 0);
+        assert_eq!(
+            sma.compute(&bars),
+            vec![None, Some(15.0), Some(25.0), Some(35.0)]
+        );
+        // EMA of volume warms up to the 2-bar SMA at index 1, then tracks.
+        let ema = VolumeEma { period: 2 };
+        assert_eq!(ema.name(), "vema_2");
+        let out = ema.compute(&bars);
+        assert_eq!(out[0], None);
+        assert_eq!(out[1], Some(15.0));
+        assert!(out[3].unwrap() > out[1].unwrap());
+    }
+
+    #[test]
     fn parse_spec_classifies() {
         assert!(parse_spec("sma:20").unwrap().is_ok());
+        assert!(parse_spec("vma:20").unwrap().is_ok());
+        assert!(parse_spec("vema:20").unwrap().is_ok());
         assert!(parse_spec("ret:log").unwrap().is_ok());
         assert!(parse_spec("vol:0").unwrap().is_err());
         assert!(parse_spec("csv").is_none());

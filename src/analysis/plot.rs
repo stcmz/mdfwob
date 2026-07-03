@@ -81,6 +81,9 @@ pub struct PlotOptions {
     pub panels: Vec<Series>,
     /// Add a volume sub-panel below the price panel.
     pub volume: bool,
+    /// Volume-scale overlays (e.g. `vma`/`vema`), drawn as lines on the volume panel. A non-empty
+    /// list implies the volume panel even when [`Self::volume`] is `false`.
+    pub volume_overlays: Vec<Series>,
 }
 
 impl Default for PlotOptions {
@@ -93,6 +96,7 @@ impl Default for PlotOptions {
             overlays: Vec::new(),
             panels: Vec::new(),
             volume: false,
+            volume_overlays: Vec::new(),
         }
     }
 }
@@ -277,7 +281,8 @@ pub fn render(bars: &[Bar], opts: &PlotOptions) -> Canvas {
     // share a scale (e.g. rsi:14 and rsi:28, or ret:log and ret:simple) go in the same pane as
     // separate colored lines rather than in stacked panes.
     let mut subs: Vec<SubPanel> = Vec::new();
-    if opts.volume {
+    // A volume MA (vma/vema) implies the volume panel even without an explicit --volume.
+    if opts.volume || !opts.volume_overlays.is_empty() {
         let vmax = bars.iter().map(|b| b.volume).max().unwrap_or(0).max(0) as f64;
         subs.push(SubPanel {
             title: "volume".to_string(),
@@ -458,7 +463,17 @@ pub fn render(bars: &[Bar], opts: &PlotOptions) -> Canvas {
                         color,
                     );
                 }
+                // Volume MA overlays (vma/vema) share the volume scale, drawn over the bars. Their
+                // colors continue the cycle after the price overlays and indicator panels.
+                let vol_base = opts.overlays.len() + opts.panels.len();
                 canvas.text(legend_x, legend_y, &sub.title, TEXT, text_scale);
+                legend_y += text_h + (2.0 * ds) as i32;
+                for (k, s) in opts.volume_overlays.iter().enumerate() {
+                    let color = series_color(vol_base + k);
+                    draw_series(&mut canvas, &style, &panel, &x_of, &s.values, color);
+                    canvas.text(legend_x, legend_y, &s.label, color, text_scale);
+                    legend_y += text_h + (2.0 * ds) as i32;
+                }
             }
             SubKind::Lines(idxs) => {
                 for &idx in idxs {
@@ -1424,6 +1439,40 @@ mod tests {
         assert!(
             canvas.px.contains(&series_color(1)),
             "second rsi line missing"
+        );
+    }
+
+    #[test]
+    fn volume_ma_draws_on_the_volume_pane_and_enables_it() {
+        // Bars with real volume so both the bars and the vma line are meaningful.
+        let bars: Vec<Bar> = (0..30u32)
+            .map(|i| {
+                let mut b = bar(1_735_700_000 + i * 86_400, 100.0, 101.0, 99.0, 100.5);
+                b.volume = 1000 + (i as i64 % 5) * 200;
+                b
+            })
+            .collect();
+        let vma = crate::analysis::calc::parse_spec("vma:5").unwrap().unwrap();
+        let opts = PlotOptions {
+            width: 800,
+            height: 500,
+            volume_overlays: vec![Series {
+                label: vma.name(),
+                values: vma.compute(&bars),
+            }],
+            // Note: volume is left false; a volume overlay must auto-enable the pane.
+            ..Default::default()
+        };
+        let canvas = render(&bars, &opts);
+        // The volume pane appears (direction-colored bars) and the vma line uses the first series
+        // color (no price overlays or indicator panels precede it).
+        assert!(
+            canvas.px.contains(&UP) || canvas.px.contains(&DOWN),
+            "volume bars missing (pane not enabled)"
+        );
+        assert!(
+            canvas.px.contains(&series_color(0)),
+            "vma overlay line missing"
         );
     }
 
