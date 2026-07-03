@@ -10,6 +10,7 @@ pub mod config;
 pub mod interval;
 pub mod model;
 pub mod output;
+pub mod plot;
 pub mod read;
 pub mod resample;
 pub mod schema;
@@ -23,6 +24,7 @@ pub use calc::{
 pub use config::{AnalysisConfig, ReturnMethod};
 pub use interval::Interval;
 pub use model::{Bar, Tick};
+pub use plot::{Canvas, PlotOptions, render};
 pub use read::{
     TickQuery, discover_inputs, open_tick_reader, read_bars, read_ticks, stream_ticks, tick_symbol,
 };

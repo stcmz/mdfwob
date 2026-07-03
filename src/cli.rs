@@ -17,6 +17,7 @@ use crate::{
             AnalysisFormat, BarStream, CalcSeries, guard_symbol_count, write_bars_fwob, write_calc,
             write_stat,
         },
+        plot::{Canvas, PlotOptions, render},
         read::{
             InputKind, TickQuery, discover_inputs, input_kind, open_tick_reader, read_bars,
             stream_ticks, tick_symbol,
@@ -48,6 +49,7 @@ impl Cli {
             Command::Stat(args) => args.run(),
             Command::Bars(args) => args.run(),
             Command::Calc(args) => args.run(),
+            Command::Plot(args) => args.run(),
         }
     }
 }
@@ -64,6 +66,8 @@ enum Command {
     Bars(BarsArgs),
     /// Compute per-bar indicator series (sma/ema/rsi/ret/vol) over bars or ticks.
     Calc(CalcArgs),
+    /// Render OHLC bars as a candlestick chart (Sixel to the console, or a PNG file).
+    Plot(PlotArgs),
 }
 
 #[derive(Debug, Args)]
@@ -503,6 +507,161 @@ impl BarsArgs {
         }
         out.flush()?;
         Ok(())
+    }
+}
+
+#[derive(Debug, Args)]
+#[command(
+    override_usage = "mdfwob plot [CONFIG.toml] [PATHS_OR_SYMBOLS...] [INTERVAL] [START..END] [OPTIONS]"
+)]
+#[command(after_help = "Tokens (case-sensitive, any order):
+  paths/symbols: FILE.fwob, a DIR, or a bare SYMBOL (resolved under output_dir)
+  interval: e.g. 30s, 5m, 1h, 1d, 1w, 1mo, 1y (default 1d)
+  session: rth (keep only regular-trading-hours ticks)
+  fill: forward-fill empty intervals within a session
+  time range: START..END (either side optional), e.g. 2024-01-01..2026-01-01 or ..2026-01-01
+              bare dates/times use the exchange tz; add Z or +/-HH for an absolute instant
+
+By default the chart is written to the console as a Sixel image (renders inline in Windows
+Terminal, WezTerm, xterm, iTerm2, ...). Pass --output to write a file instead: a .png (default) or
+a .six/.sixel raw Sixel dump.")]
+struct PlotArgs {
+    /// Window start. Bare dates/times use the exchange tz; add Z or +/-HH for an absolute
+    /// instant. Overrides the start side of a START..END token.
+    #[arg(long)]
+    start: Option<String>,
+    /// Window end (a bare date is inclusive of the whole local day). Overrides a START..END token.
+    #[arg(long)]
+    end: Option<String>,
+    /// Keep only regular-trading-hours ticks.
+    #[arg(long = "use-rth")]
+    use_rth: bool,
+    /// Override the session window (HH:MM-HH:MM). Default 09:30-16:00 (rth) / 04:00-20:00.
+    #[arg(long)]
+    session: Option<String>,
+    /// Override the session timezone (IANA name). Default America/New_York.
+    #[arg(long)]
+    tz: Option<String>,
+    /// Write the chart to a file (.png, or .six/.sixel for a raw Sixel dump) instead of the
+    /// console. Requires a single resolved symbol.
+    #[arg(long, short = 'o')]
+    output: Option<PathBuf>,
+    /// Image width in pixels.
+    #[arg(long, default_value_t = crate::analysis::plot::DEFAULT_WIDTH)]
+    width: u32,
+    /// Image height in pixels.
+    #[arg(long, default_value_t = crate::analysis::plot::DEFAULT_HEIGHT)]
+    height: u32,
+    /// SMA overlay period over closes (0 disables the overlay).
+    #[arg(long, default_value_t = 20)]
+    sma: usize,
+    #[arg(value_name = "ITEM", num_args = 0..)]
+    items: Vec<String>,
+}
+
+impl PlotArgs {
+    fn run(self) -> Result<()> {
+        let (config_path, tokens) = split_config_target(self.items)?;
+        let acfg = load_analysis_config(config_path.as_deref())?;
+        let BarsTokens {
+            paths,
+            interval: interval_token,
+            format,
+            use_rth,
+            fill,
+            start: range_start,
+            end: range_end,
+        } = classify_with_interval(&tokens)?;
+        // `plot` renders an image; a table/csv/fwob format token is meaningless here.
+        if format != AnalysisFormat::default() {
+            bail!("plot does not take an output format token; use --output to write a file");
+        }
+        let use_rth = self.use_rth || use_rth;
+        let interval = resolve_interval(interval_token, acfg.bars.interval.as_deref())?;
+        let fill = fill || acfg.bars.fill;
+        let session = resolve_session(&acfg, use_rth, self.session.as_deref(), self.tz.as_deref())?;
+        warn_uneven_interval(interval, &session, use_rth);
+        let clock = BarClock::Session(session.clone());
+        let start = self.start.clone().or(range_start);
+        let end = self.end.clone().or(range_end);
+        let (start, end) = parse_bounds(start.as_deref(), end.as_deref(), &session.time_zone())?;
+        let files = resolve_files(&paths, &acfg)?;
+        let query = TickQuery {
+            start,
+            end,
+            session: use_rth.then(|| session.clone()),
+        };
+
+        // Group inputs by symbol, exactly like `bars`, so a symbol's files feed one resampler.
+        let mut by_symbol: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+        for path in &files {
+            match tick_symbol(path) {
+                Ok(symbol) => by_symbol.entry(symbol).or_default().push(path.clone()),
+                Err(error) => {
+                    tracing::error!(path = %path.display(), error = %format!("{error:#}"), "failed to read")
+                }
+            }
+        }
+        if by_symbol.is_empty() {
+            bail!("no plottable inputs resolved");
+        }
+        if self.output.is_some() && by_symbol.len() > 1 {
+            bail!(
+                "plot --output writes a single chart, but {} symbols resolved; narrow the selection",
+                by_symbol.len()
+            );
+        }
+
+        let stdout = std::io::stdout();
+        for (symbol, paths) in &by_symbol {
+            let mut bars = Vec::new();
+            stream_bars(paths, interval, &clock, &query, fill, |bar| {
+                bars.push(bar);
+                Ok(())
+            })?;
+            if bars.is_empty() {
+                tracing::warn!(symbol = %symbol, "no bars in range; nothing to plot");
+                continue;
+            }
+            let title = if self.sma >= 2 {
+                format!("{symbol}  {}  SMA{}", interval.label(), self.sma)
+            } else {
+                format!("{symbol}  {}", interval.label())
+            };
+            let opts = PlotOptions {
+                width: self.width,
+                height: self.height,
+                sma_period: self.sma,
+                title,
+            };
+            let canvas = render(&bars, &opts);
+            match &self.output {
+                Some(path) => {
+                    write_chart_file(&canvas, path)?;
+                    tracing::info!(path = %path.display(), candles = bars.len(), "wrote chart");
+                }
+                None => {
+                    let mut lock = stdout.lock();
+                    lock.write_all(canvas.to_sixel().as_bytes())?;
+                    lock.flush()?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Writes a rendered [`Canvas`] to `path`, choosing the encoding from the extension: `.six`/`.sixel`
+/// dumps the raw Sixel escape sequence, anything else (including `.png`) writes an indexed PNG.
+fn write_chart_file(canvas: &Canvas, path: &Path) -> Result<()> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("six") | Some("sixel") => std::fs::write(path, canvas.to_sixel())
+            .with_context(|| format!("failed to write {}", path.display())),
+        _ => canvas.write_png(path),
     }
 }
 
@@ -1198,6 +1357,44 @@ mod tests {
             };
             assert_eq!(args.commit_interval_seconds, Some(expected));
         }
+    }
+
+    #[test]
+    fn plot_defaults_to_console_hd_and_accepts_overrides() {
+        // Defaults: 1920x1080, SMA 20, no output file (console Sixel).
+        let cli = Cli::try_parse_from(["mdfwob", "plot", "AAPL"]).unwrap();
+        let Command::Plot(args) = cli.command else {
+            panic!("expected plot command");
+        };
+        assert_eq!(args.width, 1920);
+        assert_eq!(args.height, 1080);
+        assert_eq!(args.sma, 20);
+        assert!(args.output.is_none());
+        assert_eq!(args.items, ["AAPL"]);
+
+        // An explicit file and dimensions override the defaults.
+        let cli = Cli::try_parse_from([
+            "mdfwob",
+            "plot",
+            "AAPL",
+            "1d",
+            "-o",
+            "chart.png",
+            "--width",
+            "3840",
+            "--height",
+            "2160",
+            "--sma",
+            "0",
+        ])
+        .unwrap();
+        let Command::Plot(args) = cli.command else {
+            panic!("expected plot command");
+        };
+        assert_eq!(args.width, 3840);
+        assert_eq!(args.height, 2160);
+        assert_eq!(args.sma, 0);
+        assert_eq!(args.output.as_deref(), Some(Path::new("chart.png")));
     }
 
     #[test]
