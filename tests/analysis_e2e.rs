@@ -184,3 +184,77 @@ fn cli_stat_bars_calc_run() {
 
     let _ = fs::remove_dir_all(dir);
 }
+
+#[test]
+fn cli_plot_accepts_tick_and_bar_files() {
+    let dir = temp_dir("cliplot");
+    let tick = write_tick_file(&dir);
+    let exe = env!("CARGO_BIN_EXE_mdfwob");
+
+    let assert_png = |path: &Path| {
+        let bytes = fs::read(path).unwrap();
+        assert!(bytes.len() > 8, "png {} too small", path.display());
+        assert_eq!(&bytes[0..4], b"\x89PNG", "{} is not a PNG", path.display());
+    };
+
+    // Plot the tick file (resampled to 5m) to a PNG.
+    let tick_png = dir.join("tick.png");
+    let out = Command::new(exe)
+        .args([
+            "plot",
+            tick.to_str().unwrap(),
+            "5m",
+            "rsi:3",
+            "volume",
+            "-o",
+            tick_png.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "plot tick failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_png(&tick_png);
+
+    // Produce a pre-aggregated bar file, then plot it directly (no interval token needed).
+    let bar_dir = dir.join("bars");
+    let out = Command::new(exe)
+        .args([
+            "bars",
+            tick.to_str().unwrap(),
+            "5m",
+            "fwob",
+            "--output",
+            bar_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "bars fwob failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let bar_file = bar_dir.join("AAPL.fwob");
+    assert!(bar_file.exists(), "bar file not written");
+
+    let bar_png = dir.join("bar.png");
+    let out = Command::new(exe)
+        .args([
+            "plot",
+            bar_file.to_str().unwrap(),
+            "-o",
+            bar_png.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "plot bar file failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_png(&bar_png);
+
+    let _ = fs::remove_dir_all(dir);
+}

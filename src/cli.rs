@@ -515,8 +515,8 @@ impl BarsArgs {
     override_usage = "mdfwob plot [CONFIG.toml] [PATHS_OR_SYMBOLS...] [INTERVAL] [START..END] [OPTIONS]"
 )]
 #[command(after_help = "Tokens (case-sensitive, any order):
-  paths/symbols: FILE.fwob, a DIR, or a bare SYMBOL (resolved under output_dir)
-  interval: e.g. 30s, 5m, 1h, 1d, 1w, 1mo, 1y (default 1d)
+  paths/symbols: a tick or bar FILE.fwob, a DIR, or a bare SYMBOL (resolved under output_dir)
+  interval: e.g. 30s, 5m, 1h, 1d, 1w, 1mo, 1y (default 1d; resamples tick files, ignored for bars)
   indicator specs: sma:N ema:N (overlaid on price); rsi:N ret:log ret:simple vol:N (own panel)
   volume: add a volume panel below the candles (same as --volume)
   session: rth (keep only regular-trading-hours ticks)
@@ -604,39 +604,67 @@ impl PlotArgs {
         let end = self.end.clone().or(range_end);
         let (start, end) = parse_bounds(start.as_deref(), end.as_deref(), &session.time_zone())?;
         let files = resolve_files(&paths, &acfg)?;
-        let query = TickQuery {
-            start,
-            end,
-            session: use_rth.then(|| session.clone()),
-        };
+        let filter = use_rth.then(|| session.clone());
 
-        // Group inputs by symbol, exactly like `bars`, so a symbol's files feed one resampler.
-        let mut by_symbol: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+        // Accept both tick files (resampled with the interval) and pre-aggregated bar files (read
+        // directly), exactly like `calc`. Group the resulting bars by symbol.
+        let mut groups: BTreeMap<String, Vec<Bar>> = BTreeMap::new();
         for path in &files {
-            match tick_symbol(path) {
-                Ok(symbol) => by_symbol.entry(symbol).or_default().push(path.clone()),
+            let result = (|| -> Result<(String, Vec<Bar>)> {
+                match input_kind(path)? {
+                    InputKind::Bar => {
+                        let (symbol, mut bars) = read_bars(path)?;
+                        // A bar file carries no ticks to filter, so honor the window here.
+                        bars.retain(|bar| {
+                            start.is_none_or(|s| bar.time >= s) && end.is_none_or(|e| bar.time <= e)
+                        });
+                        Ok((symbol, bars))
+                    }
+                    InputKind::Tick => {
+                        let symbol = tick_symbol(path)?;
+                        let query = TickQuery {
+                            start,
+                            end,
+                            session: filter.clone(),
+                        };
+                        let mut bars = Vec::new();
+                        stream_bars(
+                            std::slice::from_ref(path),
+                            interval,
+                            &clock,
+                            &query,
+                            fill,
+                            |bar| {
+                                bars.push(bar);
+                                Ok(())
+                            },
+                        )?;
+                        Ok((symbol, bars))
+                    }
+                }
+            })();
+            match result {
+                Ok((symbol, mut bars)) => groups.entry(symbol).or_default().append(&mut bars),
                 Err(error) => {
                     tracing::error!(path = %path.display(), error = %format!("{error:#}"), "failed to read")
                 }
             }
         }
-        if by_symbol.is_empty() {
+        if groups.is_empty() {
             bail!("no plottable inputs resolved");
         }
-        if self.output.is_some() && by_symbol.len() > 1 {
+        if self.output.is_some() && groups.len() > 1 {
             bail!(
                 "plot --output writes a single chart, but {} symbols resolved; narrow the selection",
-                by_symbol.len()
+                groups.len()
             );
         }
 
         let stdout = std::io::stdout();
-        for (symbol, paths) in &by_symbol {
-            let mut bars = Vec::new();
-            stream_bars(paths, interval, &clock, &query, fill, |bar| {
-                bars.push(bar);
-                Ok(())
-            })?;
+        for (symbol, mut bars) in groups {
+            // A symbol may span several files; keep the merged bars ascending for rendering and
+            // for the indicator computations that assume ordered input.
+            bars.sort_by_key(|bar| bar.time);
             if bars.is_empty() {
                 tracing::warn!(symbol = %symbol, "no bars in range; nothing to plot");
                 continue;
