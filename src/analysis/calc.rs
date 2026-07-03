@@ -1,8 +1,9 @@
 //! Per-bar derived series: the [`Indicator`] trait, built-ins, custom functions,
 //! and the [`Calc`] pipeline.
 //!
-//! Built-in specs are `sma:N`, `ema:N`, `vsma:N`, `vema:N`, `rsi:N`, `ret:log`,
-//! `ret:simple`, `vol:N`. API users can also register arbitrary closures with [`Calc::with_fn`].
+//! Built-in specs are `sma:N`, `ema:N`, `dema:N`, `vsma:N`, `vema:N`, `vdema:N`,
+//! `rsi:N`, `ret:log`, `ret:simple`, `vol:N`. API users can also register arbitrary
+//! closures with [`Calc::with_fn`].
 
 use anyhow::{Result, bail};
 
@@ -64,6 +65,29 @@ fn exp_ma(values: &[f64], period: usize) -> Vec<Option<f64>> {
     out
 }
 
+/// Double exponential moving average (Mulloy): `DEMA = 2*EMA - EMA(EMA)`, which cancels much of a
+/// plain EMA's lag. Warms up over `2*(period-1)` bars (the inner EMA feeds the outer one).
+fn double_ema(values: &[f64], period: usize) -> Vec<Option<f64>> {
+    let n = values.len();
+    let mut out = vec![None; n];
+    if period == 0 {
+        return out;
+    }
+    let e1 = exp_ma(values, period);
+    // The inner EMA is `Some` from `start` onward with no gaps; feed that tail to the outer EMA.
+    let Some(start) = e1.iter().position(Option::is_some) else {
+        return out;
+    };
+    let e1_tail: Vec<f64> = e1[start..].iter().map(|v| v.unwrap()).collect();
+    let e2 = exp_ma(&e1_tail, period);
+    for i in start..n {
+        if let (Some(a), Some(b)) = (e1[i], e2[i - start]) {
+            out[i] = Some(2.0 * a - b);
+        }
+    }
+    out
+}
+
 fn one_return(method: ReturnMethod, prev: f64, cur: f64) -> f64 {
     match method {
         ReturnMethod::Log => (cur / prev).ln(),
@@ -101,6 +125,21 @@ impl Indicator for Ema {
     }
 }
 
+/// Double exponential moving average of close (lower lag than `ema`).
+pub struct Dema {
+    pub period: usize,
+}
+
+impl Indicator for Dema {
+    fn name(&self) -> String {
+        format!("dema_{}", self.period)
+    }
+
+    fn compute(&self, bars: &[Bar]) -> Vec<Option<f64>> {
+        double_ema(&closes(bars), self.period)
+    }
+}
+
 /// Simple moving average of volume over `period` bars.
 pub struct VolumeSma {
     pub period: usize,
@@ -132,6 +171,25 @@ impl Indicator for VolumeEma {
 
     fn compute(&self, bars: &[Bar]) -> Vec<Option<f64>> {
         exp_ma(&volumes(bars), self.period)
+    }
+
+    fn decimals(&self) -> u8 {
+        0
+    }
+}
+
+/// Double exponential moving average of volume (lower lag than `vema`).
+pub struct VolumeDema {
+    pub period: usize,
+}
+
+impl Indicator for VolumeDema {
+    fn name(&self) -> String {
+        format!("vdema_{}", self.period)
+    }
+
+    fn compute(&self, bars: &[Bar]) -> Vec<Option<f64>> {
+        double_ema(&volumes(bars), self.period)
     }
 
     fn decimals(&self) -> u8 {
@@ -298,7 +356,7 @@ pub fn parse_spec(token: &str) -> Option<Result<Box<dyn Indicator>>> {
     // a colon (e.g. a Windows drive letter `C:\...`) fall through to path tokens.
     if !matches!(
         kind,
-        "sma" | "ema" | "vsma" | "vema" | "rsi" | "vol" | "ret"
+        "sma" | "ema" | "dema" | "vsma" | "vema" | "vdema" | "rsi" | "vol" | "ret"
     ) {
         return None;
     }
@@ -315,8 +373,10 @@ pub fn parse_spec(token: &str) -> Option<Result<Box<dyn Indicator>>> {
         match kind {
             "sma" => Ok(Box::new(Sma { period: period()? })),
             "ema" => Ok(Box::new(Ema { period: period()? })),
+            "dema" => Ok(Box::new(Dema { period: period()? })),
             "vsma" => Ok(Box::new(VolumeSma { period: period()? })),
             "vema" => Ok(Box::new(VolumeEma { period: period()? })),
+            "vdema" => Ok(Box::new(VolumeDema { period: period()? })),
             "rsi" => Ok(Box::new(Rsi { period: period()? })),
             "vol" => Ok(Box::new(Volatility { period: period()? })),
             "ret" => {
@@ -548,10 +608,32 @@ mod tests {
     }
 
     #[test]
+    fn dema_reduces_lag_versus_ema() {
+        // On a steady ramp, DEMA tracks closer to the latest value than EMA (less lag).
+        let bars = bars_from_closes(&(0..30).map(|i| 100.0 + i as f64).collect::<Vec<_>>());
+        assert_eq!(Dema { period: 5 }.name(), "dema_5");
+        let ema = Ema { period: 5 }.compute(&bars);
+        let dema = Dema { period: 5 }.compute(&bars);
+        let last = bars.len() - 1;
+        let price = bars[last].close;
+        let ema_lag = price - ema[last].unwrap();
+        let dema_lag = price - dema[last].unwrap();
+        assert!(
+            dema_lag.abs() < ema_lag.abs(),
+            "expected DEMA to lag less: dema_lag={dema_lag}, ema_lag={ema_lag}"
+        );
+        // Warm-up: DEMA needs 2*(N-1) bars before its first value.
+        assert!(dema[2 * (5 - 1) - 1].is_none());
+        assert!(dema[2 * (5 - 1)].is_some());
+    }
+
+    #[test]
     fn parse_spec_classifies() {
         assert!(parse_spec("sma:20").unwrap().is_ok());
+        assert!(parse_spec("dema:20").unwrap().is_ok());
         assert!(parse_spec("vsma:20").unwrap().is_ok());
         assert!(parse_spec("vema:20").unwrap().is_ok());
+        assert!(parse_spec("vdema:20").unwrap().is_ok());
         assert!(parse_spec("ret:log").unwrap().is_ok());
         assert!(parse_spec("vol:0").unwrap().is_err());
         assert!(parse_spec("csv").is_none());

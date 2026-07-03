@@ -79,10 +79,13 @@ macro_rules! indicator_guide {
               trend baseline; lags price by ~N/2 bars. Warms up over N-1 bars.
   ema:N       Exponential moving average: alpha = 2/(N+1), seeded with the N-bar
               SMA. Weights recent closes more, so it turns faster than sma:N.
+  dema:N      Double exponential moving average, 2*EMA - EMA(EMA). Cancels most of
+              the EMA's lag, hugging price more tightly (at the cost of some noise).
   vsma:N      Simple moving average of volume over N bars (drawn on the volume
               panel). Smooths volume to reveal participation trends.
   vema:N      Exponential moving average of volume (alpha = 2/(N+1)); reacts to a
               volume spike faster than vsma:N.
+  vdema:N     Double exponential moving average of volume; low-lag volume trend.
   rsi:N       Wilder's Relative Strength Index (0-100): 100 - 100/(1+RS), where
               RS = Wilder-smoothed avg gain / avg loss over N bars. A momentum
               oscillator; >70 is often overbought, <30 oversold.
@@ -542,8 +545,8 @@ impl BarsArgs {
 #[command(after_help = concat!("Tokens (case-sensitive, any order):
   paths/symbols: a tick or bar FILE.fwob, a DIR, or a bare SYMBOL (resolved under output_dir)
   interval: e.g. 30s, 5m, 1h, 1d, 1w, 1mo, 1y (default 1d; resamples tick files, ignored for bars)
-  indicator specs: sma:N ema:N (on price); vsma:N vema:N (on volume); rsi:N ret:log ret:simple vol:N (own panel)
-  volume: add a volume panel below the candles (same as --volume; implied by vsma/vema)
+  indicator specs: sma:N ema:N dema:N (on price); vsma:N vema:N vdema:N (on volume); rsi:N ret:log ret:simple vol:N (own panel)
+  volume: add a volume panel below the candles (same as --volume; implied by vsma/vema/vdema)
   session: rth (keep only regular-trading-hours ticks)
   fill: forward-fill empty intervals within a session
   time range: START..END (either side optional), e.g. 2024-01-01..2026-01-01 or ..2026-01-01
@@ -708,8 +711,8 @@ impl PlotArgs {
                     values: indicator.compute(&bars),
                 };
                 match spec.split(':').next() {
-                    Some("sma") | Some("ema") => overlays.push(series),
-                    Some("vsma") | Some("vema") => volume_overlays.push(series),
+                    Some("sma") | Some("ema") | Some("dema") => overlays.push(series),
+                    Some("vsma") | Some("vema") | Some("vdema") => volume_overlays.push(series),
                     _ => panels.push(series),
                 }
             }
@@ -838,7 +841,7 @@ fn fmt_session_len(seconds: u32) -> String {
 )]
 #[command(after_help = concat!("Tokens (case-sensitive, any order):
   paths/symbols: FILE.fwob, a DIR, or a bare SYMBOL (resolved under output_dir)
-  indicator specs: sma:N ema:N rsi:N ret:log ret:simple vol:N
+  indicator specs: sma:N ema:N dema:N vsma:N vema:N vdema:N rsi:N ret:log ret:simple vol:N
   interval: e.g. 5m, 1h, 1d (resamples a tick file; default 1d; ignored for bar files)
   formats: table (default), csv, md, jsonl, raw, hex, fwob
   session: rth (keep only regular-trading-hours ticks)

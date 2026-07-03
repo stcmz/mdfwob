@@ -18,8 +18,8 @@ pub mod session;
 pub mod stat;
 
 pub use calc::{
-    Calc, CalcColumn, CalcOutput, CalcSummary, Ema, Indicator, Returns, Rsi, Sma, Volatility,
-    VolumeEma, VolumeSma, parse_spec, summarize,
+    Calc, CalcColumn, CalcOutput, CalcSummary, Dema, Ema, Indicator, Returns, Rsi, Sma, Volatility,
+    VolumeDema, VolumeEma, VolumeSma, parse_spec, summarize,
 };
 pub use config::{AnalysisConfig, ReturnMethod};
 pub use interval::Interval;
