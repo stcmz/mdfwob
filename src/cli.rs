@@ -633,6 +633,8 @@ impl PlotArgs {
                 height: self.height,
                 sma_period: self.sma,
                 title,
+                // Label the axis in the same session tz the bars were anchored to.
+                tz: session.time_zone(),
             };
             let canvas = render(&bars, &opts);
             match &self.output {

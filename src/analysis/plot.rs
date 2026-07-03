@@ -53,6 +53,10 @@ pub struct PlotOptions {
     pub sma_period: usize,
     /// Title drawn at the top-left (e.g. `"AAPL 1d"`).
     pub title: String,
+    /// Timezone the x-axis calendar boundaries and clock labels are expressed in. This should match
+    /// the session tz the bars were aggregated against, so day/month/year ticks land on the same
+    /// local boundaries the buckets were anchored to.
+    pub tz: TimeZone,
 }
 
 impl Default for PlotOptions {
@@ -62,6 +66,7 @@ impl Default for PlotOptions {
             height: DEFAULT_HEIGHT,
             sma_period: 20,
             title: String::new(),
+            tz: TimeZone::UTC,
         }
     }
 }
@@ -241,20 +246,35 @@ pub fn render(bars: &[Bar], opts: &PlotOptions) -> Canvas {
     let pen_t = grid_t;
     let sma_t = ((2.0 * ds).round() as i32).max(1);
 
-    // Month boundaries: the first bar of each new month. Used for the vertical grid lines (drawn
-    // under the candles) and the bottom axis labels (drawn on top, after the candles).
-    let month_ticks: Vec<(usize, String)> = {
-        let mut ticks = Vec::new();
-        let mut last = String::new();
-        for (i, bar) in bars.iter().enumerate() {
-            let month = month_label(bar.time);
-            if month != last {
-                ticks.push((i, month.clone()));
-                last = month;
-            }
-        }
-        ticks
-    };
+    // Time-axis boundaries (positions only), chosen to suit the visible span (years for a
+    // multi-year view down to minutes for an intraday one), expressed in the configured timezone.
+    let (gran, time_ticks) = time_axis_ticks(bars, &opts.tz);
+
+    // Resolve label geometry and drop collisions so labels never overprint each other. Two labels
+    // can collide when the first bar sits mid-period (a leading partial tick right next to the
+    // first real boundary) or when a coarse label is simply wider than the tick spacing.
+    let min_gap = char_w; // keep at least one blank character between labels
+    let all: Vec<usize> = (0..time_ticks.len()).collect();
+    let boxes: Vec<(i32, i32)> = label_ticks(gran, &time_ticks, &all)
+        .iter()
+        .map(|(i, label)| {
+            let tw = label.chars().count() as i32 * char_w;
+            let lx = x_of(*i).min(w as i32 - tw - label_gap).max(0);
+            (lx, tw)
+        })
+        .collect();
+    // Label the kept ticks using the previous *kept* tick as context, so whichever tick becomes
+    // first-visible after a collision drop still carries the year (the dropped leading tick took
+    // its year with it otherwise). Recompute geometry from the final label widths.
+    let keep = select_nonoverlapping(&boxes, min_gap);
+    let placed: Vec<(usize, i32, String)> = label_ticks(gran, &time_ticks, &keep)
+        .into_iter()
+        .map(|(i, label)| {
+            let tw = label.chars().count() as i32 * char_w;
+            let lx = x_of(i).min(w as i32 - tw - label_gap).max(0);
+            (i, lx, label)
+        })
+        .collect();
 
     // Grid first (both axes), so the candles and overlays paint on top of it.
     // Horizontal price grid + right-aligned labels in the gutter.
@@ -271,8 +291,8 @@ pub fn render(bars: &[Bar], opts: &PlotOptions) -> Canvas {
             text_scale,
         );
     }
-    // Vertical month grid lines.
-    for (i, _) in &month_ticks {
+    // Vertical time-axis grid lines, at the same boundaries as the (kept) labels.
+    for (i, _, _) in &placed {
         canvas.fill_rect(x_of(*i), top, grid_t, plot_h, GRID);
     }
 
@@ -316,13 +336,11 @@ pub fn render(bars: &[Bar], opts: &PlotOptions) -> Canvas {
         }
     }
 
-    // Month labels along the bottom (on top of the grid and candles). Clamp each label's x so the
-    // last one does not run off the right edge of the canvas.
+    // Time-axis labels along the bottom (on top of the grid and candles), using the collision-free
+    // set and pixel positions resolved above.
     let label_y = h as i32 - bottom + (6.0 * ds) as i32;
-    for (i, month) in &month_ticks {
-        let tw = month.chars().count() as i32 * char_w;
-        let lx = x_of(*i).min(w as i32 - tw - label_gap).max(0);
-        canvas.text(lx, label_y, month, TEXT, text_scale);
+    for (_, lx, label) in &placed {
+        canvas.text(*lx, label_y, label, TEXT, text_scale);
     }
 
     // Title.
@@ -333,10 +351,183 @@ pub fn render(bars: &[Bar], opts: &PlotOptions) -> Canvas {
     canvas
 }
 
-/// Formats a UTC epoch second as a three-letter month abbreviation (`Jan`..`Dec`).
-fn month_label(epoch: u32) -> String {
-    match Timestamp::from_second(i64::from(epoch)) {
-        Ok(ts) => ts.to_zoned(TimeZone::UTC).strftime("%b").to_string(),
+/// The granularity of a time-axis tick, chosen from the visible span.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gran {
+    /// Sub-day step of `n` seconds (minutes/hours).
+    Sec(i64),
+    Day,
+    Week,
+    /// A run of `n` calendar months (1 = monthly, 3 = quarterly).
+    Month(i64),
+    /// A run of `n` calendar years.
+    Year(i64),
+}
+
+impl Gran {
+    /// The bucket index a timestamp falls in; a tick is emitted whenever this changes between
+    /// consecutive bars.
+    fn bucket(self, t: i64) -> i64 {
+        match self {
+            Gran::Sec(step) => t.div_euclid(step),
+            Gran::Day => t.div_euclid(86_400),
+            // Week buckets aligned to Monday (epoch day 0 = Thursday, so shift by 3).
+            Gran::Week => (t.div_euclid(86_400) + 3).div_euclid(7),
+            Gran::Month(k) => {
+                let (y, m, _) = ymd(t);
+                (i64::from(y) * 12 + i64::from(m - 1)).div_euclid(k)
+            }
+            Gran::Year(k) => i64::from(ymd(t).0).div_euclid(k),
+        }
+    }
+
+    /// The label for a tick at (local) time `t`. `prev` is the previous tick's local time, used so a
+    /// sub-day axis shows a date when the day changes (a clock time otherwise) and a monthly axis
+    /// shows the year only on the first tick of each new year (the leading tick counts as a change).
+    fn label(self, t: i64, prev: Option<i64>) -> String {
+        match self {
+            Gran::Sec(_) => {
+                let day = t.div_euclid(86_400);
+                let prev_day = prev.map(|p| p.div_euclid(86_400));
+                if prev_day != Some(day) {
+                    strf(t, "%b %d")
+                } else {
+                    strf(t, "%H:%M")
+                }
+            }
+            Gran::Day | Gran::Week => strf(t, "%b %d"),
+            Gran::Month(_) => {
+                let year = ymd(t).0;
+                let prev_year = prev.map(|p| ymd(p).0);
+                if prev_year == Some(year) {
+                    strf(t, "%b")
+                } else {
+                    strf(t, "%b %Y")
+                }
+            }
+            Gran::Year(_) => strf(t, "%Y"),
+        }
+    }
+}
+
+/// Picks time-axis ticks that suit the visible span: years for a multi-year view, months for a
+/// yearly one, days/hours/minutes as the window shrinks. Returns `(bar_index, label)` pairs at each
+/// boundary of the chosen granularity, targeting a readable number of labels across the width.
+///
+/// Calendar boundaries and clock labels are computed in `tz` so they line up with the local
+/// day/month/year the bars were aggregated against (each timestamp is shifted by its `tz` offset,
+/// then treated as civil time).
+fn time_axis_ticks(bars: &[Bar], tz: &TimeZone) -> (Gran, Vec<(usize, i64)>) {
+    let n = bars.len();
+    if n == 0 {
+        return (Gran::Day, Vec::new());
+    }
+    let span = (i64::from(bars[n - 1].time) - i64::from(bars[0].time)).max(1);
+    // Cap the label count; the finest ladder step that stays under it wins, which keeps roughly
+    // 7..14 labels (adjacent steps differ by ~2-4x).
+    const MAX_TICKS: i64 = 14;
+    // (approximate seconds per step, granularity), ascending.
+    const LADDER: [(i64, Gran); 15] = [
+        (300, Gran::Sec(300)),         // 5m
+        (900, Gran::Sec(900)),         // 15m
+        (1_800, Gran::Sec(1_800)),     // 30m
+        (3_600, Gran::Sec(3_600)),     // 1h
+        (10_800, Gran::Sec(10_800)),   // 3h
+        (21_600, Gran::Sec(21_600)),   // 6h
+        (43_200, Gran::Sec(43_200)),   // 12h
+        (86_400, Gran::Day),           // 1d
+        (604_800, Gran::Week),         // 1w
+        (2_629_800, Gran::Month(1)),   // 1mo
+        (7_889_400, Gran::Month(3)),   // 1 quarter
+        (31_557_600, Gran::Year(1)),   // 1y
+        (63_115_200, Gran::Year(2)),   // 2y
+        (157_788_000, Gran::Year(5)),  // 5y
+        (315_576_000, Gran::Year(10)), // 10y
+    ];
+    let gran = LADDER
+        .iter()
+        .find(|(secs, _)| span / secs <= MAX_TICKS)
+        .map(|&(_, g)| g)
+        .unwrap_or(Gran::Sec(60));
+
+    // Emit a tick at each granularity-bucket boundary, carrying the bar index and its local time.
+    // Labeling is deferred to [`label_ticks`] so it can be done against the surviving (kept) ticks
+    // after collision resolution, keeping the year on whichever tick ends up first-visible.
+    let mut ticks = Vec::new();
+    let mut prev_bucket: Option<i64> = None;
+    for (i, bar) in bars.iter().enumerate() {
+        // Shift into local civil time so all calendar/clock math is tz-correct.
+        let local = local_epoch(i64::from(bar.time), tz);
+        let bucket = gran.bucket(local);
+        if prev_bucket != Some(bucket) {
+            ticks.push((i, local));
+            prev_bucket = Some(bucket);
+        }
+    }
+    (gran, ticks)
+}
+
+/// Labels the ticks at indices `keep` (into `ticks`, each `(bar_index, local_time)`), using the
+/// previous *kept* tick as context. So the first kept tick — and any kept tick that starts a new
+/// year or a new day — shows the fuller form (year / date), while runs within the same year or day
+/// stay compact. Returns `(bar_index, label)` for each kept tick, in order.
+fn label_ticks(gran: Gran, ticks: &[(usize, i64)], keep: &[usize]) -> Vec<(usize, String)> {
+    let mut out = Vec::with_capacity(keep.len());
+    let mut prev: Option<i64> = None;
+    for &k in keep {
+        let (bar, local) = ticks[k];
+        out.push((bar, gran.label(local, prev)));
+        prev = Some(local);
+    }
+    out
+}
+
+/// Shifts a UTC epoch second into local civil seconds for `tz` (i.e. `t + utc_offset(t)`), so the
+/// UTC-based [`ymd`]/[`strf`] helpers yield `tz`-local calendar fields and clock times. The offset
+/// is resolved per instant, so DST transitions are handled.
+fn local_epoch(t: i64, tz: &TimeZone) -> i64 {
+    match Timestamp::from_second(t) {
+        Ok(ts) => t + i64::from(tz.to_offset(ts).seconds()),
+        Err(_) => t,
+    }
+}
+
+/// Selects which time-axis labels to draw so none overprint another. `boxes` are the labels'
+/// `(left_x, width)` in draw order (left to right); `min_gap` is the minimum blank space required
+/// between two labels. Returns the kept indices.
+///
+/// A leading label that would collide with the second one is dropped in favor of the second: the
+/// first bar of a window often sits mid-period (a short "leading partial" tick sitting right next
+/// to the first real period boundary), and the boundary is the more useful of the two. After that
+/// it is a greedy left-to-right sweep that keeps a label only once it clears the previous one.
+fn select_nonoverlapping(boxes: &[(i32, i32)], min_gap: i32) -> Vec<usize> {
+    let start = usize::from(boxes.len() >= 2 && boxes[0].0 + boxes[0].1 + min_gap > boxes[1].0);
+    let mut kept = Vec::new();
+    let mut last_right = i32::MIN;
+    for (i, &(lx, tw)) in boxes.iter().enumerate().skip(start) {
+        if lx >= last_right.saturating_add(min_gap) {
+            last_right = lx + tw;
+            kept.push(i);
+        }
+    }
+    kept
+}
+
+/// Decomposes a UTC epoch second into `(year, month, day)`; falls back to the epoch on overflow.
+fn ymd(t: i64) -> (i16, i8, i8) {
+    match Timestamp::from_second(t) {
+        Ok(ts) => {
+            let z = ts.to_zoned(TimeZone::UTC);
+            (z.year(), z.month(), z.day())
+        }
+        Err(_) => (1970, 1, 1),
+    }
+}
+
+/// Formats a UTC epoch second with a jiff `strftime` pattern.
+fn strf(t: i64, fmt: &str) -> String {
+    match Timestamp::from_second(t) {
+        Ok(ts) => ts.to_zoned(TimeZone::UTC).strftime(fmt).to_string(),
         Err(_) => String::new(),
     }
 }
@@ -474,6 +665,7 @@ mod tests {
             height: 360,
             sma_period: 5,
             title: "TEST 1d".into(),
+            tz: jiff::tz::TimeZone::UTC,
         };
         let canvas = render(&sample(), &opts);
         assert_eq!(canvas.width, 640);
@@ -488,6 +680,7 @@ mod tests {
             height: 360,
             sma_period: 5,
             title: "TEST 1d".into(),
+            tz: jiff::tz::TimeZone::UTC,
         };
         let canvas = render(&sample(), &opts);
         // Every non-background palette color should appear somewhere.
@@ -511,6 +704,7 @@ mod tests {
             height: 360,
             sma_period: 0,
             title: String::new(),
+            tz: jiff::tz::TimeZone::UTC,
         };
         let canvas = render(&bars, &opts);
         // The far-left column must be entirely background: labels keep a gap and never clip.
@@ -535,6 +729,7 @@ mod tests {
                 height: 400,
                 sma_period: 0,
                 title: String::new(),
+                tz: jiff::tz::TimeZone::UTC,
             },
         );
         let w = canvas.width as usize;
@@ -557,6 +752,7 @@ mod tests {
                 height: 400,
                 sma_period: 0,
                 title: String::new(),
+                tz: jiff::tz::TimeZone::UTC,
             },
         );
         let w = canvas.width as usize;
@@ -582,6 +778,240 @@ mod tests {
         );
     }
 
+    fn epoch(y: i16, m: i8, d: i8) -> u32 {
+        jiff::civil::date(y, m, d)
+            .to_zoned(jiff::tz::TimeZone::UTC)
+            .unwrap()
+            .timestamp()
+            .as_second() as u32
+    }
+
+    fn flat_bar(time: u32) -> Bar {
+        bar(time, 100.0, 101.0, 99.0, 100.5)
+    }
+
+    /// Full label pipeline with every tick kept (no collisions) — the common case for these tests.
+    fn labeled(bars: &[Bar], tz: &jiff::tz::TimeZone) -> Vec<(usize, String)> {
+        let (gran, ticks) = time_axis_ticks(bars, tz);
+        let all: Vec<usize> = (0..ticks.len()).collect();
+        label_ticks(gran, &ticks, &all)
+    }
+
+    #[test]
+    fn time_axis_uses_year_labels_over_a_multi_year_span() {
+        // One bar on the first of each month across six calendar years.
+        let mut bars = Vec::new();
+        for y in 2020..2026i16 {
+            for m in 1..=12i8 {
+                bars.push(flat_bar(epoch(y, m, 1)));
+            }
+        }
+        let ticks = labeled(&bars, &jiff::tz::TimeZone::UTC);
+        assert!(ticks.len() <= 14, "too many labels: {}", ticks.len());
+        let labels: Vec<&str> = ticks.iter().map(|(_, l)| l.as_str()).collect();
+        // A multi-year span is labeled by year.
+        assert!(labels.contains(&"2020"), "labels = {labels:?}");
+        assert!(labels.contains(&"2025"), "labels = {labels:?}");
+        assert!(
+            labels
+                .iter()
+                .all(|l| l.len() == 4 && l.chars().all(|c| c.is_ascii_digit())),
+            "expected pure year labels, got {labels:?}"
+        );
+    }
+
+    #[test]
+    fn time_axis_shows_a_year_anchor_over_a_single_year_of_daily_bars() {
+        // Daily bars for one calendar year -> monthly ticks; the first month carries the year.
+        let base = epoch(2026, 1, 1);
+        let bars: Vec<Bar> = (0..365u32).map(|i| flat_bar(base + i * 86_400)).collect();
+        let ticks = labeled(&bars, &jiff::tz::TimeZone::UTC);
+        let labels: Vec<&str> = ticks.iter().map(|(_, l)| l.as_str()).collect();
+        assert!(ticks.len() <= 14, "too many labels: {}", ticks.len());
+        assert!(
+            labels.contains(&"Jan 2026"),
+            "expected a year anchor on the first month, got {labels:?}"
+        );
+        assert!(
+            labels.contains(&"Feb"),
+            "expected bare month labels within the year, got {labels:?}"
+        );
+    }
+
+    #[test]
+    fn monthly_axis_shows_the_year_only_on_the_first_month_of_each_year() {
+        // Range Feb 2026 .. Jan 2027 (one bar per month): only the first visible month of a year
+        // carries the year -> "Feb 2026" then bare months, then "Jan 2027".
+        let mut bars = Vec::new();
+        for (y, m) in [
+            (2026i16, 2i8),
+            (2026, 3),
+            (2026, 4),
+            (2026, 5),
+            (2026, 6),
+            (2026, 7),
+            (2026, 8),
+            (2026, 9),
+            (2026, 10),
+            (2026, 11),
+            (2026, 12),
+            (2027, 1),
+        ] {
+            bars.push(flat_bar(epoch(y, m, 1)));
+        }
+        let ticks = labeled(&bars, &jiff::tz::TimeZone::UTC);
+        let labels: Vec<&str> = ticks.iter().map(|(_, l)| l.as_str()).collect();
+        assert_eq!(labels.first(), Some(&"Feb 2026"), "labels = {labels:?}");
+        assert!(labels.contains(&"Jan 2027"), "labels = {labels:?}");
+        // No other label carries a year (they are bare months like "Mar", "Apr", ...).
+        let with_year: Vec<&&str> = labels.iter().filter(|l| l.contains(' ')).collect();
+        assert_eq!(
+            with_year,
+            vec![&"Feb 2026", &"Jan 2027"],
+            "only the first month of each year should show the year, got {labels:?}"
+        );
+    }
+
+    #[test]
+    fn dropped_leading_tick_keeps_the_year_on_the_first_visible_label() {
+        // Monthly ticks all within 2026 (Feb..Dec). When the leading Feb tick is dropped (as
+        // happens when it collides with the March boundary), the surviving first-visible label must
+        // still carry the year -> "Mar 2026", not a bare "Mar".
+        let bars: Vec<Bar> = (2..=12i8).map(|m| flat_bar(epoch(2026, m, 1))).collect();
+        let (gran, ticks) = time_axis_ticks(&bars, &jiff::tz::TimeZone::UTC);
+        assert!(
+            ticks.len() >= 3,
+            "expected monthly ticks, got {}",
+            ticks.len()
+        );
+        // Keep everything except the leading tick, exactly as a collision drop would.
+        let keep: Vec<usize> = (1..ticks.len()).collect();
+        let labels = label_ticks(gran, &ticks, &keep);
+        assert_eq!(
+            labels[0].1, "Mar 2026",
+            "first visible label must carry the year after a leading drop"
+        );
+        // Without a drop, the year rides on the leading tick and March stays bare.
+        let full = labeled(&bars, &jiff::tz::TimeZone::UTC);
+        assert_eq!(full[0].1, "Feb 2026");
+        assert_eq!(full[1].1, "Mar");
+    }
+
+    #[test]
+    fn calendar_boundaries_follow_the_configured_timezone() {
+        // 2026-01-01T02:00:00Z is still 2025-12-31 21:00 in New York. Daily bars starting there
+        // should label the first tick "Dec 31" (NY) rather than "Jan 01" (UTC).
+        let ny = jiff::tz::TimeZone::get("America/New_York").unwrap();
+        let base = epoch(2026, 1, 1) + 2 * 3600; // 02:00 UTC
+        let bars: Vec<Bar> = (0..20u32).map(|i| flat_bar(base + i * 86_400)).collect();
+        let utc_ticks = labeled(&bars, &jiff::tz::TimeZone::UTC);
+        let ny_ticks = labeled(&bars, &ny);
+        assert_eq!(utc_ticks[0].1, "Jan 01", "utc = {:?}", utc_ticks[0]);
+        assert_eq!(ny_ticks[0].1, "Dec 31", "ny = {:?}", ny_ticks[0]);
+    }
+
+    #[test]
+    fn time_axis_uses_clock_labels_for_an_intraday_span() {
+        // 5-minute bars across a single RTH session -> intraday (HH:MM) ticks, first one dated.
+        let base = epoch(2026, 7, 2) + 13 * 3600 + 30 * 60; // 13:30 UTC
+        let bars: Vec<Bar> = (0..78u32).map(|i| flat_bar(base + i * 300)).collect();
+        let ticks = labeled(&bars, &jiff::tz::TimeZone::UTC);
+        let labels: Vec<&str> = ticks.iter().map(|(_, l)| l.as_str()).collect();
+        assert!(ticks.len() <= 14, "too many labels: {}", ticks.len());
+        // Clock labels appear...
+        assert!(
+            labels.iter().any(|l| l.contains(':')),
+            "expected HH:MM labels, got {labels:?}"
+        );
+        // ...and the first label is a date for context (no colon).
+        assert!(
+            !labels[0].contains(':'),
+            "expected the first label to be a date, got {labels:?}"
+        );
+    }
+
+    #[test]
+    fn leading_partial_label_yields_to_the_first_boundary() {
+        // A short leading tick at x=10 sits right next to the first real boundary at x=20; with a
+        // min gap of 8 they collide, so the leading one is dropped in favor of the boundary.
+        let boxes = [(10, 60), (20, 60), (400, 60), (800, 60)];
+        let keep = select_nonoverlapping(&boxes, 8);
+        assert_eq!(
+            keep,
+            vec![1, 2, 3],
+            "leading partial should lose to the boundary"
+        );
+    }
+
+    #[test]
+    fn nonoverlapping_labels_are_all_kept() {
+        let boxes = [(0, 40), (200, 40), (400, 40)];
+        assert_eq!(select_nonoverlapping(&boxes, 8), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn crowded_labels_are_thinned_left_to_right() {
+        // Five equally wide labels packed closer than their width: keep every other one or so.
+        let boxes = [(0, 50), (30, 50), (60, 50), (90, 50), (120, 50)];
+        let keep = select_nonoverlapping(&boxes, 8);
+        // No two kept labels overlap.
+        for pair in keep.windows(2) {
+            let (lx0, tw0) = boxes[pair[0]];
+            let (lx1, _) = boxes[pair[1]];
+            assert!(lx1 >= lx0 + tw0 + 8, "kept labels {pair:?} overlap");
+        }
+        assert!(keep.len() >= 2, "should keep more than one label");
+    }
+
+    #[test]
+    fn weekly_bars_across_a_year_boundary_do_not_overlap_labels() {
+        // Reproduces the reported case: weekly bars from late Dec 2024 through mid-2026. The
+        // leading Dec-2024 partial tick must not collide with the Jan-2025 quarter boundary.
+        let start = epoch(2024, 12, 30);
+        let bars: Vec<Bar> = (0..78u32)
+            .map(|i| flat_bar(start + i * 7 * 86_400))
+            .collect();
+        let opts = PlotOptions {
+            width: 1280,
+            height: 720,
+            sma_period: 0,
+            title: String::new(),
+            tz: jiff::tz::TimeZone::UTC,
+        };
+        // Recompute the label boxes the way render() does and assert the kept set is overlap-free.
+        let ticks = labeled(&bars, &jiff::tz::TimeZone::UTC);
+        let ds = (opts.height as f32 / DEFAULT_HEIGHT as f32)
+            .min(opts.width as f32 / DEFAULT_WIDTH as f32);
+        let char_w = ((1.6 * ds).round() as i32).max(1) * 8;
+        let label_gap = (8.0 * ds) as i32;
+        let x_of = |i: usize| -> i32 {
+            // Approximate; only relative spacing matters for the overlap check.
+            120 + ((i as f64 + 0.5) * ((opts.width as f64 - 140.0) / bars.len() as f64)).round()
+                as i32
+        };
+        let boxes: Vec<(i32, i32)> = ticks
+            .iter()
+            .map(|(i, l)| {
+                let tw = l.chars().count() as i32 * char_w;
+                let lx = x_of(*i).min(opts.width as i32 - tw - label_gap).max(0);
+                (lx, tw)
+            })
+            .collect();
+        let keep = select_nonoverlapping(&boxes, char_w);
+        for pair in keep.windows(2) {
+            let (lx0, tw0) = boxes[pair[0]];
+            let (lx1, _) = boxes[pair[1]];
+            assert!(
+                lx1 >= lx0 + tw0 + char_w,
+                "labels overlap: {:?} vs {:?}",
+                ticks[pair[0]],
+                ticks[pair[1]]
+            );
+        }
+        // And the render path itself must not panic on this data.
+        let _ = render(&bars, &opts);
+    }
+
     #[test]
     fn empty_series_yields_blank_canvas_of_requested_size() {
         let opts = PlotOptions {
@@ -589,6 +1019,7 @@ mod tests {
             height: 200,
             sma_period: 0,
             title: String::new(),
+            tz: jiff::tz::TimeZone::UTC,
         };
         let canvas = render(&[], &opts);
         assert_eq!(canvas.px.len(), 320 * 200);
@@ -602,6 +1033,7 @@ mod tests {
             height: 80,
             sma_period: 5,
             title: String::new(),
+            tz: jiff::tz::TimeZone::UTC,
         };
         let sixel = render(&sample(), &opts).to_sixel();
         assert!(
@@ -625,6 +1057,7 @@ mod tests {
             height: 120,
             sma_period: 5,
             title: "PNG".into(),
+            tz: jiff::tz::TimeZone::UTC,
         };
         render(&sample(), &opts).write_png(&path).unwrap();
 
