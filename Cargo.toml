@@ -33,7 +33,7 @@ serde_json = "1.0"
 # Cap below time 0.3.50, which fails to compile (unresolved `time_macros::timestamp`).
 # This keeps `cargo install mdfwob` working without `--locked`. Lift the cap once a
 # fixed time release (>= 0.3.51) is available.
-time = { version = ">=0.3, <0.3.50", features = ["formatting", "macros", "parsing"] }
+time = { version = ">=0.3, <0.3.54", features = ["formatting", "macros", "parsing"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 toml = "0.8"
 tracing = "0.1"
