@@ -19,10 +19,10 @@ use crate::{
         },
         plot::{Canvas, PlotOptions, Series, render},
         read::{
-            InputKind, TickQuery, discover_inputs, input_kind, open_tick_reader, read_bars,
-            stream_ticks, tick_symbol,
+            InputKind, TickQuery, discover_inputs, file_symbol, input_kind, open_tick_reader,
+            read_bars, stream_ticks, tick_symbol,
         },
-        resample::{BarClock, ForwardFiller, Resampler},
+        resample::{BarClock, BarResampler, ForwardFiller, Resampler},
         schema::{bar_schema, with_symbol_column},
         session::Session,
         stat::StatAccumulator,
@@ -60,9 +60,9 @@ enum Command {
     Download(DownloadArgs),
     /// Fully verify a FWOB v1 or v2 output file.
     Verify(VerifyArgs),
-    /// Summarize tick files: one row per file with price/volume/gap stats.
+    /// Summarize tick or bar files: one row per file with price/volume stats.
     Stat(StatArgs),
-    /// Resample ticks into OHLCV bars (table/csv/md/jsonl/raw/hex/fwob).
+    /// Resample ticks (or re-resample bars) into OHLCV bars (table/csv/md/jsonl/raw/hex/fwob).
     Bars(BarsArgs),
     /// Compute per-bar indicator series (sma/ema/rsi/ret/vol) over bars or ticks.
     Calc(CalcArgs),
@@ -340,9 +340,6 @@ struct StatArgs {
     /// Override the session timezone (IANA name). Default America/New_York.
     #[arg(long)]
     tz: Option<String>,
-    /// Intra-day tick spacing (seconds) above which a gap is counted. Default 60.
-    #[arg(long = "max-gap")]
-    max_gap: Option<u32>,
     /// Optional CONFIG.toml, then files/dirs/symbols and tokens (see below).
     #[arg(value_name = "ITEM", num_args = 0..)]
     items: Vec<String>,
@@ -368,7 +365,6 @@ impl StatArgs {
         let start = self.start.clone().or(range_start);
         let end = self.end.clone().or(range_end);
         let (start, end) = parse_bounds(start.as_deref(), end.as_deref(), &session.time_zone())?;
-        let max_gap = self.max_gap.unwrap_or(acfg.stat.max_gap);
         let files = resolve_files(&paths, &acfg)?;
         let query = TickQuery {
             start,
@@ -380,14 +376,33 @@ impl StatArgs {
         let mut failures = 0u32;
         for path in &files {
             let result = (|| -> Result<_> {
-                let (mut reader, symbol) = open_tick_reader(path)?;
                 let format_label = format_label(path)?;
-                let mut acc = StatAccumulator::new(max_gap, &session);
-                stream_ticks(&mut reader, &query, |tick| {
-                    acc.push(&tick);
-                    Ok(())
-                })?;
-                Ok(acc.finish(symbol, format_label))
+                let mut acc = StatAccumulator::new();
+                match input_kind(path)? {
+                    InputKind::Tick => {
+                        let (mut reader, symbol) = open_tick_reader(path)?;
+                        stream_ticks(&mut reader, &query, |tick| {
+                            acc.push_tick(&tick);
+                            Ok(())
+                        })?;
+                        Ok(acc.finish(symbol, "tick", format_label))
+                    }
+                    InputKind::Bar => {
+                        let (symbol, bars) = read_bars(path)?;
+                        for bar in &bars {
+                            let keep = query.start.is_none_or(|s| bar.time >= s)
+                                && query.end.is_none_or(|e| bar.time <= e)
+                                && query
+                                    .session
+                                    .as_ref()
+                                    .is_none_or(|session| session.contains(bar.time));
+                            if keep {
+                                acc.push_bar(bar);
+                            }
+                        }
+                        Ok(acc.finish(symbol, "bar", format_label))
+                    }
+                }
             })();
             match result {
                 Ok(row) => rows.push(row),
@@ -414,8 +429,8 @@ impl StatArgs {
     override_usage = "mdfwob bars [CONFIG.toml] [PATHS_OR_SYMBOLS...] [INTERVAL] [START..END] [FORMAT] [OPTIONS]"
 )]
 #[command(after_help = "Tokens (case-sensitive, any order):
-  paths/symbols: FILE.fwob, a DIR, or a bare SYMBOL (resolved under output_dir)
-  interval: e.g. 30s, 5m, 1h, 1d, 1w, 1mo, 1y (default 1d)
+  paths/symbols: a tick or bar FILE.fwob, a DIR, or a bare SYMBOL (resolved under output_dir)
+  interval: e.g. 30s, 5m, 1h, 1d, 1w, 1mo, 1y (default 1d; bar files re-resample to it, e.g. 1s->1m)
   formats: table (default), csv, md, jsonl, raw, hex, fwob
   session: rth (keep only regular-trading-hours ticks)
   fill: forward-fill empty intervals within a session
@@ -476,12 +491,12 @@ impl BarsArgs {
             session: use_rth.then(|| session.clone()),
         };
 
-        // Group input files by the symbol they report, preserving discovery order so a symbol's
-        // files feed one resampler as a single ascending stream. Only the header of each file is
-        // read here; the heavy tick scan happens during streaming.
+        // Group input files (tick or bar) by the symbol they report, preserving discovery order so
+        // a symbol's files feed one resampler as a single ascending stream. Only the header of each
+        // file is read here; the heavy scan happens during streaming.
         let mut by_symbol: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
         for path in &files {
-            match tick_symbol(path) {
+            match file_symbol(path) {
                 Ok(symbol) => by_symbol.entry(symbol).or_default().push(path.clone()),
                 Err(error) => {
                     tracing::error!(path = %path.display(), error = %format!("{error:#}"), "failed to read")
@@ -546,7 +561,7 @@ impl BarsArgs {
 )]
 #[command(after_help = concat!("Tokens (case-sensitive, any order):
   paths/symbols: a tick or bar FILE.fwob, a DIR, or a bare SYMBOL (resolved under output_dir)
-  interval: e.g. 30s, 5m, 1h, 1d, 1w, 1mo, 1y (default 1d; resamples tick files, ignored for bars)
+  interval: e.g. 30s, 5m, 1h, 1d, 1w, 1mo, 1y (default 1d; tick files resample to it, bar files re-resample to it)
   indicator specs: sma:N ema:N dema:N (on price); vsma:N vema:N vdema:N (on volume); rsi:N ret:log ret:simple vol:N (own panel)
   volume: add a volume panel below the candles (same as --volume; implied by vsma/vema/vdema)
   session: rth (keep only regular-trading-hours ticks)
@@ -636,42 +651,32 @@ impl PlotArgs {
         let files = resolve_files(&paths, &acfg)?;
         let filter = use_rth.then(|| session.clone());
 
-        // Accept both tick files (resampled with the interval) and pre-aggregated bar files (read
-        // directly), exactly like `calc`. Group the resulting bars by symbol.
+        // Accept both tick files and pre-aggregated bar files: both stream through the resampler at
+        // the requested interval, so a bar file honors the interval (e.g. plotting a 1s bar file at
+        // 1m aggregates it into 1m candles instead of drawing degenerate one-second dots). Group the
+        // resulting bars by symbol.
+        let query = TickQuery {
+            start,
+            end,
+            session: filter.clone(),
+        };
         let mut groups: BTreeMap<String, Vec<Bar>> = BTreeMap::new();
         for path in &files {
             let result = (|| -> Result<(String, Vec<Bar>)> {
-                match input_kind(path)? {
-                    InputKind::Bar => {
-                        let (symbol, mut bars) = read_bars(path)?;
-                        // A bar file carries no ticks to filter, so honor the window here.
-                        bars.retain(|bar| {
-                            start.is_none_or(|s| bar.time >= s) && end.is_none_or(|e| bar.time <= e)
-                        });
-                        Ok((symbol, bars))
-                    }
-                    InputKind::Tick => {
-                        let symbol = tick_symbol(path)?;
-                        let query = TickQuery {
-                            start,
-                            end,
-                            session: filter.clone(),
-                        };
-                        let mut bars = Vec::new();
-                        stream_bars(
-                            std::slice::from_ref(path),
-                            interval,
-                            &clock,
-                            &query,
-                            fill,
-                            |bar| {
-                                bars.push(bar);
-                                Ok(())
-                            },
-                        )?;
-                        Ok((symbol, bars))
-                    }
-                }
+                let symbol = file_symbol(path)?;
+                let mut bars = Vec::new();
+                stream_bars(
+                    std::slice::from_ref(path),
+                    interval,
+                    &clock,
+                    &query,
+                    fill,
+                    |bar| {
+                        bars.push(bar);
+                        Ok(())
+                    },
+                )?;
+                Ok((symbol, bars))
             })();
             match result {
                 Ok((symbol, mut bars)) => groups.entry(symbol).or_default().append(&mut bars),
@@ -786,7 +791,12 @@ fn write_chart_file(canvas: &Canvas, path: &Path) -> Result<()> {
 
 /// Streams a symbol's bars to `sink` as each bucket closes, feeding all of `paths` through one
 /// resampler (so multiple files of the same symbol form a single ascending stream) and applying
-/// forward-fill when requested. Ticks are read in bulk chunks and never fully materialized.
+/// forward-fill when requested.
+///
+/// Accepts both tick files (resampled from ticks) and pre-aggregated bar files (re-resampled from
+/// bars to the requested `interval`, e.g. 1s→1m), so every downstream command honors the interval
+/// regardless of input format. A symbol's files must all be the same kind. Ticks are read in bulk
+/// chunks and never fully materialized; bar files honor the `query` window by bar time.
 fn stream_bars(
     paths: &[PathBuf],
     interval: Interval,
@@ -795,15 +805,51 @@ fn stream_bars(
     fill: bool,
     sink: impl FnMut(Bar) -> Result<()>,
 ) -> Result<()> {
-    let mut filler = ForwardFiller::new(interval, clock.clone(), fill, sink);
-    let mut resampler = Resampler::new(interval, clock.clone());
+    let mut kind: Option<InputKind> = None;
     for path in paths {
-        let (mut reader, _) = open_tick_reader(path)?;
-        stream_ticks(&mut reader, query, |tick| {
-            resampler.push(&tick, &mut |bar| filler.push(bar))
-        })?;
+        let this = input_kind(path)?;
+        match kind {
+            Some(existing) if existing != this => {
+                bail!(
+                    "cannot mix tick and bar files for one symbol ({})",
+                    path.display()
+                )
+            }
+            _ => kind = Some(this),
+        }
     }
-    resampler.finish(&mut |bar| filler.push(bar))
+
+    let mut filler = ForwardFiller::new(interval, clock.clone(), fill, sink);
+    match kind {
+        Some(InputKind::Bar) => {
+            let mut resampler = BarResampler::new(interval, clock.clone());
+            for path in paths {
+                let (_, bars) = read_bars(path)?;
+                for bar in &bars {
+                    let keep = query.start.is_none_or(|s| bar.time >= s)
+                        && query.end.is_none_or(|e| bar.time <= e)
+                        && query
+                            .session
+                            .as_ref()
+                            .is_none_or(|session| session.contains(bar.time));
+                    if keep {
+                        resampler.push(bar, &mut |bar| filler.push(bar))?;
+                    }
+                }
+            }
+            resampler.finish(&mut |bar| filler.push(bar))
+        }
+        _ => {
+            let mut resampler = Resampler::new(interval, clock.clone());
+            for path in paths {
+                let (mut reader, _) = open_tick_reader(path)?;
+                stream_ticks(&mut reader, query, |tick| {
+                    resampler.push(&tick, &mut |bar| filler.push(bar))
+                })?;
+            }
+            resampler.finish(&mut |bar| filler.push(bar))
+        }
+    }
 }
 
 /// Warns when a sub-day interval does not evenly divide the active trading session (RTH or
@@ -842,9 +888,9 @@ fn fmt_session_len(seconds: u32) -> String {
     override_usage = "mdfwob calc [CONFIG.toml] [PATHS_OR_SYMBOLS...] [INTERVAL] SPEC... [START..END] [FORMAT] [OPTIONS]"
 )]
 #[command(after_help = concat!("Tokens (case-sensitive, any order):
-  paths/symbols: FILE.fwob, a DIR, or a bare SYMBOL (resolved under output_dir)
+  paths/symbols: a tick or bar FILE.fwob, a DIR, or a bare SYMBOL (resolved under output_dir)
   indicator specs: sma:N ema:N dema:N vsma:N vema:N vdema:N rsi:N ret:log ret:simple vol:N
-  interval: e.g. 5m, 1h, 1d (resamples a tick file; default 1d; ignored for bar files)
+  interval: e.g. 5m, 1h, 1d (tick files resample to it; bar files re-resample to it, or omit to keep native)
   formats: table (default), csv, md, jsonl, raw, hex, fwob
   session: rth (keep only regular-trading-hours ticks)
   fill: forward-fill empty intervals within a session
@@ -937,18 +983,50 @@ impl CalcArgs {
         let mut groups: BTreeMap<String, Vec<Bar>> = BTreeMap::new();
         for path in &files {
             let result = (|| -> Result<(String, Vec<Bar>)> {
+                let query = TickQuery {
+                    start,
+                    end,
+                    session: filter.clone(),
+                };
                 match input_kind(path)? {
-                    InputKind::Bar => read_bars(path),
+                    // A bar file with an interval token is re-resampled to it (e.g. 1s→1m); without
+                    // one it is used at its native resolution. Either way the time-range/session
+                    // window is honored.
+                    InputKind::Bar => {
+                        let symbol = file_symbol(path)?;
+                        let mut bars = Vec::new();
+                        if let Some(interval) = interval {
+                            stream_bars(
+                                std::slice::from_ref(path),
+                                interval,
+                                &clock,
+                                &query,
+                                fill,
+                                |bar| {
+                                    bars.push(bar);
+                                    Ok(())
+                                },
+                            )?;
+                        } else {
+                            let (_, all) = read_bars(path)?;
+                            for bar in all {
+                                let keep = start.is_none_or(|s| bar.time >= s)
+                                    && end.is_none_or(|e| bar.time <= e)
+                                    && filter
+                                        .as_ref()
+                                        .is_none_or(|session| session.contains(bar.time));
+                                if keep {
+                                    bars.push(bar);
+                                }
+                            }
+                        }
+                        Ok((symbol, bars))
+                    }
                     InputKind::Tick => {
                         let interval = interval.context(
                             "an interval token is required to resample a tick file (e.g. 5m, 1h, 1d)",
                         )?;
                         let symbol = tick_symbol(path)?;
-                        let query = TickQuery {
-                            start,
-                            end,
-                            session: filter.clone(),
-                        };
                         let mut bars = Vec::new();
                         stream_bars(
                             std::slice::from_ref(path),

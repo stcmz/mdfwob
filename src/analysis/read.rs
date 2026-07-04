@@ -89,6 +89,14 @@ pub fn tick_symbol(path: &Path) -> Result<String> {
     Ok(symbol)
 }
 
+/// Resolves the symbol any FWOB file reports (header title, else file stem), for either a tick or
+/// bar file. Cheap: it only reads the header, not the frames.
+pub fn file_symbol(path: &Path) -> Result<String> {
+    let reader =
+        Reader::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    Ok(symbol_of(path, reader.title()))
+}
+
 /// Reads ticks from a file, applying the time-range and session filters.
 /// Returns the resolved symbol and the (ascending) ticks.
 pub fn read_ticks(path: &Path, query: &TickQuery) -> Result<(String, Vec<Tick>)> {

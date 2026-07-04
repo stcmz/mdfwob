@@ -30,7 +30,6 @@ pub struct AnalysisConfig {
     pub rth: SessionSpec,
     /// Extended-hours session window.
     pub extended: SessionSpec,
-    pub stat: StatDefaults,
     pub bars: BarsDefaults,
     pub calc: CalcDefaults,
 }
@@ -68,19 +67,6 @@ impl Default for SessionSpec {
             tz: DEFAULT_TZ.to_owned(),
             hours: String::new(),
         }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct StatDefaults {
-    /// Spacing (seconds) above which an intra-day tick gap is counted.
-    pub max_gap: u32,
-}
-
-impl Default for StatDefaults {
-    fn default() -> Self {
-        Self { max_gap: 60 }
     }
 }
 
@@ -140,7 +126,6 @@ mod tests {
         let config = AnalysisConfig::default();
         assert!(config.session(true).is_ok());
         assert!(config.session(false).is_ok());
-        assert_eq!(config.stat.max_gap, 60);
         assert_eq!(config.calc.method, ReturnMethod::Log);
         assert_eq!(config.calc.periods_per_year, 252.0);
     }

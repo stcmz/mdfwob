@@ -168,6 +168,16 @@ fn floor_years(date: civil::Date, n: u32) -> Option<civil::Date> {
     civil::Date::new(i16::try_from(bucket).ok()?, 1, 1).ok()
 }
 
+/// The price mass (`vwap * volume`, i.e. the sum of `price * size` over the bar's ticks) a bar
+/// contributes to a re-resampled bucket's VWAP. Zero-volume/empty bars carry no mass.
+fn bar_weighted(bar: &Bar) -> f64 {
+    if bar.vwap.is_finite() {
+        bar.vwap * bar.volume as f64
+    } else {
+        0.0
+    }
+}
+
 struct Accumulator {
     time: u32,
     open: f64,
@@ -200,6 +210,32 @@ impl Accumulator {
         self.volume += i64::from(tick.size);
         self.weighted += tick.price * f64::from(tick.size);
         self.trades += 1;
+    }
+
+    /// Opens a bucket from an existing bar (used when re-resampling a bar file to a coarser or
+    /// equal interval). `time` is the target bucket start, not the source bar's time.
+    fn from_bar(time: u32, bar: &Bar) -> Self {
+        Self {
+            time,
+            open: bar.open,
+            high: bar.high,
+            low: bar.low,
+            close: bar.close,
+            volume: bar.volume,
+            weighted: bar_weighted(bar),
+            trades: bar.trades,
+        }
+    }
+
+    /// Folds another source bar into the open bucket. Source bars are ascending, so `close` is the
+    /// latest bar's close; the VWAP is rebuilt from each bar's `vwap * volume` price mass.
+    fn update_bar(&mut self, bar: &Bar) {
+        self.high = self.high.max(bar.high);
+        self.low = self.low.min(bar.low);
+        self.close = bar.close;
+        self.volume += bar.volume;
+        self.weighted += bar_weighted(bar);
+        self.trades += bar.trades;
     }
 
     fn finish(self) -> Bar {
@@ -260,6 +296,57 @@ impl Resampler {
                     .advance(self.interval, start)
                     .max(start.saturating_add(1));
                 self.current = Some(Accumulator::new(start, tick));
+            }
+        }
+        Ok(())
+    }
+
+    /// Emits the final open bucket (if any).
+    pub fn finish(mut self, emit: &mut impl FnMut(Bar) -> Result<()>) -> Result<()> {
+        if let Some(acc) = self.current.take() {
+            emit(acc.finish())?;
+        }
+        Ok(())
+    }
+}
+
+/// Incremental bar → bar resampler: re-buckets an ascending stream of source bars into a coarser
+/// (or equal) `interval`, aggregating OHLCV the same way [`Resampler`] aggregates ticks. Feeding a
+/// finer interval than the source simply re-times each bar into its own bucket (no sub-division is
+/// possible). Mirrors [`Resampler`]: emit fires as each bucket closes; [`BarResampler::finish`]
+/// flushes the final open bucket.
+pub struct BarResampler {
+    interval: Interval,
+    clock: BarClock,
+    current: Option<Accumulator>,
+    bucket_end: u32,
+}
+
+impl BarResampler {
+    pub fn new(interval: Interval, clock: BarClock) -> Self {
+        Self {
+            interval,
+            clock,
+            current: None,
+            bucket_end: 0,
+        }
+    }
+
+    /// Folds `bar` into the open target bucket, emitting the just-completed bar when `bar` opens a
+    /// new bucket. Source bars must be ascending by time.
+    pub fn push(&mut self, bar: &Bar, emit: &mut impl FnMut(Bar) -> Result<()>) -> Result<()> {
+        match &mut self.current {
+            Some(acc) if bar.time < self.bucket_end => acc.update_bar(bar),
+            _ => {
+                if let Some(acc) = self.current.take() {
+                    emit(acc.finish())?;
+                }
+                let start = self.clock.bucket_start(self.interval, bar.time);
+                self.bucket_end = self
+                    .clock
+                    .advance(self.interval, start)
+                    .max(start.saturating_add(1));
+                self.current = Some(Accumulator::from_bar(start, bar));
             }
         }
         Ok(())
@@ -381,6 +468,73 @@ mod tests {
         assert_eq!(first.trades, 3);
         // vwap = (10*100 + 12*50 + 11*25) / 175
         assert!((first.vwap - (1000.0 + 600.0 + 275.0) / 175.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn bar_resampler_aggregates_bars_to_coarser_interval() {
+        let interval = Interval::parse("1m").unwrap().unwrap();
+        let input = vec![
+            Bar {
+                time: 0,
+                open: 10.0,
+                high: 11.0,
+                low: 9.0,
+                close: 10.5,
+                volume: 100,
+                vwap: 10.2,
+                trades: 5,
+            },
+            Bar {
+                time: 30,
+                open: 10.5,
+                high: 12.0,
+                low: 10.0,
+                close: 11.5,
+                volume: 200,
+                vwap: 11.0,
+                trades: 8,
+            },
+            Bar {
+                time: 90,
+                open: 11.5,
+                high: 11.6,
+                low: 11.0,
+                close: 11.2,
+                volume: 50,
+                vwap: 11.3,
+                trades: 2,
+            },
+        ];
+        let mut out = Vec::new();
+        {
+            let mut r = BarResampler::new(interval, BarClock::Utc);
+            for bar in &input {
+                r.push(bar, &mut |b| {
+                    out.push(b);
+                    Ok(())
+                })
+                .unwrap();
+            }
+            r.finish(&mut |b| {
+                out.push(b);
+                Ok(())
+            })
+            .unwrap();
+        }
+        // Bucket [0,60) merges the first two bars; bucket [60,120) holds the third.
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].time, 0);
+        assert_eq!(out[0].open, 10.0); // first bar's open
+        assert_eq!(out[0].high, 12.0); // max high
+        assert_eq!(out[0].low, 9.0); // min low
+        assert_eq!(out[0].close, 11.5); // last bar's close
+        assert_eq!(out[0].volume, 300);
+        assert_eq!(out[0].trades, 13);
+        // vwap rebuilt from price mass: (10.2*100 + 11.0*200) / 300.
+        assert!((out[0].vwap - (10.2 * 100.0 + 11.0 * 200.0) / 300.0).abs() < 1e-9);
+        assert_eq!(out[1].time, 60);
+        assert_eq!(out[1].trades, 2);
+        assert!((out[1].vwap - 11.3).abs() < 1e-9);
     }
 
     #[test]

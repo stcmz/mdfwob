@@ -55,9 +55,6 @@ tz = "America/New_York"
 hours = "04:00-20:00"
 
 # Per-command defaults. CLI tokens/flags override these.
-[analysis.stat]
-max_gap = 60 # Intra-day spacing (seconds) above which a gap is counted.
-
 [analysis.bars]
 interval = "5m" # Default bar interval when no interval token is given.
 fill = false # Forward-fill empty intervals with flat bars.

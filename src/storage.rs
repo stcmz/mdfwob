@@ -13,7 +13,7 @@ use tracing::warn;
 
 use crate::{
     fwob_options::{FwobOptions, TargetFormat},
-    tick::{ShortTick, short_tick_schema},
+    tick::{ShortTick, tick_schema},
 };
 
 pub struct TickStore {
@@ -156,14 +156,14 @@ impl TickStore {
             match self.options.format {
                 TargetFormat::V1 => Writer::create_v1(
                     &self.path,
-                    short_tick_schema(),
+                    tick_schema(),
                     fwob_v1::WriterOptions::new(&self.title),
                     &[],
                 )
                 .with_context(|| format!("failed to create v1 {}", self.path.display())),
                 TargetFormat::V2 => Writer::create_v2(
                     &self.path,
-                    short_tick_schema(),
+                    tick_schema(),
                     self.options.v2_writer_options(&self.title)?,
                 )
                 .with_context(|| format!("failed to create v2 {}", self.path.display())),
@@ -581,9 +581,9 @@ mod tests {
                 .unwrap();
 
             let reader = Reader::open(store.path()).unwrap();
-            assert_eq!(reader.schema().fields[0].name, "Time");
+            assert_eq!(reader.schema().fields[0].name, "time");
             assert_eq!(reader.schema().fields[0].semantic, time_expected);
-            assert_eq!(reader.schema().fields[1].name, "Price");
+            assert_eq!(reader.schema().fields[1].name, "price");
             assert_eq!(reader.schema().fields[1].semantic, price_expected);
             fs::remove_dir_all(dir).unwrap();
         }

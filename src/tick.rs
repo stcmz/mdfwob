@@ -33,23 +33,23 @@ impl ShortTick {
     }
 }
 
-pub fn short_tick_schema() -> Schema {
+pub fn tick_schema() -> Schema {
     Schema::new(
-        "ShortTick",
+        "Tick",
         vec![
-            // Time is an absolute UTC epoch second (see downloader::provider_tick_to_short_tick).
+            // time is an absolute UTC epoch second (see downloader::provider_tick_to_short_tick).
             // V2 persists this semantic; V1 accepts but does not store it (reads back as None).
-            Field::new("Time", FieldType::UnsignedInteger, 4, 0)
+            Field::new("time", FieldType::UnsignedInteger, 4, 0)
                 .with_semantic(FieldSemantic::UnixTimestamp(TimestampUnit::Seconds)),
-            // Price is stored as the real price * PRICE_SCALE (10,000), i.e. 4 decimal places.
-            // V2 persists this semantic so `fwob dump` shows the real price; V1 reads it back as None.
-            Field::new("Price", FieldType::UnsignedInteger, 4, 4)
+            // price is stored as the real price * PRICE_SCALE (10,000), i.e. 4 decimal places.
+            // V2 persists this semantic so `fwob cat` shows the real price; V1 reads it back as None.
+            Field::new("price", FieldType::UnsignedInteger, 4, 4)
                 .with_semantic(FieldSemantic::FixedPoint(4)),
-            Field::new("Size", FieldType::SignedInteger, 4, 8),
+            Field::new("size", FieldType::SignedInteger, 4, 8),
         ],
         0,
     )
-    .expect("static ShortTick schema is valid")
+    .expect("static Tick schema is valid")
 }
 
 #[cfg(test)]

@@ -11,10 +11,10 @@ use fwob_v2::WriterOptions;
 use mdfwob::analysis::config::ReturnMethod;
 use mdfwob::analysis::output::{AnalysisFormat, BarSeries, write_bars};
 use mdfwob::analysis::{
-    BarClock, Calc, Interval, Session, Sma, TickQuery, compute_stat, read_bars, read_ticks,
-    resample, summarize,
+    BarClock, Calc, Interval, Sma, TickQuery, compute_stat, read_bars, read_ticks, resample,
+    summarize,
 };
-use mdfwob::tick::{ShortTick, short_tick_schema};
+use mdfwob::tick::{ShortTick, tick_schema};
 
 fn temp_dir(tag: &str) -> PathBuf {
     let nonce = SystemTime::now()
@@ -29,7 +29,7 @@ fn temp_dir(tag: &str) -> PathBuf {
 /// Writes an `AAPL.fwob` tick file: one tick per minute, ascending prices.
 fn write_tick_file(dir: &Path) -> PathBuf {
     let path = dir.join("AAPL.fwob");
-    let mut writer = Writer::create_v2(&path, short_tick_schema(), WriterOptions::new("AAPL"))
+    let mut writer = Writer::create_v2(&path, tick_schema(), WriterOptions::new("AAPL"))
         .expect("create tick file");
     // 2024-01-02 14:30:00Z, then every 60s. 20 ticks => 14:30..14:49.
     let base = 1_704_205_800u32;
@@ -60,11 +60,10 @@ fn library_api_reads_resamples_and_computes() {
     assert_eq!(bars.len(), 4);
     assert_eq!(bars[0].trades, 5);
 
-    let session = Session::new("America/New_York", "00:00-24:00").unwrap();
-    let row = compute_stat(symbol, "fwob-v2".into(), &ticks, 60, &session);
-    assert_eq!(row.ticks, 20);
+    let row = compute_stat(symbol, "fwob-v2".into(), &ticks);
+    assert_eq!(row.trades, 20);
     assert_eq!(row.volume, 2_000);
-    assert_eq!(row.gaps, 0);
+    assert_eq!(row.kind, "tick");
 
     // calc: built-in + custom function over the bars.
     let out = Calc::new(&bars)
@@ -149,7 +148,7 @@ fn cli_stat_bars_calc_run() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.starts_with("Time,Open,High,Low,Close,Volume,VWAP,Trades"),
+        stdout.starts_with("time,open,high,low,close,volume,vwap,trades"),
         "{stdout}"
     );
     // First 5m bar opens at 185.0 -> stored 1_850_000; time is the raw epoch second.
@@ -162,7 +161,7 @@ fn cli_stat_bars_calc_run() {
         .unwrap();
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("Time"), "{stdout}");
+    assert!(stdout.contains("time"), "{stdout}");
     assert!(stdout.contains("2024-01-02T14:30:00Z"), "{stdout}");
 
     // calc 5m sma:2 rsi:3 (table) with summary

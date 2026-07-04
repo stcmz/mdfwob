@@ -341,11 +341,11 @@ fn summary_line(symbol: &str, summary: &CalcSummary, include_symbol: bool) -> St
 
 // ---- stat (bespoke summary renderer) ------------------------------------------
 
-const STAT_HEADERS: [&str; 11] = [
-    "symbol", "format", "ticks", "first", "last", "min", "max", "mean", "vwap", "volume", "gaps",
+const STAT_HEADERS: [&str; 10] = [
+    "symbol", "kind", "format", "trades", "first", "last", "min", "max", "vwap", "volume",
 ];
-const STAT_ALIGNS: [bool; 11] = [
-    false, false, true, false, false, true, true, true, true, true, true,
+const STAT_ALIGNS: [bool; 10] = [
+    false, false, false, true, false, false, true, true, true, true,
 ];
 
 pub fn write_stat(rows: &[StatRow], format: FrameFormat, out: &mut impl Write) -> Result<()> {
@@ -354,16 +354,15 @@ pub fn write_stat(rows: &[StatRow], format: FrameFormat, out: &mut impl Write) -
             for row in rows {
                 let value = serde_json::json!({
                     "symbol": row.symbol,
+                    "kind": row.kind,
                     "format": row.format,
-                    "ticks": row.ticks,
+                    "trades": row.trades,
                     "first": row.first,
                     "last": row.last,
                     "min": finite(row.min),
                     "max": finite(row.max),
-                    "mean": finite(row.mean),
                     "vwap": finite(row.vwap),
                     "volume": row.volume,
-                    "gaps": row.gaps,
                 });
                 serde_json::to_writer(&mut *out, &value)?;
                 writeln!(out)?;
@@ -394,16 +393,15 @@ pub fn write_stat(rows: &[StatRow], format: FrameFormat, out: &mut impl Write) -
 fn stat_row_cells(row: &StatRow, human: bool) -> Vec<String> {
     vec![
         row.symbol.clone(),
+        row.kind.to_owned(),
         row.format.clone(),
-        comma_u64(row.ticks),
+        comma_u64(row.trades),
         opt_time(row.first, human),
         opt_time(row.last, human),
         fmt_price(row.min),
         fmt_price(row.max),
-        fmt_price(row.mean),
         fmt_price(row.vwap),
         comma_i64(row.volume),
-        comma_u64(row.gaps),
     ]
 }
 

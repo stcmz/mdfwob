@@ -6,7 +6,7 @@ use fwob_core::{Field, FieldSemantic, FieldType, Schema, TimestampUnit};
 use crate::analysis::model::Bar;
 use crate::tick::PRICE_SCALE;
 
-pub const TICK_FRAME_TYPE: &str = "ShortTick";
+pub const TICK_FRAME_TYPE: &str = "Tick";
 pub const BAR_FRAME_TYPE: &str = "Bar";
 pub const CALC_FRAME_TYPE: &str = "Calc";
 
@@ -63,23 +63,23 @@ pub fn bar_schema() -> Schema {
     Schema::new(
         BAR_FRAME_TYPE,
         vec![
-            Field::new("Time", FieldType::UnsignedInteger, 4, 0)
+            Field::new("time", FieldType::UnsignedInteger, 4, 0)
                 .with_semantic(FieldSemantic::UnixTimestamp(TimestampUnit::Seconds)),
-            Field::new("Open", FieldType::UnsignedInteger, 4, 4)
+            Field::new("open", FieldType::UnsignedInteger, 4, 4)
                 .with_semantic(FieldSemantic::FixedPoint(4)),
-            Field::new("High", FieldType::UnsignedInteger, 4, 8)
+            Field::new("high", FieldType::UnsignedInteger, 4, 8)
                 .with_semantic(FieldSemantic::FixedPoint(4)),
-            Field::new("Low", FieldType::UnsignedInteger, 4, 12)
+            Field::new("low", FieldType::UnsignedInteger, 4, 12)
                 .with_semantic(FieldSemantic::FixedPoint(4)),
-            Field::new("Close", FieldType::UnsignedInteger, 4, 16)
+            Field::new("close", FieldType::UnsignedInteger, 4, 16)
                 .with_semantic(FieldSemantic::FixedPoint(4)),
             // FixedPoint(0) is display-only: it comma-groups the integer (and never nulls,
-            // since Volume is never i64::MIN).
-            Field::new("Volume", FieldType::SignedInteger, 8, 20)
+            // since volume is never i64::MIN).
+            Field::new("volume", FieldType::SignedInteger, 8, 20)
                 .with_semantic(FieldSemantic::FixedPoint(0)),
-            Field::new("VWAP", FieldType::UnsignedInteger, 4, 28)
+            Field::new("vwap", FieldType::UnsignedInteger, 4, 28)
                 .with_semantic(FieldSemantic::FixedPoint(4)),
-            Field::new("Trades", FieldType::UnsignedInteger, 8, 32)
+            Field::new("trades", FieldType::UnsignedInteger, 8, 32)
                 .with_semantic(FieldSemantic::FixedPoint(0)),
         ],
         0,
@@ -120,9 +120,9 @@ pub fn decode_bar(bytes: &[u8]) -> Result<Bar> {
 pub fn calc_schema(names: &[String], decimals: &[u8]) -> Result<Schema> {
     assert_eq!(names.len(), decimals.len(), "names and decimals must align");
     let mut fields = vec![
-        Field::new("Time", FieldType::UnsignedInteger, 4, 0)
+        Field::new("time", FieldType::UnsignedInteger, 4, 0)
             .with_semantic(FieldSemantic::UnixTimestamp(TimestampUnit::Seconds)),
-        Field::new("Close", FieldType::UnsignedInteger, 4, 4)
+        Field::new("close", FieldType::UnsignedInteger, 4, 4)
             .with_semantic(FieldSemantic::FixedPoint(4)),
     ];
     let mut offset = 8u32;
@@ -207,7 +207,7 @@ mod tests {
         let display = with_symbol_column(&bar_schema());
         assert_eq!(display.fields[0].name, "Symbol");
         assert_eq!(display.fields[0].offset, 0);
-        assert_eq!(display.fields[1].name, "Time");
+        assert_eq!(display.fields[1].name, "time");
         assert_eq!(display.fields[1].offset, 1);
         assert_eq!(display.frame_len, BAR_FRAME_LEN + 1);
     }
