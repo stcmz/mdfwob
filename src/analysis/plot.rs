@@ -11,7 +11,7 @@
 //! sizes scale with the canvas so a 4K image looks proportional to a 1080p one.
 
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{BufReader, BufWriter};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -1588,13 +1588,13 @@ mod tests {
         };
         render(&sample(), &opts).write_png(&path).unwrap();
 
-        let decoder = png::Decoder::new(File::open(&path).unwrap());
+        let decoder = png::Decoder::new(BufReader::new(File::open(&path).unwrap()));
         let mut reader = decoder.read_info().unwrap();
         let info = reader.info();
         assert_eq!(info.width, 200);
         assert_eq!(info.height, 120);
         assert_eq!(info.color_type, png::ColorType::Indexed);
-        let mut buf = vec![0; reader.output_buffer_size()];
+        let mut buf = vec![0; reader.output_buffer_size().unwrap()];
         reader.next_frame(&mut buf).unwrap();
         std::fs::remove_file(&path).ok();
     }
