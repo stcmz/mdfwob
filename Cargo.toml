@@ -27,7 +27,7 @@ fwob-v1 = "1.13"
 fwob-v2 = "1.13"
 ibapi = { version = "3.1.0", default-features = false, features = ["sync"] }
 jiff = "0.2"
-png = "0.17"
+png = "0.18"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # Cap below time 0.3.50, which fails to compile (unresolved `time_macros::timestamp`).
