@@ -20,7 +20,7 @@ use crate::{
         plot::{Canvas, PlotOptions, Series, render},
         read::{
             InputKind, TickQuery, discover_inputs, file_symbol, input_kind, open_tick_reader,
-            read_bars, stream_ticks, tick_symbol,
+            stream_bars_file, stream_ticks, tick_symbol,
         },
         resample::{BarClock, BarResampler, ForwardFiller, Resampler},
         schema::{bar_schema, with_symbol_column},
@@ -388,18 +388,10 @@ impl StatArgs {
                         Ok(acc.finish(symbol, "tick", format_label))
                     }
                     InputKind::Bar => {
-                        let (symbol, bars) = read_bars(path)?;
-                        for bar in &bars {
-                            let keep = query.start.is_none_or(|s| bar.time >= s)
-                                && query.end.is_none_or(|e| bar.time <= e)
-                                && query
-                                    .session
-                                    .as_ref()
-                                    .is_none_or(|session| session.contains(bar.time));
-                            if keep {
-                                acc.push_bar(bar);
-                            }
-                        }
+                        let symbol = stream_bars_file(path, &query, |bar| {
+                            acc.push_bar(&bar);
+                            Ok(())
+                        })?;
                         Ok(acc.finish(symbol, "bar", format_label))
                     }
                 }
@@ -824,18 +816,11 @@ fn stream_bars(
         Some(InputKind::Bar) => {
             let mut resampler = BarResampler::new(interval, clock.clone());
             for path in paths {
-                let (_, bars) = read_bars(path)?;
-                for bar in &bars {
-                    let keep = query.start.is_none_or(|s| bar.time >= s)
-                        && query.end.is_none_or(|e| bar.time <= e)
-                        && query
-                            .session
-                            .as_ref()
-                            .is_none_or(|session| session.contains(bar.time));
-                    if keep {
-                        resampler.push(bar, &mut |bar| filler.push(bar))?;
-                    }
-                }
+                // Seek to the window instead of reading the whole bar file, so a narrow time range
+                // is proportionally fast.
+                stream_bars_file(path, query, |bar| {
+                    resampler.push(&bar, &mut |bar| filler.push(bar))
+                })?;
             }
             resampler.finish(&mut |bar| filler.push(bar))
         }
@@ -1008,17 +993,12 @@ impl CalcArgs {
                                 },
                             )?;
                         } else {
-                            let (_, all) = read_bars(path)?;
-                            for bar in all {
-                                let keep = start.is_none_or(|s| bar.time >= s)
-                                    && end.is_none_or(|e| bar.time <= e)
-                                    && filter
-                                        .as_ref()
-                                        .is_none_or(|session| session.contains(bar.time));
-                                if keep {
-                                    bars.push(bar);
-                                }
-                            }
+                            // No interval token: keep native bars, but seek to the window instead
+                            // of scanning the whole file.
+                            stream_bars_file(path, &query, |bar| {
+                                bars.push(bar);
+                                Ok(())
+                            })?;
                         }
                         Ok((symbol, bars))
                     }

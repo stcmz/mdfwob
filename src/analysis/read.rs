@@ -7,7 +7,7 @@ use fwob::Reader;
 use fwob_core::Key;
 
 use crate::analysis::model::{Bar, Tick};
-use crate::analysis::schema::{BAR_FRAME_TYPE, TICK_FRAME_LEN, TICK_FRAME_TYPE, decode_bar};
+use crate::analysis::schema::{BAR_FRAME_TYPE, TICK_FRAME_TYPE, decode_bar};
 use crate::analysis::session::Session;
 use crate::config::normalize_symbol;
 use crate::tick::PRICE_SCALE;
@@ -27,7 +27,7 @@ pub struct TickQuery {
     pub session: Option<Session>,
 }
 
-/// Decodes a 12-byte `ShortTick` frame.
+/// Decodes a 12-byte tick frame into a [`Tick`] (scaled integer price → real `f64`).
 pub fn decode_tick(bytes: &[u8]) -> Tick {
     Tick {
         time: u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
@@ -53,10 +53,6 @@ pub fn detect_kind(reader: &Reader) -> Result<InputKind> {
     match schema.frame_type.as_str() {
         TICK_FRAME_TYPE => Ok(InputKind::Tick),
         BAR_FRAME_TYPE => Ok(InputKind::Bar),
-        other if schema.frame_len == TICK_FRAME_LEN => {
-            let _ = other;
-            Ok(InputKind::Tick)
-        }
         other => bail!(
             "unsupported frame type {other:?}; expected a tick ({TICK_FRAME_TYPE}) or bar ({BAR_FRAME_TYPE}) file"
         ),
@@ -191,6 +187,45 @@ pub fn read_bars(path: &Path) -> Result<(String, Vec<Bar>)> {
     Ok((symbol, bars))
 }
 
+/// Streams bars from a bar file within the query's time window, seeking to the key range so a
+/// narrow `--start`/`--end` reads only the relevant frames instead of the whole file, and applying
+/// the session filter per bar. Returns the resolved symbol. This is the bar-file counterpart to
+/// [`stream_ticks`]; use it (not [`read_bars`]) whenever a time window may apply.
+pub fn stream_bars_file(
+    path: &Path,
+    query: &TickQuery,
+    mut f: impl FnMut(Bar) -> Result<()>,
+) -> Result<String> {
+    let mut reader =
+        Reader::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    if detect_kind(&reader)? != InputKind::Bar {
+        bail!("{} is a tick file, not a bar file", path.display());
+    }
+    let symbol = symbol_of(path, reader.title());
+    let session = query.session.as_ref();
+    let Some((lo, hi)) = index_window(&mut reader, query.start, query.end)? else {
+        return Ok(symbol);
+    };
+    let frame_len = reader.schema().frame_len as usize;
+    let batch = (READ_CHUNK_BYTES / frame_len.max(1)).max(1);
+    let mut index = lo;
+    while index < hi {
+        let want = ((hi - index) as usize).min(batch);
+        let raw = reader.read_raw_frames_chunk(index, want)?;
+        if raw.is_empty() {
+            break;
+        }
+        for bytes in raw.chunks_exact(frame_len) {
+            let bar = decode_bar(bytes)?;
+            if session.is_none_or(|s| s.contains(bar.time)) {
+                f(bar)?;
+            }
+        }
+        index += (raw.len() / frame_len) as u64;
+    }
+    Ok(symbol)
+}
+
 /// Expands positional tokens into concrete `*.fwob` paths.
 ///
 /// Each token may be an existing file, an existing directory (its immediate
@@ -275,5 +310,60 @@ mod tests {
         assert_eq!(tick.time, 1_461_572_280);
         assert!((tick.price - 105.22).abs() < 1e-9);
         assert_eq!(tick.size, 500);
+    }
+
+    #[test]
+    fn stream_bars_file_yields_only_the_windowed_bars() {
+        use crate::analysis::schema::{bar_schema, encode_bar};
+        use fwob::Writer;
+        use fwob_v2::WriterOptions;
+
+        let dir = std::env::temp_dir().join(format!("mdfwob-swf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("AAPL.fwob");
+        let mut writer =
+            Writer::create_v2(&path, bar_schema(), WriterOptions::new("AAPL")).unwrap();
+        let mut buf = Vec::new();
+        for i in 1..=10u32 {
+            let bar = Bar {
+                time: i * 100,
+                open: 1.0,
+                high: 1.0,
+                low: 1.0,
+                close: 1.0,
+                volume: 1,
+                vwap: 1.0,
+                trades: 1,
+            };
+            encode_bar(&bar, &mut buf);
+        }
+        writer.append_presorted_frames(&buf).unwrap();
+        writer.finish().unwrap();
+
+        // Inclusive [300, 700] window seeks to five of the ten bars.
+        let query = TickQuery {
+            start: Some(300),
+            end: Some(700),
+            session: None,
+        };
+        let mut got = Vec::new();
+        let symbol = stream_bars_file(&path, &query, |bar| {
+            got.push(bar.time);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(symbol, "AAPL");
+        assert_eq!(got, vec![300, 400, 500, 600, 700]);
+
+        // No window streams every bar.
+        let mut all = Vec::new();
+        stream_bars_file(&path, &TickQuery::default(), |bar| {
+            all.push(bar.time);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(all.len(), 10);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

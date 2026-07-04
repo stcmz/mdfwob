@@ -26,8 +26,8 @@ pub use interval::Interval;
 pub use model::{Bar, Tick};
 pub use plot::{Canvas, PlotOptions, render};
 pub use read::{
-    TickQuery, discover_inputs, file_symbol, open_tick_reader, read_bars, read_ticks, stream_ticks,
-    tick_symbol,
+    TickQuery, discover_inputs, file_symbol, open_tick_reader, read_bars, read_ticks,
+    stream_bars_file, stream_ticks, tick_symbol,
 };
 pub use resample::{BarClock, ForwardFiller, Resampler, resample};
 pub use session::Session;

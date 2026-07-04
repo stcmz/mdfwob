@@ -20,7 +20,7 @@ use crate::{
     fwob_options::FwobOptions,
     providers::{DatabentoProvider, IbkrProvider, MarketDataProvider, RecoveryAction},
     storage::{TickStore, TickWriter},
-    tick::ShortTick,
+    tick::Tick,
 };
 
 const MAX_TICKS_PER_REQUEST: i32 = 1000;
@@ -514,7 +514,7 @@ impl<P: MarketDataProvider> SymbolDownloader<'_, P> {
 
             let mut frames = Vec::with_capacity(ticks.len());
             for tick in ticks {
-                frames.push(provider_tick_to_short_tick(tick, &contract.symbol)?);
+                frames.push(provider_tick_to_tick(tick, &contract.symbol)?);
             }
 
             let count = frames.len();
@@ -686,14 +686,14 @@ fn fmt_in_tz(instant: OffsetDateTime, tz: &TimeZone) -> String {
     }
 }
 
-fn provider_tick_to_short_tick(tick: ProviderTick, symbol: &str) -> Result<ShortTick> {
+fn provider_tick_to_tick(tick: ProviderTick, symbol: &str) -> Result<Tick> {
     // Unix seconds identify an absolute UTC instant. The source offset or
     // exchange timezone must never be encoded as local wall-clock time.
     let utc_seconds = tick.timestamp.unix_timestamp();
     if utc_seconds < 0 || utc_seconds > u32::MAX as i64 {
         bail!("tick timestamp is outside u32 range for {symbol}: {utc_seconds}");
     }
-    ShortTick::new(utc_seconds as u32, tick.price, tick.size)
+    Tick::new(utc_seconds as u32, tick.price, tick.size)
 }
 
 fn stock_contract(group: &StockContractConfig, symbol: &str) -> StockContract {
@@ -1561,7 +1561,7 @@ mod tests {
         let dir = temp_dir("mdfwob-resume");
         let store = TickStore::new(&dir, "MSFT", FwobOptions::default());
         store
-            .append_ticks(&[ShortTick::new(base.unix_timestamp() as u32, 100.0, 1).unwrap()])
+            .append_ticks(&[Tick::new(base.unix_timestamp() as u32, 100.0, 1).unwrap()])
             .unwrap();
 
         let provider = MockProvider {
@@ -2106,7 +2106,7 @@ mod tests {
         ];
 
         let stored = cases.map(|timestamp| {
-            provider_tick_to_short_tick(
+            provider_tick_to_tick(
                 ProviderTick {
                     timestamp,
                     price: 100.0,

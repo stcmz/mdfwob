@@ -1,7 +1,7 @@
 //! Rendering of analysis results.
 //!
 //! `bars` and `calc` render through fwob's canonical [`FrameFormatter`], so their stdout is
-//! identical to `fwob dump` of the corresponding `.fwob` (same time format, a-priori column
+//! identical to `fwob cat` of the corresponding `.fwob` (same time format, a-priori column
 //! widths, fixed-point, and null handling). `stat` is a per-file summary (not frames) and keeps
 //! a small bespoke renderer with tight, scan-based widths.
 

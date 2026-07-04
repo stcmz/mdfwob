@@ -5,22 +5,20 @@
 
 Standalone CLI for downloading historical market data into FWOB files.
 
-The default output schema matches the legacy `ShortTick` layout:
+The output tick schema is:
 
 ```text
-Time   u32  Unix seconds since the UTC epoch
-Price  u32  price * 10,000
-Size   i32  shares
+time   u32  Unix seconds since the UTC epoch
+price  u32  price * 10,000  (4 fixed decimals)
+size   i32  shares
 ```
 
-New v2 files tag display semantics so `fwob dump` is human-readable: `Time` as
-`unix-seconds` (shown as an RFC3339 datetime) and `Price` as `fixed-4` (shown
+v2 files tag display semantics so `fwob cat` is human-readable: `time` as
+`unix-seconds` (shown as an RFC3339 datetime) and `price` as `fixed-4` (shown
 divided by 10,000, e.g. `150.0000`). The stored integers are unchanged; the
-semantics only affect display. Files created before this version can be tagged
-in place with `fwob edit --set-semantic Price=fixed-4 SYMBOL.fwob` (v2 only; v1
-does not store field semantics).
+semantics only affect display.
 
-`Time` is always an absolute UTC epoch second. TWS login timezone, computer
+`time` is always an absolute UTC epoch second. TWS login timezone, computer
 timezone, exchange timezone, and daylight-saving transitions do not change the
 stored value. Date-time inputs must include an RFC3339 offset or `Z`; date-only
 inputs mean midnight UTC.
@@ -45,7 +43,7 @@ provider token.
 
 Existing files are auto-detected. A v1 file remains v1 when resumed even when
 the `v1` token is omitted. The format token controls creation of new files.
-When an existing v2 file is resumed without writer-tuning tokens, FWOB 1.6
+When an existing v2 file is resumed without writer-tuning tokens, FWOB
 inherits its codec and encoding. Supplying codec, encoding, packing, page-size,
 partial-page, or zstd-level options explicitly overrides the inherited write
 settings for newly appended pages.
@@ -168,7 +166,8 @@ mdfwob download SPCX --request-interval-ms 1000
 
 ## Analysis
 
-Three subcommands analyze the tick FWOB files mdfwob produces. They share the
+Four subcommands analyze the FWOB files mdfwob produces. They read both the tick
+files it downloads and the bar files `bars --format fwob` writes. They share the
 fwob-family positional-token style: paths/symbols, an interval token
 (`Ns`/`Nm`/`Nh`/`Nd`/`Nw`/`Nmo`/`Ny` for seconds/minutes/hours/days/weeks/
 months/years), an output-format token (`table` default, plus `csv`, `md`,
@@ -188,12 +187,17 @@ mdfwob bars AAPL.fwob 5m rth fill            # RTH bars, forward-fill gaps in-se
 mdfwob bars AAPL.fwob 1h 2026-01-01..2026-02-01  # range token (exchange tz, end exclusive)
 mdfwob calc AAPL.fwob 1d rth ret:log vol:20 sma:20 rsi:14 --summary
 mdfwob calc bars/AAPL.fwob sma:20            # a bar file needs no interval
+mdfwob plot AAPL.fwob 5m rsi:14 volume       # candlesticks to the console (Sixel)
+mdfwob plot AAPL.fwob 1d sma:50 -o chart.png # ...or write a PNG
 ```
 
-- **`stat`** prints one summary row per tick file: symbol, format, tick count,
-  time range, price min/max/mean, VWAP, signed volume, and intra-day gap count.
-- **`bars`** resamples ticks into OHLCV(+VWAP, trades) bars, streaming each row
-  to stdout as its bucket closes; with no interval token it defaults to `1d`.
+- **`stat`** prints one summary row per file (tick or bar): symbol, `kind`
+  (`tick`/`bar`), format, trade count, time range, price min/max, VWAP, and
+  signed volume. Every field is derivable from either format, so a tick file and
+  the bars it resamples into report the same stats.
+- **`bars`** resamples ticks — or re-resamples coarser bars (e.g. `1s`→`1m`) —
+  into OHLCV(+VWAP, trades) bars, streaming each row to stdout as its bucket
+  closes; with no interval token it defaults to `1d`.
   **Sub-day intervals (s/m/h) are anchored to the
   session open** in the exchange timezone, so e.g. RTH `1h` bars start 09:30,
   10:30, …; **day, week, month, and year intervals are calendar-aligned in the
@@ -205,13 +209,19 @@ mdfwob calc bars/AAPL.fwob sma:20            # a bar file needs no interval
   session (never across the overnight gap); `fwob` output writes one
   `<symbol>.fwob` per symbol into `--output`.
 - **`calc`** computes per-bar indicator columns from composable specs —
-  `sma:N`, `ema:N`, `rsi:N`, `ret:log`, `ret:simple`, `vol:N` — over a bar file,
-  or over a tick file plus an interval token (auto-resampled). Columns are stored
-  as 4-byte fixed-point integers at a per-indicator precision (price-level
-  indicators use 4 decimals, returns/volatility use 8); warm-up cells with no
-  value are shown as `-`. `--summary` appends whole-series mean return and
+  `sma:N`, `ema:N`, `dema:N`, `vsma:N`, `vema:N`, `vdema:N`, `rsi:N`, `ret:log`,
+  `ret:simple`, `vol:N` — over a bar file (optionally re-resampled to a coarser
+  interval), or over a tick file plus an interval token (auto-resampled). Columns
+  are stored as 4-byte fixed-point integers at a per-indicator precision
+  (price-level indicators use 4 decimals, returns/volatility use 8); warm-up cells
+  with no value are shown as `-`. `--summary` appends whole-series mean return and
   realized volatility (`--annualize` `--periods-per-year F`); `--method
   log|simple` selects the summary return type.
+- **`plot`** renders OHLC candlesticks — with the same indicator specs as `calc`
+  (price overlays, a volume panel via `volume`/`vsma`/`vema`/`vdema`, and stacked
+  panels for `rsi`/`ret`/`vol`) — as an inline Sixel image on the console, or a
+  `.png` (or raw `.six`/`.sixel`) file with `--output`. Tick and bar files are
+  both accepted and resampled to the requested interval.
 
 `--use-rth` keeps only regular-trading-hours ticks. Sessions are defined in an
 exchange timezone (DST-correct), defaulting to `09:30-16:00 America/New_York`
@@ -222,11 +232,10 @@ and `--tz NAME`. That timezone also anchors day/week/month/year bars even when
 `--start`/`--end` or a positional `START..END` token (either side optional, e.g.
 `2024-01-01..2026-01-01` or `..2026-01-01`); a bare date or date-time is read in
 the exchange timezone (add `Z` or a `±HH` offset for an absolute instant), and a
-bare end date includes the whole local day. Gap counting in `stat` only counts
-intra-day gaps, so the overnight/weekend boundary is never miscounted. `bars` and `calc`
-render through fwob's formatter, so their output matches `fwob dump` of the
+bare end date includes the whole local day. `bars` and `calc`
+render through fwob's formatter, so their output matches `fwob cat` of the
 equivalent `.fwob`: `table`/`md` show fixed-point values and a UTC RFC3339
-datetime (`Time`); `csv`/`jsonl`/`raw` carry the exact stored integers (prices
+datetime (`time`); `csv`/`jsonl`/`raw` carry the exact stored integers (prices
 ×10⁴, epoch seconds), with absent calc values empty/`null`. With more than one
 symbol the output gains a leading `Symbol` column.
 

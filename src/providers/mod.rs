@@ -21,8 +21,8 @@ pub trait MarketDataProvider: Sync {
     /// Returns trades in nondecreasing timestamp order, all at or after `start`.
     ///
     /// When a provider returns a partial result, it must include every trade through the final
-    /// returned UTC second. The downloader resumes at the following whole second because FWOB's
-    /// legacy `ShortTick` schema stores second-resolution timestamps.
+    /// returned UTC second. The downloader resumes at the following whole second because the tick
+    /// schema stores second-resolution timestamps.
     ///
     /// `cancel` lets a long/blocked request abort promptly so Ctrl+C is honored without waiting
     /// for the request to complete. A provider that observes cancellation should return an error

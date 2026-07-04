@@ -13,7 +13,7 @@ use tracing::warn;
 
 use crate::{
     fwob_options::{FwobOptions, TargetFormat},
-    tick::{ShortTick, tick_schema},
+    tick::{Tick, tick_schema},
 };
 
 pub struct TickStore {
@@ -128,7 +128,7 @@ impl TickStore {
     /// callers that write exactly one batch (and the unit tests). Multi-batch callers should use
     /// [`TickStore::writer`] to keep the writer open.
     #[allow(dead_code)]
-    pub fn append_ticks(&self, ticks: &[ShortTick]) -> Result<()> {
+    pub fn append_ticks(&self, ticks: &[Tick]) -> Result<()> {
         let mut writer = self.writer();
         writer.append_ticks(ticks)?;
         writer.finish()
@@ -190,7 +190,7 @@ pub struct TickWriter<'a> {
 }
 
 impl TickWriter<'_> {
-    pub fn append_ticks(&mut self, ticks: &[ShortTick]) -> Result<()> {
+    pub fn append_ticks(&mut self, ticks: &[Tick]) -> Result<()> {
         if ticks.is_empty() {
             return Ok(());
         }
@@ -293,7 +293,7 @@ mod tests {
         let dir = temp_dir("mdfwob-existing-v1");
         let v1_options = options_for(TargetFormat::V1);
         TickStore::new(&dir, "SPOT", v1_options)
-            .append_ticks(&[ShortTick::new(10, 1.23, 100).unwrap()])
+            .append_ticks(&[Tick::new(10, 1.23, 100).unwrap()])
             .unwrap();
 
         let default_options = FwobOptions {
@@ -302,7 +302,7 @@ mod tests {
         };
         let default_store = TickStore::new(&dir, "SPOT", default_options);
         default_store
-            .append_ticks(&[ShortTick::new(11, 1.24, 200).unwrap()])
+            .append_ticks(&[Tick::new(11, 1.24, 200).unwrap()])
             .unwrap();
         assert_eq!(default_store.last_timestamp().unwrap(), Some(11));
         assert_eq!(
@@ -327,7 +327,7 @@ mod tests {
         initial_store
             .append_ticks(
                 &(0..200)
-                    .map(|time| ShortTick::new(time, 1.23, 100).unwrap())
+                    .map(|time| Tick::new(time, 1.23, 100).unwrap())
                     .collect::<Vec<_>>(),
             )
             .unwrap();
@@ -336,7 +336,7 @@ mod tests {
         resumed_store
             .append_ticks(
                 &(200..400)
-                    .map(|time| ShortTick::new(time, 1.24, 100).unwrap())
+                    .map(|time| Tick::new(time, 1.24, 100).unwrap())
                     .collect::<Vec<_>>(),
             )
             .unwrap();
@@ -360,7 +360,7 @@ mod tests {
             let options = options_for(format);
             let store = TickStore::new(&dir, "AAPL", options);
             store
-                .append_ticks(&[ShortTick::new(10, 1.23, 100).unwrap()])
+                .append_ticks(&[Tick::new(10, 1.23, 100).unwrap()])
                 .unwrap();
             store.verify_existing().unwrap();
             fs::remove_dir_all(dir).unwrap();
@@ -373,7 +373,7 @@ mod tests {
         let options = options_for(TargetFormat::V1);
         let store = TickStore::new(&dir, "AAPL", options);
         store
-            .append_ticks(&[ShortTick::new(10, 1.23, 100).unwrap()])
+            .append_ticks(&[Tick::new(10, 1.23, 100).unwrap()])
             .unwrap();
         append_garbage(store.path());
 
@@ -388,7 +388,7 @@ mod tests {
         let dir = temp_dir("mdfwob-repair-v2");
         let store = TickStore::new(&dir, "AAPL", FwobOptions::default());
         store
-            .append_ticks(&[ShortTick::new(10, 1.23, 100).unwrap()])
+            .append_ticks(&[Tick::new(10, 1.23, 100).unwrap()])
             .unwrap();
         append_garbage(store.path());
 
@@ -403,13 +403,13 @@ mod tests {
         let dir = temp_dir("mdfwob-transactional-append");
         let store = TickStore::new(&dir, "AAPL", FwobOptions::default());
         store
-            .append_ticks(&[ShortTick::new(10, 1.23, 100).unwrap()])
+            .append_ticks(&[Tick::new(10, 1.23, 100).unwrap()])
             .unwrap();
 
         let error = store
             .append_ticks(&[
-                ShortTick::new(12, 1.25, 300).unwrap(),
-                ShortTick::new(11, 1.24, 200).unwrap(),
+                Tick::new(12, 1.25, 300).unwrap(),
+                Tick::new(11, 1.24, 200).unwrap(),
             ])
             .unwrap_err();
         assert!(error.to_string().contains("key"));
@@ -429,7 +429,7 @@ mod tests {
             ..FwobOptions::default()
         };
         TickStore::new(&dir, "AAPL", v1_options)
-            .append_ticks(&[ShortTick::new(10, 1.23, 100).unwrap()])
+            .append_ticks(&[Tick::new(10, 1.23, 100).unwrap()])
             .unwrap();
 
         // Explicitly requesting v2 against the existing v1 file is an error.
@@ -465,8 +465,8 @@ mod tests {
         let mut writer = store.writer();
         let mut total = 0u64;
         for batch in 0..5u32 {
-            let ticks: Vec<ShortTick> = (0..10)
-                .map(|i| ShortTick::new(batch * 10 + i, 1.23, 100).unwrap())
+            let ticks: Vec<Tick> = (0..10)
+                .map(|i| Tick::new(batch * 10 + i, 1.23, 100).unwrap())
                 .collect();
             writer.append_ticks(&ticks).unwrap();
             total += ticks.len() as u64;
@@ -486,7 +486,7 @@ mod tests {
 
         let mut writer = store.writer();
         writer
-            .append_ticks(&[ShortTick::new(10, 1.23, 100).unwrap()])
+            .append_ticks(&[Tick::new(10, 1.23, 100).unwrap()])
             .unwrap();
         // A commit (no final finish yet) must make the first batch durably readable.
         writer.commit().unwrap();
@@ -494,7 +494,7 @@ mod tests {
 
         // The same writer keeps going on the still-open handle (no reopen).
         writer
-            .append_ticks(&[ShortTick::new(11, 1.24, 200).unwrap()])
+            .append_ticks(&[Tick::new(11, 1.24, 200).unwrap()])
             .unwrap();
         writer.finish().unwrap();
         assert_eq!(store.last_timestamp().unwrap(), Some(11));
@@ -510,13 +510,13 @@ mod tests {
         // finishes once at the end — the commit cadence is a durability checkpoint, never a change
         // to the output. Use many batches of noisy ticks so v2 forms several compressed pages plus
         // a raw residual, exercising the reclaim/recompaction path on each commit.
-        let batches: Vec<Vec<ShortTick>> = (0..40)
+        let batches: Vec<Vec<Tick>> = (0..40)
             .map(|batch: u32| {
                 (0..50)
                     .map(|i| {
                         let time = batch * 50 + i;
                         let price = 1.0 + f64::from(time.wrapping_mul(2_654_435_761)) / 1.0e6;
-                        ShortTick::new(time, price, (time as i32).wrapping_mul(7) + 1).unwrap()
+                        Tick::new(time, price, (time as i32).wrapping_mul(7) + 1).unwrap()
                     })
                     .collect()
             })
@@ -577,7 +577,7 @@ mod tests {
             let options = options_for(format);
             let store = TickStore::new(&dir, "AAPL", options);
             store
-                .append_ticks(&[ShortTick::new(1_761_000_000, 1.23, 100).unwrap()])
+                .append_ticks(&[Tick::new(1_761_000_000, 1.23, 100).unwrap()])
                 .unwrap();
 
             let reader = Reader::open(store.path()).unwrap();
@@ -592,12 +592,12 @@ mod tests {
     fn append_twice_and_assert(store: &TickStore) {
         store
             .append_ticks(&[
-                ShortTick::new(10, 1.23, 100).unwrap(),
-                ShortTick::new(11, 1.24, 200).unwrap(),
+                Tick::new(10, 1.23, 100).unwrap(),
+                Tick::new(11, 1.24, 200).unwrap(),
             ])
             .unwrap();
         store
-            .append_ticks(&[ShortTick::new(12, 1.25, 300).unwrap()])
+            .append_ticks(&[Tick::new(12, 1.25, 300).unwrap()])
             .unwrap();
         assert_eq!(store.last_timestamp().unwrap(), Some(12));
     }

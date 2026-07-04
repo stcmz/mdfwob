@@ -3,14 +3,18 @@ use fwob_core::{Field, FieldSemantic, FieldType, Schema, TimestampUnit};
 
 pub const PRICE_SCALE: f64 = 10_000.0;
 
+/// A trade tick as stored on disk: a 1:1 mirror of the `"Tick"` frame schema ([`tick_schema`]),
+/// with `price` a scaled integer (real price × [`PRICE_SCALE`]). Built during ingestion and
+/// encoded to 12-byte frames. Its decoded read/analysis counterpart is
+/// [`crate::analysis::model::Tick`] — the same fields, but with `price` as a real `f64`.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ShortTick {
+pub struct Tick {
     pub time: u32,
     pub price: u32,
     pub size: i32,
 }
 
-impl ShortTick {
+impl Tick {
     pub fn new(time: u32, price: f64, size: i32) -> Result<Self> {
         if !price.is_finite() || price < 0.0 {
             bail!("price must be a non-negative finite number");
@@ -37,7 +41,7 @@ pub fn tick_schema() -> Schema {
     Schema::new(
         "Tick",
         vec![
-            // time is an absolute UTC epoch second (see downloader::provider_tick_to_short_tick).
+            // time is an absolute UTC epoch second (see downloader::provider_tick_to_tick).
             // V2 persists this semantic; V1 accepts but does not store it (reads back as None).
             Field::new("time", FieldType::UnsignedInteger, 4, 0)
                 .with_semantic(FieldSemantic::UnixTimestamp(TimestampUnit::Seconds)),
@@ -57,8 +61,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn encodes_legacy_short_tick_layout() {
-        let tick = ShortTick::new(1_461_572_280, 105.22, 500).unwrap();
+    fn encodes_tick_layout() {
+        let tick = Tick::new(1_461_572_280, 105.22, 500).unwrap();
         let mut bytes = Vec::new();
         tick.encode(&mut bytes);
         assert_eq!(bytes.len(), 12);

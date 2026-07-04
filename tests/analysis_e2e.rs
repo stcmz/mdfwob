@@ -14,7 +14,7 @@ use mdfwob::analysis::{
     BarClock, Calc, Interval, Sma, TickQuery, compute_stat, read_bars, read_ticks, resample,
     summarize,
 };
-use mdfwob::tick::{ShortTick, tick_schema};
+use mdfwob::tick::{Tick, tick_schema};
 
 fn temp_dir(tag: &str) -> PathBuf {
     let nonce = SystemTime::now()
@@ -36,7 +36,7 @@ fn write_tick_file(dir: &Path) -> PathBuf {
     let mut buf = Vec::new();
     for i in 0..20u32 {
         let price = 185.0 + f64::from(i) * 0.1;
-        ShortTick::new(base + i * 60, price, 100)
+        Tick::new(base + i * 60, price, 100)
             .unwrap()
             .encode(&mut buf);
     }
@@ -136,7 +136,7 @@ fn cli_stat_bars_calc_run() {
     assert!(stdout.contains("AAPL"));
 
     // bars 5m csv: headers are the schema field names; values are raw stored integers
-    // (price * 10_000, epoch time) -- identical to `fwob dump ... csv`.
+    // (price * 10_000, epoch time) -- identical to `fwob cat ... csv`.
     let out = Command::new(exe)
         .args(["bars", path_str, "5m", "csv"])
         .output()
@@ -154,7 +154,7 @@ fn cli_stat_bars_calc_run() {
     // First 5m bar opens at 185.0 -> stored 1_850_000; time is the raw epoch second.
     assert!(stdout.contains("1704205800,1850000,"), "{stdout}");
 
-    // bars 5m table: time renders as RFC3339 (unified with fwob dump).
+    // bars 5m table: time renders as RFC3339 (unified with fwob cat).
     let out = Command::new(exe)
         .args(["bars", path_str, "5m"])
         .output()
