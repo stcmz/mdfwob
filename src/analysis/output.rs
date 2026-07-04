@@ -158,16 +158,58 @@ impl<'a, W: Write> BarStream<'a, W> {
 }
 
 pub fn write_bars_fwob(symbol: &str, bars: &[Bar], dir: &Path) -> Result<()> {
-    let path = dir.join(format!("{symbol}.fwob"));
-    let mut writer = Writer::create_v2(&path, bar_schema(), WriterOptions::new(symbol))
-        .with_context(|| format!("failed to create {}", path.display()))?;
-    let mut buf = Vec::with_capacity(bars.len() * BAR_FRAME_LEN as usize);
+    let mut writer = BarWriter::create(symbol, dir)?;
     for bar in bars {
-        encode_bar(bar, &mut buf);
+        writer.push(bar)?;
     }
-    writer.append_presorted_frames(&buf)?;
-    writer.finish()?;
-    Ok(())
+    writer.finish()
+}
+
+/// Streaming writer for a single symbol's bar `.fwob` file. Bars are encoded into a bounded buffer
+/// and flushed to the underlying [`Writer`] in batches, so a whole-history fine-interval conversion
+/// (e.g. `1s`, which yields hundreds of millions of bars) never materializes the entire series in
+/// memory. Feed ascending bars with [`BarWriter::push`], then call [`BarWriter::finish`].
+pub struct BarWriter {
+    writer: Writer,
+    buf: Vec<u8>,
+}
+
+impl BarWriter {
+    /// Target flush size: batching the presorted append amortizes page formation while keeping
+    /// peak memory to a few megabytes regardless of the total bar count.
+    const FLUSH_BYTES: usize = 4 * 1024 * 1024;
+
+    pub fn create(symbol: &str, dir: &Path) -> Result<Self> {
+        let path = dir.join(format!("{symbol}.fwob"));
+        let writer = Writer::create_v2(&path, bar_schema(), WriterOptions::new(symbol))
+            .with_context(|| format!("failed to create {}", path.display()))?;
+        Ok(Self {
+            writer,
+            buf: Vec::with_capacity(Self::FLUSH_BYTES + BAR_FRAME_LEN as usize),
+        })
+    }
+
+    pub fn push(&mut self, bar: &Bar) -> Result<()> {
+        encode_bar(bar, &mut self.buf);
+        if self.buf.len() >= Self::FLUSH_BYTES {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        if !self.buf.is_empty() {
+            self.writer.append_presorted_frames(&self.buf)?;
+            self.buf.clear();
+        }
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<()> {
+        self.flush()?;
+        self.writer.finish()?;
+        Ok(())
+    }
 }
 
 // ---- calc ---------------------------------------------------------------------
@@ -517,6 +559,43 @@ fn finite(value: f64) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bar_writer_streams_across_flush_boundary() {
+        use crate::analysis::read::read_bars;
+
+        // More bars than one flush buffer holds (FLUSH_BYTES / BAR_FRAME_LEN) so at least one
+        // mid-stream batch is appended before finish, exercising the incremental path.
+        let count = (BarWriter::FLUSH_BYTES / BAR_FRAME_LEN as usize) + 5_000;
+        let dir = std::env::temp_dir().join(format!("mdfwob-barwriter-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut writer = BarWriter::create("TEST", &dir).unwrap();
+        for i in 0..count {
+            let t = 1_704_067_200 + i as u32; // ascending 1s bars
+            let price = 100.0 + (i as f64) * 0.0001;
+            writer
+                .push(&Bar {
+                    time: t,
+                    open: price,
+                    high: price,
+                    low: price,
+                    close: price,
+                    volume: 10,
+                    vwap: price,
+                    trades: 1,
+                })
+                .unwrap();
+        }
+        writer.finish().unwrap();
+
+        let (symbol, bars) = read_bars(&dir.join("TEST.fwob")).unwrap();
+        assert_eq!(symbol, "TEST");
+        assert_eq!(bars.len(), count);
+        assert_eq!(bars[0].time, 1_704_067_200);
+        assert_eq!(bars[count - 1].time, 1_704_067_200 + (count as u32 - 1));
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn comma_grouping() {

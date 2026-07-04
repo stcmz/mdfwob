@@ -14,7 +14,7 @@ use crate::{
         interval::{Granularity, Interval},
         model::Bar,
         output::{
-            AnalysisFormat, BarStream, CalcSeries, guard_symbol_count, write_bars_fwob, write_calc,
+            AnalysisFormat, BarStream, BarWriter, CalcSeries, guard_symbol_count, write_calc,
             write_stat,
         },
         plot::{Canvas, PlotOptions, Series, render},
@@ -500,13 +500,15 @@ impl BarsArgs {
                     .context("bars --format fwob requires --output DIR")?;
                 std::fs::create_dir_all(dir)
                     .with_context(|| format!("failed to create {}", dir.display()))?;
+                // Stream each bucket straight into the bar file so a fine-interval conversion of a
+                // whole tick history (e.g. 1s over billions of ticks) keeps bounded memory instead
+                // of buffering the entire bar series first.
                 for (symbol, paths) in &by_symbol {
-                    let mut bars = Vec::new();
+                    let mut writer = BarWriter::create(symbol, dir)?;
                     stream_bars(paths, interval, &clock, &query, fill, |bar| {
-                        bars.push(bar);
-                        Ok(())
+                        writer.push(&bar)
                     })?;
-                    write_bars_fwob(symbol, &bars, dir)?;
+                    writer.finish()?;
                 }
             }
             AnalysisFormat::Frame(frame) => {
