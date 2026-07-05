@@ -4,13 +4,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use fwob::Reader;
-use fwob_core::Key;
+use fwob_core::{Key, Schema};
 
 use crate::analysis::model::{Bar, Tick};
-use crate::analysis::schema::{BAR_FRAME_TYPE, TICK_FRAME_TYPE, decode_bar};
+use crate::analysis::schema::{BAR_FRAME_TYPE, TICK_FRAME_TYPE, bar_schema, decode_bar};
 use crate::analysis::session::Session;
 use crate::config::normalize_symbol;
-use crate::tick::PRICE_SCALE;
+use crate::tick::{PRICE_SCALE, tick_schema};
 
 /// Whether a file holds raw ticks or pre-aggregated bars.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,16 +47,65 @@ fn symbol_of(path: &Path, title: &str) -> String {
     }
 }
 
-/// Identifies whether an open reader is a tick or bar file.
+/// Identifies whether an open reader is a tick or bar file, validating that its schema matches the
+/// canonical layout for that kind. Decoding is positional, so a mislabeled file (right frame type,
+/// wrong columns/layout) would otherwise be silently mis-decoded.
 pub fn detect_kind(reader: &Reader) -> Result<InputKind> {
     let schema = reader.schema();
-    match schema.frame_type.as_str() {
-        TICK_FRAME_TYPE => Ok(InputKind::Tick),
-        BAR_FRAME_TYPE => Ok(InputKind::Bar),
+    let (kind, expected) = match schema.frame_type.as_str() {
+        TICK_FRAME_TYPE => (InputKind::Tick, tick_schema()),
+        BAR_FRAME_TYPE => (InputKind::Bar, bar_schema()),
         other => bail!(
             "unsupported frame type {other:?}; expected a tick ({TICK_FRAME_TYPE}) or bar ({BAR_FRAME_TYPE}) file"
         ),
+    };
+    ensure_layout(schema, &expected)?;
+    Ok(kind)
+}
+
+/// Verifies `actual` has the same on-disk layout as the canonical `expected` schema: frame length,
+/// key field, field count, and each field's name/type/length/offset. Field *semantics* are
+/// deliberately ignored, since FWOB v1 does not persist them (a v1 file reads them back as `None`),
+/// so requiring them would reject otherwise-identical v1 files.
+fn ensure_layout(actual: &Schema, expected: &Schema) -> Result<()> {
+    let reject = |why: String| -> Result<()> {
+        bail!(
+            "{} file schema does not match the expected layout: {why}",
+            expected.frame_type
+        )
+    };
+    if actual.frame_len != expected.frame_len {
+        return reject(format!(
+            "frame length {} (expected {})",
+            actual.frame_len, expected.frame_len
+        ));
     }
+    if actual.key_field_index != expected.key_field_index {
+        return reject(format!(
+            "key field index {} (expected {})",
+            actual.key_field_index, expected.key_field_index
+        ));
+    }
+    if actual.fields.len() != expected.fields.len() {
+        return reject(format!(
+            "{} columns (expected {})",
+            actual.fields.len(),
+            expected.fields.len()
+        ));
+    }
+    for (a, e) in actual.fields.iter().zip(&expected.fields) {
+        if a.name != e.name
+            || a.field_type != e.field_type
+            || a.length != e.length
+            || a.offset != e.offset
+        {
+            return reject(format!(
+                "column {:?} ({:?}, {} bytes @ offset {}) — expected {:?} ({:?}, {} bytes @ offset {})",
+                a.name, a.field_type, a.length, a.offset, e.name, e.field_type, e.length, e.offset
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Detects whether a file holds ticks or bars by opening its header.
@@ -365,5 +414,66 @@ mod tests {
         assert_eq!(all.len(), 10);
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Writes a one-frame v2 file with an arbitrary schema, for layout-check tests.
+    fn write_schema_file(
+        tag: &str,
+        name: &str,
+        schema: fwob_core::Schema,
+        frame: &[u8],
+    ) -> PathBuf {
+        use fwob::Writer;
+        use fwob_v2::WriterOptions;
+        let dir = std::env::temp_dir().join(format!("mdfwob-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{name}.fwob"));
+        let mut writer = Writer::create_v2(&path, schema, WriterOptions::new(name)).unwrap();
+        writer.append_presorted_frames(frame).unwrap();
+        writer.finish().unwrap();
+        path
+    }
+
+    #[test]
+    fn detect_kind_rejects_mismatched_columns() {
+        use fwob_core::{Field, FieldType, Schema};
+        // Correct frame type and layout, but the third column is misnamed.
+        let schema = Schema::new(
+            TICK_FRAME_TYPE,
+            vec![
+                Field::new("time", FieldType::UnsignedInteger, 4, 0),
+                Field::new("price", FieldType::UnsignedInteger, 4, 4),
+                Field::new("qty", FieldType::SignedInteger, 4, 8),
+            ],
+            0,
+        )
+        .unwrap();
+        let path = write_schema_file("mismatch", "BAD", schema, &[0u8; 12]);
+        let err = input_kind(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("does not match") && msg.contains("qty"),
+            "unexpected error: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn detect_kind_accepts_canonical_layout_without_semantics() {
+        use fwob_core::{Field, FieldType, Schema};
+        // Canonical tick layout but with semantics left as None, as a v1 file reads back.
+        let schema = Schema::new(
+            TICK_FRAME_TYPE,
+            vec![
+                Field::new("time", FieldType::UnsignedInteger, 4, 0),
+                Field::new("price", FieldType::UnsignedInteger, 4, 4),
+                Field::new("size", FieldType::SignedInteger, 4, 8),
+            ],
+            0,
+        )
+        .unwrap();
+        let path = write_schema_file("v1like", "OK", schema, &[0u8; 12]);
+        assert_eq!(input_kind(&path).unwrap(), InputKind::Tick);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

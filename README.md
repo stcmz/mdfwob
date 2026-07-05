@@ -186,7 +186,7 @@ mdfwob bars data/ 1mo fwob --output bars/
 mdfwob bars AAPL.fwob 5m rth fill            # RTH bars, forward-fill gaps in-session
 mdfwob bars AAPL.fwob 1h 2026-01-01..2026-02-01  # range token (exchange tz, end exclusive)
 mdfwob calc AAPL.fwob 1d rth ret:log vol:20 sma:20 rsi:14 --summary
-mdfwob calc bars/AAPL.fwob sma:20            # a bar file needs no interval
+mdfwob calc AAPL.fwob sma:20                 # no interval token -> 1d (the default)
 mdfwob plot AAPL.fwob 5m rsi:14 volume       # candlesticks to the console (Sixel)
 mdfwob plot AAPL.fwob 1d sma:50 -o chart.png # ...or write a PNG
 ```
@@ -210,8 +210,8 @@ mdfwob plot AAPL.fwob 1d sma:50 -o chart.png # ...or write a PNG
   `<symbol>.fwob` per symbol into `--output`.
 - **`calc`** computes per-bar indicator columns from composable specs —
   `sma:N`, `ema:N`, `dema:N`, `vsma:N`, `vema:N`, `vdema:N`, `rsi:N`, `ret:log`,
-  `ret:simple`, `vol:N` — over a bar file (optionally re-resampled to a coarser
-  interval), or over a tick file plus an interval token (auto-resampled). Columns
+  `ret:simple`, `vol:N` — over tick or bar files, both resampled/re-resampled to
+  the interval token (default `1d` when none is given, like `bars`/`plot`). Columns
   are stored as 4-byte fixed-point integers at a per-indicator precision
   (price-level indicators use 4 decimals, returns/volatility use 8); warm-up cells
   with no value are shown as `-`. `--summary` appends whole-series mean return and

@@ -181,6 +181,19 @@ fn cli_stat_bars_calc_run() {
     assert!(stdout.contains("ret_log"));
     assert!(stdout.contains("# summary:"));
 
+    // calc with NO interval token defaults to 1d (like bars/plot) instead of erroring on a tick
+    // file. The 20-minute tick span collapses into a single 1d bar.
+    let out = Command::new(exe)
+        .args(["calc", path_str, "sma:2"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "calc without an interval token should default to 1d, got: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("sma_2"));
+
     let _ = fs::remove_dir_all(dir);
 }
 

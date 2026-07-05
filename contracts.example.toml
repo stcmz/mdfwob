@@ -61,7 +61,7 @@ interval = "5m" # Default bar interval when no interval token is given.
 fill = false # Forward-fill empty intervals with flat bars.
 
 [analysis.calc]
-interval = "1d" # Default interval when resampling a tick file.
+interval = "1d" # Default bar interval; applies to tick and bar inputs.
 method = "log" # Summary return method: "log" or "simple".
 fill = false
 annualize = false # Annualize the --summary realized volatility.

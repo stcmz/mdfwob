@@ -20,7 +20,7 @@ use crate::{
         plot::{Canvas, PlotOptions, Series, render},
         read::{
             InputKind, TickQuery, discover_inputs, file_symbol, input_kind, open_tick_reader,
-            stream_bars_file, stream_ticks, tick_symbol,
+            stream_bars_file, stream_ticks,
         },
         resample::{BarClock, BarResampler, ForwardFiller, Resampler},
         schema::{bar_schema, with_symbol_column},
@@ -875,7 +875,7 @@ fn fmt_session_len(seconds: u32) -> String {
 #[command(after_help = concat!("Tokens (case-sensitive, any order):
   paths/symbols: a tick or bar FILE.fwob, a DIR, or a bare SYMBOL (resolved under output_dir)
   indicator specs: sma:N ema:N dema:N vsma:N vema:N vdema:N rsi:N ret:log ret:simple vol:N
-  interval: e.g. 5m, 1h, 1d (tick files resample to it; bar files re-resample to it, or omit to keep native)
+  interval: e.g. 5m, 1h, 1d (default 1d; tick and bar inputs both resample/re-resample to it)
   formats: table (default), csv, md, jsonl, raw, hex, fwob
   session: rth (keep only regular-trading-hours ticks)
   fill: forward-fill empty intervals within a session
@@ -935,17 +935,9 @@ impl CalcArgs {
         if spec_tokens.is_empty() {
             bail!("calc requires at least one indicator spec (e.g. sma:20, ret:log, vol:20)");
         }
-        let interval = match interval_token {
-            Some(interval) => Some(interval),
-            None => match acfg.calc.interval.as_deref() {
-                Some(text) => Some(
-                    Interval::parse(text)
-                        .with_context(|| format!("invalid interval in config: {text:?}"))?
-                        .with_context(|| format!("invalid interval in config: {text:?}"))?,
-                ),
-                None => None,
-            },
-        };
+        // Like `bars`/`plot`, default to 1d when neither a token nor a config value is given; tick
+        // and bar inputs alike resample/re-resample to it.
+        let interval = resolve_interval(interval_token, acfg.calc.interval.as_deref())?;
         let method = match self.method.as_deref() {
             Some(token) => ReturnMethod::from_token(token)
                 .ok_or_else(|| anyhow::anyhow!("--method must be log or simple"))?,
@@ -955,9 +947,7 @@ impl CalcArgs {
         let periods_per_year = self.periods_per_year.unwrap_or(acfg.calc.periods_per_year);
         let fill = fill || acfg.calc.fill;
         let session = resolve_session(&acfg, use_rth, self.session.as_deref(), self.tz.as_deref())?;
-        if let Some(iv) = interval {
-            warn_uneven_interval(iv, &session, use_rth);
-        }
+        warn_uneven_interval(interval, &session, use_rth);
         let clock = BarClock::Session(session.clone());
         let filter = use_rth.then(|| session.clone());
         let start = self.start.clone().or(range_start);
@@ -968,60 +958,27 @@ impl CalcArgs {
         let mut groups: BTreeMap<String, Vec<Bar>> = BTreeMap::new();
         for path in &files {
             let result = (|| -> Result<(String, Vec<Bar>)> {
+                // Tick and bar files both stream through the resampler at `interval` (bars are
+                // re-resampled, e.g. 1s→1m), honoring the time-range/session window.
+                let symbol = file_symbol(path)?;
                 let query = TickQuery {
                     start,
                     end,
                     session: filter.clone(),
                 };
-                match input_kind(path)? {
-                    // A bar file with an interval token is re-resampled to it (e.g. 1s→1m); without
-                    // one it is used at its native resolution. Either way the time-range/session
-                    // window is honored.
-                    InputKind::Bar => {
-                        let symbol = file_symbol(path)?;
-                        let mut bars = Vec::new();
-                        if let Some(interval) = interval {
-                            stream_bars(
-                                std::slice::from_ref(path),
-                                interval,
-                                &clock,
-                                &query,
-                                fill,
-                                |bar| {
-                                    bars.push(bar);
-                                    Ok(())
-                                },
-                            )?;
-                        } else {
-                            // No interval token: keep native bars, but seek to the window instead
-                            // of scanning the whole file.
-                            stream_bars_file(path, &query, |bar| {
-                                bars.push(bar);
-                                Ok(())
-                            })?;
-                        }
-                        Ok((symbol, bars))
-                    }
-                    InputKind::Tick => {
-                        let interval = interval.context(
-                            "an interval token is required to resample a tick file (e.g. 5m, 1h, 1d)",
-                        )?;
-                        let symbol = tick_symbol(path)?;
-                        let mut bars = Vec::new();
-                        stream_bars(
-                            std::slice::from_ref(path),
-                            interval,
-                            &clock,
-                            &query,
-                            fill,
-                            |bar| {
-                                bars.push(bar);
-                                Ok(())
-                            },
-                        )?;
-                        Ok((symbol, bars))
-                    }
-                }
+                let mut bars = Vec::new();
+                stream_bars(
+                    std::slice::from_ref(path),
+                    interval,
+                    &clock,
+                    &query,
+                    fill,
+                    |bar| {
+                        bars.push(bar);
+                        Ok(())
+                    },
+                )?;
+                Ok((symbol, bars))
             })();
             match result {
                 Ok((symbol, mut bars)) => groups.entry(symbol).or_default().append(&mut bars),
