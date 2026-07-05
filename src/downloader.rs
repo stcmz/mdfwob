@@ -366,6 +366,7 @@ fn run_with_provider(
                     let result = (|| {
                         let _lock = store.try_lock()?;
                         store.ensure_compatible_format()?;
+                        store.ensure_tick_schema()?;
                         store.verify_existing()?;
                         downloader.download_symbol(&contract, &store)
                     })();
@@ -403,7 +404,7 @@ struct SymbolDownloader<'a, P> {
     /// IBKR reconnect retry budget: -1 retries forever, 0 disables retries, and a
     /// positive value caps the wall-clock seconds spent retrying a single request.
     reconnect_timeout_seconds: i64,
-    /// Exchange timezone that anchors the day-advance and log timestamps.
+    /// Exchange timezone that anchors the day-advance and the progress timestamps in log fields.
     timezone: &'a TimeZone,
     cancel: &'a CancellationToken,
     /// Paces the first attempt of each request (normal data-fetch rate).

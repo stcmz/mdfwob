@@ -23,7 +23,7 @@ parallelism = 4 # Maximum number of contracts processed concurrently.
 request_interval_ms = 1000 # Global minimum spacing between provider requests.
 retry_interval_ms = 10000 # Global minimum spacing between retry attempts after a recoverable error.
 commit_interval_seconds = 60 # Durably flush the open writer this often (doesn't change the file); -1 = only at end, 0 = every batch.
-timezone = "America/New_York" # Exchange tz for day-advance alignment and log timestamps (stored time stays UTC).
+timezone = "America/New_York" # Exchange tz for day-advance alignment and progress timestamps in log fields (stored time stays UTC; the log-line prefix uses machine-local time).
 
 # Symbols in one stock group share currency and exchange properties.
 [[stocks]]

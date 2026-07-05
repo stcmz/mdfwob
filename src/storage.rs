@@ -12,6 +12,7 @@ use fwob_core::Key;
 use tracing::warn;
 
 use crate::{
+    analysis::read::{InputKind, detect_kind},
     fwob_options::{FwobOptions, TargetFormat},
     tick::{Tick, tick_schema},
 };
@@ -89,6 +90,35 @@ impl TickStore {
                 self.path.display(),
                 format_label(actual),
                 target_label(self.options.format),
+            );
+        }
+        Ok(())
+    }
+
+    /// Rejects resuming an existing file that is not a canonical tick file — an old
+    /// `ShortTick`/capitalized-column file, a bar file, or any schema mdfwob's readers would reject.
+    /// Appends are positional, so a mismatched file would otherwise be silently extended (and then be
+    /// unreadable by `stat`/`bars`/`calc`/`plot`) or fail later with a cryptic frame-size error. This
+    /// reuses the same `detect_kind` layout check the readers enforce. A missing file (about to be
+    /// created with `tick_schema()`) passes.
+    pub fn ensure_tick_schema(&self) -> Result<()> {
+        if !self.path.exists() {
+            return Ok(());
+        }
+        let reader = Reader::open(&self.path)
+            .with_context(|| format!("failed to open {}", self.path.display()))?;
+        let kind = detect_kind(&reader).with_context(|| {
+            format!(
+                "{} is not a canonical tick file; migrate it with `fwob set --frame-type Tick \
+                 --rename-column Time=time --rename-column Price=price --rename-column Size=size` \
+                 or download to a different output",
+                self.path.display()
+            )
+        })?;
+        if kind != InputKind::Tick {
+            bail!(
+                "{} is a bar file, not a tick file; download to a different output",
+                self.path.display()
             );
         }
         Ok(())
@@ -587,6 +617,53 @@ mod tests {
             assert_eq!(reader.schema().fields[1].semantic, price_expected);
             fs::remove_dir_all(dir).unwrap();
         }
+    }
+
+    #[test]
+    fn ensure_tick_schema_rejects_non_tick_file() {
+        use fwob_core::{Field, FieldType, Schema};
+
+        let dir = temp_dir("mdfwob-schema-guard");
+        fs::create_dir_all(&dir).unwrap();
+        // A legacy "ShortTick" file with capitalized columns: the exact shape the strict readers
+        // reject, and which download must refuse to silently extend.
+        let schema = Schema::new(
+            "ShortTick",
+            vec![
+                Field::new("Time", FieldType::UnsignedInteger, 4, 0),
+                Field::new("Price", FieldType::UnsignedInteger, 4, 4),
+                Field::new("Size", FieldType::SignedInteger, 4, 8),
+            ],
+            0,
+        )
+        .unwrap();
+        let path = dir.join("AAPL.fwob");
+        let mut writer =
+            Writer::create_v2(&path, schema, fwob_v2::WriterOptions::new("AAPL")).unwrap();
+        writer.append_presorted_frames(&[0u8; 12]).unwrap();
+        writer.finish().unwrap();
+
+        let store = TickStore::new(&dir, "AAPL", FwobOptions::default());
+        let err = store.ensure_tick_schema().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("not a canonical tick file"),
+            "unexpected error: {err:#}"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ensure_tick_schema_accepts_missing_and_canonical_files() {
+        let dir = temp_dir("mdfwob-schema-ok");
+        let store = TickStore::new(&dir, "AAPL", FwobOptions::default());
+        // A missing file is fine: it will be created with the canonical tick schema.
+        store.ensure_tick_schema().unwrap();
+        // A file mdfwob itself wrote passes.
+        store
+            .append_ticks(&[Tick::new(10, 1.23, 100).unwrap()])
+            .unwrap();
+        store.ensure_tick_schema().unwrap();
+        fs::remove_dir_all(dir).unwrap();
     }
 
     fn append_twice_and_assert(store: &TickStore) {

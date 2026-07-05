@@ -149,7 +149,8 @@ struct DownloadArgs {
     #[arg(long)]
     end: Option<String>,
 
-    /// Exchange timezone (IANA name) for day-advance alignment and log timestamps.
+    /// Exchange timezone (IANA name) for day-advance alignment and the download-progress
+    /// timestamps shown in log fields (the log-line prefix uses the machine's local time).
     /// Defaults to the config value (America/New_York).
     #[arg(long)]
     timezone: Option<String>,
