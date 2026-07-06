@@ -1,0 +1,39 @@
+[package]
+name = "mdfwob"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+description = "Download historical market data from IBKR and Databento into FWOB files"
+keywords = ["market-data", "ibkr", "databento", "finance", "fwob"]
+categories = ["command-line-utilities"]
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+[dependencies]
+mdfwob-core = { version = "1.6.3", path = "../mdfwob-core" }
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+ctrlc = "3.5"
+databento = "0.53.0"
+fs2 = "0.4"
+fwob = "1.13"
+fwob-core = "1.13"
+fwob-v1 = "1.13"
+fwob-v2 = "1.13"
+ibapi = { version = "3.1.0", default-features = false, features = ["sync"] }
+jiff = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# Cap below time 0.3.50, which fails to compile (unresolved `time_macros::timestamp`).
+# This keeps `cargo install mdfwob` working without `--locked`. Lift the cap once a
+# fixed time release (>= 0.3.51) is available.
+time = { version = ">=0.3, <0.3.54", features = ["formatting", "macros", "parsing"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
