@@ -9,7 +9,7 @@ use fwob_core::{Key, Schema};
 use crate::analysis::model::{Bar, Tick};
 use crate::analysis::schema::{BAR_FRAME_TYPE, TICK_FRAME_TYPE, bar_schema, decode_bar};
 use crate::analysis::session::Session;
-use crate::config::normalize_symbol;
+use crate::normalize_symbol;
 use crate::tick::{PRICE_SCALE, tick_schema};
 
 /// Whether a file holds raw ticks or pre-aggregated bars.

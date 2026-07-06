@@ -224,9 +224,7 @@ fn default_option_multiplier() -> String {
     "100".into()
 }
 
-pub fn normalize_symbol(symbol: &str) -> String {
-    symbol.trim().to_ascii_uppercase()
-}
+pub use mdfwob_core::normalize_symbol;
 
 #[cfg(test)]
 mod tests {
@@ -234,7 +232,8 @@ mod tests {
 
     #[test]
     fn example_config_stays_valid() {
-        let config: Config = toml::from_str(include_str!("../contracts.example.toml")).unwrap();
+        let config: Config =
+            toml::from_str(include_str!("../../../contracts.example.toml")).unwrap();
 
         assert_eq!(config.download.provider, ProviderKind::Ibkr);
         assert!(!config.stocks.is_empty());

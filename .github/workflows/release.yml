@@ -152,6 +152,9 @@ jobs:
             exit 1
           }
 
+          # mdfwob depends on the mdfwob-core path crate, so core must reach
+          # crates.io first or `cargo publish --package mdfwob` is rejected.
+          publish_and_wait mdfwob-core
           publish_and_wait mdfwob
 
   github-release:

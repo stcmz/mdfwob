@@ -1473,7 +1473,6 @@ dependencies = [
  "clap",
  "ctrlc",
  "databento",
- "font8x8",
  "fs2",
  "fwob",
  "fwob-core",
@@ -1481,7 +1480,7 @@ dependencies = [
  "fwob-v2",
  "ibapi",
  "jiff",
- "png",
+ "mdfwob-core",
  "serde",
  "serde_json",
  "time",
@@ -1490,6 +1489,22 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "winresource",
+]
+
+[[package]]
+name = "mdfwob-core"
+version = "1.6.3"
+dependencies = [
+ "anyhow",
+ "font8x8",
+ "fwob",
+ "fwob-core",
+ "fwob-v2",
+ "jiff",
+ "png",
+ "serde",
+ "serde_json",
+ "toml 0.8.23",
 ]
 
 [[package]]

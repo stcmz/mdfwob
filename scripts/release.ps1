@@ -36,10 +36,10 @@ if ($head -ne $originHead) {
 $manifest = Get-Content Cargo.toml -Raw
 $match = [regex]::Match(
     $manifest,
-    '(?ms)^\[package\]\s+name = "mdfwob"\s+version = "(\d+)\.(\d+)\.(\d+)"'
+    '(?ms)^\[workspace\.package\]\s+version = "(\d+)\.(\d+)\.(\d+)"'
 )
 if (-not $match.Success) {
-    throw "Could not find the mdfwob package version in Cargo.toml."
+    throw "Could not find the workspace version in Cargo.toml."
 }
 
 $major = [int] $match.Groups[1].Value
@@ -88,7 +88,7 @@ $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
     $utf8NoBom
 )
 
-cargo update -p mdfwob
+cargo update --workspace
 Assert-NativeSuccess "Updating Cargo.lock"
 cargo fmt --all --check
 Assert-NativeSuccess "Checking formatting"
