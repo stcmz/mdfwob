@@ -95,24 +95,11 @@ impl ReturnMethod {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CalcDefaults {
     pub interval: Option<String>,
     pub fill: bool,
-    pub annualize: bool,
-    pub periods_per_year: f64,
-}
-
-impl Default for CalcDefaults {
-    fn default() -> Self {
-        Self {
-            interval: None,
-            fill: false,
-            annualize: false,
-            periods_per_year: 252.0,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -124,7 +111,7 @@ mod tests {
         let config = AnalysisConfig::default();
         assert!(config.session(true).is_ok());
         assert!(config.session(false).is_ok());
-        assert_eq!(config.calc.periods_per_year, 252.0);
+        assert!(config.calc.interval.is_none());
     }
 
     #[test]

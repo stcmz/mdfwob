@@ -63,8 +63,6 @@ fill = false # Forward-fill empty intervals with flat bars.
 [analysis.calc]
 interval = "1d" # Default bar interval; applies to tick and bar inputs.
 fill = false
-annualize = false # Annualize the --summary return volatility (needs a ret: column).
-periods_per_year = 252.0 # Annualization factor (sqrt scaling).
 
 # Each option entry identifies one exact contract and creates a separate FWOB file.
 [[options]]

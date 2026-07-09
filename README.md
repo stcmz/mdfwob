@@ -220,14 +220,18 @@ mdfwob plot AAPL.fwob 1d sma:50 -o chart.png # ...or write a PNG
   buffering the whole series. Columns are stored as 4-byte fixed-point integers at
   a per-indicator precision (price-level indicators use 4 decimals,
   returns/volatility use 8); warm-up cells with no value are shown as `-`.
-  `--summary` appends a per-column footer as **colored TOML** (the same style as
-  `fwob inspect`): a `[summary.<col>]` block per requested indicator with
-  `n/mean/min/max/last`, and — only when a `ret:log`/`ret:simple` column is present
-  — a `[summary.ret_*]` block summarizing that return series as a fitted normal
-  (`mean`, `stdev`, `skew`, `excess_kurtosis`, `p25`/`median`/`p75`,
-  `jarque_bera`, `min`, `max`). The return method follows the `ret:` spec you pass;
-  `--annualize`/`--periods-per-year F` add an annualized volatility to the return
-  block.
+  `--summary` appends a footer as **colored TOML** (the same style as `fwob
+  inspect`): a `[summary.price]` block (first/last/high/low, `drawdown_from_peak`,
+  `cagr`), a `[summary.<col>]` block per indicator with `n/mean/min/max/last`, and
+  — only when a `ret:log`/`ret:simple` column is present — a `[summary.ret_*]`
+  block summarizing that return series as a fitted normal (`mean`, `stdev`, `skew`,
+  `excess_kurtosis`, `p25`/`median`/`p75`, `jarque_bera`, `min`, `max`) with
+  `annualized_return`/`annualized_vol`/`sharpe`, followed by a
+  `[summary.ret_*.character]` read of plain-word labels
+  (`trend`/`volatility`/`skew`/`tails`/`distribution`, and a `regime` from a
+  `vol:N` column) from fixed thresholds. The return method follows the `ret:` spec.
+  Annualization defaults to the data's own bar frequency (returns ÷ calendar-years,
+  so daily/weekly/intraday are all correct); `--periods-per-year F` overrides it.
 - **`plot`** renders OHLC candlesticks — with the same indicator specs as `calc`
   (price overlays, a volume panel via `volume`/`vsma`/`vema`/`vdema`, and stacked
   panels for `rsi`/`ret`/`vol`) — as an inline Sixel image on the console, or a

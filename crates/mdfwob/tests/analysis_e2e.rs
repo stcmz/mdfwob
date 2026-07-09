@@ -180,12 +180,18 @@ fn cli_stat_bars_calc_run() {
     assert!(stdout.contains("sma_2"));
     assert!(stdout.contains("ret_log"));
     // The summary footer is a colored-TOML block (plain here since stdout is piped): a `[summary]`
-    // table, a `[summary.ret_log]` fitted-normal block (driven by the ret:log column), and a
-    // per-indicator `[summary.sma_2]` block.
+    // table, a `[summary.price]` block (drawdown/CAGR), a per-indicator `[summary.sma_2]` block,
+    // and a `[summary.ret_log]` fitted-normal block with annualized figures and a `.character`
+    // sub-block, all driven by the ret:log column.
     assert!(stdout.contains("[summary]"), "{stdout}");
+    assert!(stdout.contains("[summary.price]"), "{stdout}");
+    assert!(stdout.contains("[summary.sma_2]"), "{stdout}");
     assert!(stdout.contains("[summary.ret_log]"), "{stdout}");
     assert!(stdout.contains("skew = "), "{stdout}");
-    assert!(stdout.contains("[summary.sma_2]"), "{stdout}");
+    assert!(stdout.contains("annualized_return = "), "{stdout}");
+    assert!(stdout.contains("sharpe = "), "{stdout}");
+    assert!(stdout.contains("[summary.ret_log.character]"), "{stdout}");
+    assert!(stdout.contains("trend = "), "{stdout}");
 
     // calc with NO interval token defaults to 1d (like bars/plot) instead of erroring on a tick
     // file. The 20-minute tick span collapses into a single 1d bar.

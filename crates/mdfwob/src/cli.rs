@@ -902,14 +902,15 @@ struct CalcArgs {
     tz: Option<String>,
     #[arg(long)]
     output: Option<PathBuf>,
-    /// Print a per-column summary footer as colored TOML. A `ret:log`/`ret:simple` column is
-    /// summarized as a fitted normal (mean, stdev, skew, excess kurtosis, quartiles, Jarque-Bera).
+    /// Print a per-column summary footer as colored TOML: a `[summary.price]` block (drawdown,
+    /// CAGR), `n/mean/min/max/last` per indicator, and — for a `ret:log`/`ret:simple` column — a
+    /// fitted-normal block (mean, stdev, skew, excess kurtosis, quartiles, Jarque-Bera, annualized
+    /// return/vol, Sharpe) plus a `[.character]` read (trend/volatility/tails/regime/...).
     #[arg(long)]
     summary: bool,
-    /// Annualize the summary's return volatility (needs a `ret:log`/`ret:simple` column).
-    #[arg(long)]
-    annualize: bool,
-    /// Annualization factor for --annualize (sqrt scaling). Default 252.
+    /// Override the summary's annualization factor (periods per year). Default: derived from the
+    /// data's own bar frequency (returns / calendar-years), so daily/weekly/intraday all annualize
+    /// correctly without assuming 252.
     #[arg(long = "periods-per-year")]
     periods_per_year: Option<f64>,
     #[arg(value_name = "ITEM", num_args = 0..)]
@@ -937,8 +938,6 @@ impl CalcArgs {
         // Like `bars`/`plot`, default to 1d when neither a token nor a config value is given; tick
         // and bar inputs alike resample/re-resample to it.
         let interval = resolve_interval(interval_token, acfg.calc.interval.as_deref())?;
-        let annualize = self.annualize || acfg.calc.annualize;
-        let periods_per_year = self.periods_per_year.unwrap_or(acfg.calc.periods_per_year);
         let fill = fill || acfg.calc.fill;
         let session = resolve_session(&acfg, use_rth, self.session.as_deref(), self.tz.as_deref())?;
         warn_uneven_interval(interval, &session, use_rth);
@@ -1043,7 +1042,7 @@ impl CalcArgs {
                                 encode_calc_row(bar.time, bar.close, &values, &decimals, buf)
                             })?;
                             if let Some(collector) = collector.as_mut() {
-                                collector.push_row(&values);
+                                collector.push_row(bar.time, bar.close, &values);
                             }
                             Ok(())
                         })?;
@@ -1060,7 +1059,7 @@ impl CalcArgs {
                         "summary".to_string()
                     };
                     writeln!(out)?;
-                    collector.render(&mut out, color, &base, annualize, periods_per_year)?;
+                    collector.render(&mut out, color, &base, self.periods_per_year)?;
                 }
                 out.flush()?;
             }
