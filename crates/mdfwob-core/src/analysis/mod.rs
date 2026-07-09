@@ -16,10 +16,12 @@ pub mod resample;
 pub mod schema;
 pub mod session;
 pub mod stat;
+pub mod summary;
 
 pub use calc::{
-    Calc, CalcColumn, CalcOutput, CalcSummary, Dema, Ema, Indicator, Returns, Rsi, Sma, Volatility,
-    VolumeDema, VolumeEma, VolumeSma, parse_spec, summarize,
+    Calc, CalcColumn, CalcOutput, CalcSummary, Dema, Ema, Indicator, Returns, Rsi, Sma,
+    StreamingIndicator, Volatility, VolumeDema, VolumeEma, VolumeSma, parse_spec,
+    parse_streaming_spec, summarize,
 };
 pub use config::{AnalysisConfig, ReturnMethod};
 pub use interval::Interval;
@@ -32,3 +34,4 @@ pub use read::{
 pub use resample::{BarClock, ForwardFiller, Resampler, resample};
 pub use session::Session;
 pub use stat::{StatAccumulator, StatRow, compute_stat};
+pub use summary::{SummaryCollector, SummaryColumn};

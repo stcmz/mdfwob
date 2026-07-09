@@ -13,9 +13,9 @@ categories = ["finance"]
 [dependencies]
 anyhow = "1.0"
 font8x8 = { version = "0.3", default-features = false }
-fwob = "1.13"
-fwob-core = "1.13"
-fwob-v2 = "1.13"
+fwob = "1.14"
+fwob-core = "1.14"
+fwob-v2 = "1.14"
 jiff = "0.2"
 png = "0.18"
 serde = { version = "1.0", features = ["derive"] }

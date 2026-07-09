@@ -209,14 +209,25 @@ mdfwob plot AAPL.fwob 1d sma:50 -o chart.png # ...or write a PNG
   session (never across the overnight gap); `fwob` output writes one
   `<symbol>.fwob` per symbol into `--output`.
 - **`calc`** computes per-bar indicator columns from composable specs —
-  `sma:N`, `ema:N`, `dema:N`, `vsma:N`, `vema:N`, `vdema:N`, `rsi:N`, `ret:log`,
-  `ret:simple`, `vol:N` — over tick or bar files, both resampled/re-resampled to
-  the interval token (default `1d` when none is given, like `bars`/`plot`). Columns
-  are stored as 4-byte fixed-point integers at a per-indicator precision
-  (price-level indicators use 4 decimals, returns/volatility use 8); warm-up cells
-  with no value are shown as `-`. `--summary` appends whole-series mean return and
-  realized volatility (`--annualize` `--periods-per-year F`); `--method
-  log|simple` selects the summary return type.
+  `sma:N`, `ema:N`, `dema:N` (moving averages of close); `vsma:N`, `vema:N`,
+  `vdema:N` (the same, of **volume** — the `v` prefix means volume); `rsi:N`;
+  `ret:log`, `ret:simple`; and `vol:N` (rolling realized **volatility**, the stdev
+  of log returns) — over tick or bar files, both resampled/re-resampled to the
+  interval token (default `1d` when none is given, like `bars`/`plot`). Note the
+  naming quirk: standalone `vol` is *volatility*, while the `v` *prefix* on
+  `vsma`/`vema`/`vdema` is *volume*. Rows stream to stdout as each bar closes (like
+  `bars`), so the built-in indicators are computed incrementally rather than
+  buffering the whole series. Columns are stored as 4-byte fixed-point integers at
+  a per-indicator precision (price-level indicators use 4 decimals,
+  returns/volatility use 8); warm-up cells with no value are shown as `-`.
+  `--summary` appends a per-column footer as **colored TOML** (the same style as
+  `fwob inspect`): a `[summary.<col>]` block per requested indicator with
+  `n/mean/min/max/last`, and — only when a `ret:log`/`ret:simple` column is present
+  — a `[summary.ret_*]` block summarizing that return series as a fitted normal
+  (`mean`, `stdev`, `skew`, `excess_kurtosis`, `p25`/`median`/`p75`,
+  `jarque_bera`, `min`, `max`). The return method follows the `ret:` spec you pass;
+  `--annualize`/`--periods-per-year F` add an annualized volatility to the return
+  block.
 - **`plot`** renders OHLC candlesticks — with the same indicator specs as `calc`
   (price overlays, a volume panel via `volume`/`vsma`/`vema`/`vdema`, and stacked
   panels for `rsi`/`ret`/`vol`) — as an inline Sixel image on the console, or a

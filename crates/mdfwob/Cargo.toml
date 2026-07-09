@@ -21,10 +21,10 @@ clap = { version = "4.5", features = ["derive"] }
 ctrlc = "3.5"
 databento = "0.53.0"
 fs2 = "0.4"
-fwob = "1.13"
-fwob-core = "1.13"
-fwob-v1 = "1.13"
-fwob-v2 = "1.13"
+fwob = "1.14"
+fwob-core = "1.14"
+fwob-v1 = "1.14"
+fwob-v2 = "1.14"
 ibapi = { version = "3.1.0", default-features = false, features = ["sync"] }
 jiff = "0.2"
 serde = { version = "1.0", features = ["derive"] }

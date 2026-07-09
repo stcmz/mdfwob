@@ -15,12 +15,8 @@ use fwob_core::Schema;
 use fwob_v2::WriterOptions;
 use jiff::{Timestamp, tz::TimeZone};
 
-use crate::analysis::calc::{CalcColumn, CalcSummary};
-use crate::analysis::config::ReturnMethod;
 use crate::analysis::model::Bar;
-use crate::analysis::schema::{
-    BAR_FRAME_LEN, bar_schema, calc_schema, encode_bar, encode_calc_row, with_symbol_column,
-};
+use crate::analysis::schema::{bar_schema, encode_bar, with_symbol_column};
 use crate::analysis::stat::StatRow;
 
 /// Maximum number of symbols that can share one interleaved stdout table (1-byte symbol index).
@@ -53,14 +49,6 @@ impl AnalysisFormat {
 pub struct BarSeries {
     pub symbol: String,
     pub bars: Vec<Bar>,
-}
-
-/// A computed calc series for one symbol.
-pub struct CalcSeries {
-    pub symbol: String,
-    pub bars: Vec<Bar>,
-    pub columns: Vec<CalcColumn>,
-    pub summary: Option<CalcSummary>,
 }
 
 // ---- bars ---------------------------------------------------------------------
@@ -96,30 +84,32 @@ fn render_bars(series: &[BarSeries], format: FrameFormat, out: &mut impl Write) 
     };
     let symbols: Vec<String> = series.iter().map(|s| s.symbol.clone()).collect();
     let strings: &[String] = if include_symbol { &symbols } else { &[] };
-    let mut stream = BarStream::new(&schema, strings, format, false, out)?;
+    let mut stream = FrameStream::new(&schema, strings, format, false, out)?;
     for (index, s) in series.iter().enumerate() {
         for bar in &s.bars {
-            stream.emit(index, bar)?;
+            stream.emit(index, |buf| encode_bar(bar, buf))?;
         }
     }
     Ok(())
 }
 
-/// Streaming bar renderer over fwob's [`FrameFormatter`]. Writes the header on construction, then
-/// one row per [`BarStream::emit`] so bars reach the terminal as soon as their bucket closes
-/// (rather than after the whole file is processed). When `strings` is non-empty the schema must be
-/// [`with_symbol_column`]'s and each row is prefixed with its symbol's index.
-pub struct BarStream<'a, W: Write> {
+/// Streaming row renderer over fwob's [`FrameFormatter`], shared by `bars` and `calc`. Writes the
+/// header on construction, then one row per [`FrameStream::emit`] — the caller supplies a closure
+/// that encodes that row's payload — so rows reach the terminal as they are produced rather than
+/// after the whole series. Only the per-row encoding differs between callers, and it lives at the
+/// call site. When `strings` is non-empty the schema must be [`with_symbol_column`]'s and each row
+/// is prefixed with its symbol's index.
+pub struct FrameStream<'a, W: Write> {
     formatter: FrameFormatter<'a>,
     include_symbol: bool,
-    /// Flush after every row so an interactive terminal shows each bar the moment its bucket
-    /// closes. Left off when stdout is redirected, so a buffered sink keeps full throughput.
+    /// Flush after every row so an interactive terminal shows each row the moment it is produced.
+    /// Left off when stdout is redirected, so a buffered sink keeps full throughput.
     autoflush: bool,
     frame: Vec<u8>,
     out: &'a mut W,
 }
 
-impl<'a, W: Write> BarStream<'a, W> {
+impl<'a, W: Write> FrameStream<'a, W> {
     pub fn new(
         schema: &'a Schema,
         strings: &'a [String],
@@ -137,18 +127,19 @@ impl<'a, W: Write> BarStream<'a, W> {
             formatter,
             include_symbol,
             autoflush,
-            frame: Vec::with_capacity(1 + BAR_FRAME_LEN as usize),
+            frame: Vec::new(),
             out,
         })
     }
 
-    /// Renders one bar row. `symbol_index` is ignored unless the stream carries a symbol column.
-    pub fn emit(&mut self, symbol_index: usize, bar: &Bar) -> Result<()> {
+    /// Renders one row. `encode` appends the frame payload (the schema fields, excluding the leading
+    /// symbol-index byte). `symbol_index` is ignored unless the stream carries a symbol column.
+    pub fn emit(&mut self, symbol_index: usize, encode: impl FnOnce(&mut Vec<u8>)) -> Result<()> {
         self.frame.clear();
         if self.include_symbol {
             self.frame.push(symbol_index as u8);
         }
-        encode_bar(bar, &mut self.frame);
+        encode(&mut self.frame);
         self.formatter.write_frame(&mut *self.out, &self.frame)?;
         if self.autoflush {
             self.out.flush()?;
@@ -158,39 +149,40 @@ impl<'a, W: Write> BarStream<'a, W> {
 }
 
 pub fn write_bars_fwob(symbol: &str, bars: &[Bar], dir: &Path) -> Result<()> {
-    let mut writer = BarWriter::create(symbol, dir)?;
+    let path = dir.join(format!("{symbol}.fwob"));
+    let mut writer = FrameWriter::create(&path, bar_schema(), symbol)?;
     for bar in bars {
-        writer.push(bar)?;
+        writer.push(|buf| encode_bar(bar, buf))?;
     }
     writer.finish()
 }
 
-/// Streaming writer for a single symbol's bar `.fwob` file. Bars are encoded into a bounded buffer
-/// and flushed to the underlying [`Writer`] in batches, so a whole-history fine-interval conversion
-/// (e.g. `1s`, which yields hundreds of millions of bars) never materializes the entire series in
-/// memory. Feed ascending bars with [`BarWriter::push`], then call [`BarWriter::finish`].
-pub struct BarWriter {
+/// Streaming writer for a single `.fwob` file, shared by `bars` and `calc`. Rows are encoded into a
+/// bounded buffer — the caller supplies a closure that encodes each payload — and flushed to the
+/// [`Writer`] in batches, so a whole-history fine-interval conversion (e.g. `1s`, hundreds of
+/// millions of rows) never materializes the entire series in memory. Feed rows with
+/// [`FrameWriter::push`], then call [`FrameWriter::finish`].
+pub struct FrameWriter {
     writer: Writer,
     buf: Vec<u8>,
 }
 
-impl BarWriter {
+impl FrameWriter {
     /// Target flush size: batching the presorted append amortizes page formation while keeping
-    /// peak memory to a few megabytes regardless of the total bar count.
+    /// peak memory to a few megabytes regardless of the total row count.
     const FLUSH_BYTES: usize = 4 * 1024 * 1024;
 
-    pub fn create(symbol: &str, dir: &Path) -> Result<Self> {
-        let path = dir.join(format!("{symbol}.fwob"));
-        let writer = Writer::create_v2(&path, bar_schema(), WriterOptions::new(symbol))
+    pub fn create(path: &Path, schema: Schema, title: &str) -> Result<Self> {
+        let writer = Writer::create_v2(path, schema, WriterOptions::new(title))
             .with_context(|| format!("failed to create {}", path.display()))?;
         Ok(Self {
             writer,
-            buf: Vec::with_capacity(Self::FLUSH_BYTES + BAR_FRAME_LEN as usize),
+            buf: Vec::with_capacity(Self::FLUSH_BYTES + 4096),
         })
     }
 
-    pub fn push(&mut self, bar: &Bar) -> Result<()> {
-        encode_bar(bar, &mut self.buf);
+    pub fn push(&mut self, encode: impl FnOnce(&mut Vec<u8>)) -> Result<()> {
+        encode(&mut self.buf);
         if self.buf.len() >= Self::FLUSH_BYTES {
             self.flush()?;
         }
@@ -212,104 +204,6 @@ impl BarWriter {
     }
 }
 
-// ---- calc ---------------------------------------------------------------------
-
-pub fn write_calc(
-    series: &[CalcSeries],
-    format: AnalysisFormat,
-    out_dir: Option<&Path>,
-    out: &mut impl Write,
-) -> Result<()> {
-    match format {
-        AnalysisFormat::Fwob => {
-            let dir = out_dir.context("calc --format fwob requires --output DIR")?;
-            std::fs::create_dir_all(dir)
-                .with_context(|| format!("failed to create {}", dir.display()))?;
-            for s in series {
-                write_calc_fwob(s, dir)?;
-            }
-            Ok(())
-        }
-        AnalysisFormat::Frame(frame) => {
-            render_calc(series, frame, out)?;
-            // Whole-series summary footer (table / markdown only).
-            if matches!(frame, FrameFormat::Table | FrameFormat::Markdown) {
-                let include_symbol = series.len() > 1;
-                for s in series {
-                    if let Some(summary) = &s.summary {
-                        writeln!(out, "{}", summary_line(&s.symbol, summary, include_symbol))?;
-                    }
-                }
-            }
-            Ok(())
-        }
-    }
-}
-
-fn render_calc(series: &[CalcSeries], format: FrameFormat, out: &mut impl Write) -> Result<()> {
-    let include_symbol = series.len() > 1;
-    guard_symbol_count(include_symbol, series.len())?;
-    let (names, decimals) = column_specs(series);
-    let base = calc_schema(&names, &decimals)?;
-
-    if include_symbol {
-        let schema = with_symbol_column(&base);
-        let strings: Vec<String> = series.iter().map(|s| s.symbol.clone()).collect();
-        let mut formatter = FrameFormatter::new(&schema, &strings, format);
-        formatter.write_header(out)?;
-        let mut frame = Vec::new();
-        for (index, s) in series.iter().enumerate() {
-            for (row, bar) in s.bars.iter().enumerate() {
-                let values: Vec<Option<f64>> = s.columns.iter().map(|c| c.values[row]).collect();
-                frame.clear();
-                frame.push(index as u8);
-                encode_calc_row(bar.time, bar.close, &values, &decimals, &mut frame);
-                formatter.write_frame(out, &frame)?;
-            }
-        }
-    } else {
-        let mut formatter = FrameFormatter::new(&base, &[], format);
-        formatter.write_header(out)?;
-        let mut frame = Vec::new();
-        for s in series {
-            for (row, bar) in s.bars.iter().enumerate() {
-                let values: Vec<Option<f64>> = s.columns.iter().map(|c| c.values[row]).collect();
-                frame.clear();
-                encode_calc_row(bar.time, bar.close, &values, &decimals, &mut frame);
-                formatter.write_frame(out, &frame)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn column_specs(series: &[CalcSeries]) -> (Vec<String>, Vec<u8>) {
-    match series.first() {
-        Some(s) => (
-            s.columns.iter().map(|c| c.name.clone()).collect(),
-            s.columns.iter().map(|c| c.decimals).collect(),
-        ),
-        None => (Vec::new(), Vec::new()),
-    }
-}
-
-fn write_calc_fwob(series: &CalcSeries, dir: &Path) -> Result<()> {
-    let path = dir.join(format!("{}.fwob", series.symbol));
-    let names: Vec<String> = series.columns.iter().map(|c| c.name.clone()).collect();
-    let decimals: Vec<u8> = series.columns.iter().map(|c| c.decimals).collect();
-    let schema = calc_schema(&names, &decimals)?;
-    let mut writer = Writer::create_v2(&path, schema, WriterOptions::new(&series.symbol))
-        .with_context(|| format!("failed to create {}", path.display()))?;
-    let mut buf = Vec::new();
-    for (row, bar) in series.bars.iter().enumerate() {
-        let values: Vec<Option<f64>> = series.columns.iter().map(|c| c.values[row]).collect();
-        encode_calc_row(bar.time, bar.close, &values, &decimals, &mut buf);
-    }
-    writer.append_presorted_frames(&buf)?;
-    writer.finish()?;
-    Ok(())
-}
-
 pub fn guard_symbol_count(include_symbol: bool, count: usize) -> Result<()> {
     if include_symbol && count > MAX_SYMBOLS {
         bail!(
@@ -317,26 +211,6 @@ pub fn guard_symbol_count(include_symbol: bool, count: usize) -> Result<()> {
         );
     }
     Ok(())
-}
-
-fn summary_line(symbol: &str, summary: &CalcSummary, include_symbol: bool) -> String {
-    let method = match summary.method {
-        ReturnMethod::Log => "log",
-        ReturnMethod::Simple => "simple",
-    };
-    let prefix = if include_symbol {
-        format!("# {symbol} summary:")
-    } else {
-        "# summary:".to_string()
-    };
-    let annualized = summary
-        .annualized
-        .map(|v| format!("  annualized={v:.6}"))
-        .unwrap_or_default();
-    format!(
-        "{prefix} method={method}  n={}  mean={:.6}  realized_vol={:.6}{annualized}  min={:.6}  max={:.6}",
-        summary.count, summary.mean, summary.realized_vol, summary.min, summary.max
-    )
 }
 
 // ---- stat (bespoke summary renderer) ------------------------------------------
@@ -559,31 +433,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bar_writer_streams_across_flush_boundary() {
+    fn frame_writer_streams_across_flush_boundary() {
         use crate::analysis::read::read_bars;
+        use crate::analysis::schema::BAR_FRAME_LEN;
 
         // More bars than one flush buffer holds (FLUSH_BYTES / BAR_FRAME_LEN) so at least one
         // mid-stream batch is appended before finish, exercising the incremental path.
-        let count = (BarWriter::FLUSH_BYTES / BAR_FRAME_LEN as usize) + 5_000;
-        let dir = std::env::temp_dir().join(format!("mdfwob-barwriter-{}", std::process::id()));
+        let count = (FrameWriter::FLUSH_BYTES / BAR_FRAME_LEN as usize) + 5_000;
+        let dir = std::env::temp_dir().join(format!("mdfwob-framewriter-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
-        let mut writer = BarWriter::create("TEST", &dir).unwrap();
+        let mut writer = FrameWriter::create(&dir.join("TEST.fwob"), bar_schema(), "TEST").unwrap();
         for i in 0..count {
             let t = 1_704_067_200 + i as u32; // ascending 1s bars
             let price = 100.0 + (i as f64) * 0.0001;
-            writer
-                .push(&Bar {
-                    time: t,
-                    open: price,
-                    high: price,
-                    low: price,
-                    close: price,
-                    volume: 10,
-                    vwap: price,
-                    trades: 1,
-                })
-                .unwrap();
+            let bar = Bar {
+                time: t,
+                open: price,
+                high: price,
+                low: price,
+                close: price,
+                volume: 10,
+                vwap: price,
+                trades: 1,
+            };
+            writer.push(|buf| encode_bar(&bar, buf)).unwrap();
         }
         writer.finish().unwrap();
 

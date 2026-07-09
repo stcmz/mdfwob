@@ -5,6 +5,8 @@
 //! `rsi:N`, `ret:log`, `ret:simple`, `vol:N`. API users can also register arbitrary
 //! closures with [`Calc::with_fn`].
 
+use std::collections::VecDeque;
+
 use anyhow::{Result, bail};
 
 use crate::analysis::config::ReturnMethod;
@@ -346,46 +348,469 @@ where
     }
 }
 
-/// Parses a spec token (`sma:20`, `ret:log`, `vol:20`, ...) into an indicator.
+/// Indicator spec prefixes recognized by [`parse_spec`] and [`parse_streaming_spec`].
+const INDICATOR_KINDS: [&str; 9] = [
+    "sma", "ema", "dema", "vsma", "vema", "vdema", "rsi", "vol", "ret",
+];
+
+/// Splits a spec token into `(kind, arg)` when its prefix is a known indicator, so paths that
+/// contain a colon (e.g. a Windows drive letter `C:\...`) fall through to path tokens.
+fn indicator_spec(token: &str) -> Option<(&str, &str)> {
+    let (kind, arg) = token.split_once(':')?;
+    INDICATOR_KINDS.contains(&kind).then_some((kind, arg))
+}
+
+fn parse_period(kind: &str, arg: &str) -> Result<usize> {
+    let n: usize = arg
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{kind} expects an integer period, got {arg:?}"))?;
+    if n == 0 {
+        bail!("{kind} period must be at least 1");
+    }
+    Ok(n)
+}
+
+fn parse_ret_method(arg: &str) -> Result<ReturnMethod> {
+    ReturnMethod::from_token(arg)
+        .ok_or_else(|| anyhow::anyhow!("ret expects log|simple, got {arg:?}"))
+}
+
+/// Parses a spec token (`sma:20`, `ret:log`, `vol:20`, ...) into a batch [`Indicator`].
 ///
 /// Returns `None` when the token is not spec-shaped (so a classifier can treat
 /// it as a path/format token), `Some(Err)` when it is spec-shaped but invalid.
 pub fn parse_spec(token: &str) -> Option<Result<Box<dyn Indicator>>> {
-    let (kind, arg) = token.split_once(':')?;
-    // Only claim tokens whose prefix is a known indicator, so paths that contain
-    // a colon (e.g. a Windows drive letter `C:\...`) fall through to path tokens.
-    if !matches!(
-        kind,
-        "sma" | "ema" | "dema" | "vsma" | "vema" | "vdema" | "rsi" | "vol" | "ret"
-    ) {
-        return None;
-    }
+    let (kind, arg) = indicator_spec(token)?;
     let result = (|| -> Result<Box<dyn Indicator>> {
-        let period = || -> Result<usize> {
-            let n: usize = arg
-                .parse()
-                .map_err(|_| anyhow::anyhow!("{kind} expects an integer period, got {arg:?}"))?;
-            if n == 0 {
-                bail!("{kind} period must be at least 1");
-            }
-            Ok(n)
-        };
         match kind {
-            "sma" => Ok(Box::new(Sma { period: period()? })),
-            "ema" => Ok(Box::new(Ema { period: period()? })),
-            "dema" => Ok(Box::new(Dema { period: period()? })),
-            "vsma" => Ok(Box::new(VolumeSma { period: period()? })),
-            "vema" => Ok(Box::new(VolumeEma { period: period()? })),
-            "vdema" => Ok(Box::new(VolumeDema { period: period()? })),
-            "rsi" => Ok(Box::new(Rsi { period: period()? })),
-            "vol" => Ok(Box::new(Volatility { period: period()? })),
-            "ret" => {
-                let method = ReturnMethod::from_token(arg)
-                    .ok_or_else(|| anyhow::anyhow!("ret expects log|simple, got {arg:?}"))?;
-                Ok(Box::new(Returns { method }))
-            }
-            _ => bail!("unknown indicator {kind:?}"),
+            "sma" => Ok(Box::new(Sma {
+                period: parse_period(kind, arg)?,
+            })),
+            "ema" => Ok(Box::new(Ema {
+                period: parse_period(kind, arg)?,
+            })),
+            "dema" => Ok(Box::new(Dema {
+                period: parse_period(kind, arg)?,
+            })),
+            "vsma" => Ok(Box::new(VolumeSma {
+                period: parse_period(kind, arg)?,
+            })),
+            "vema" => Ok(Box::new(VolumeEma {
+                period: parse_period(kind, arg)?,
+            })),
+            "vdema" => Ok(Box::new(VolumeDema {
+                period: parse_period(kind, arg)?,
+            })),
+            "rsi" => Ok(Box::new(Rsi {
+                period: parse_period(kind, arg)?,
+            })),
+            "vol" => Ok(Box::new(Volatility {
+                period: parse_period(kind, arg)?,
+            })),
+            "ret" => Ok(Box::new(Returns {
+                method: parse_ret_method(arg)?,
+            })),
+            _ => unreachable!("indicator_spec only yields known kinds"),
         }
+    })();
+    Some(result)
+}
+
+// ---- streaming indicators -----------------------------------------------------
+
+/// Incremental form of a built-in [`Indicator`]: fed one bar at a time, returning that bar's value
+/// (or `None` during warm-up). This lets `calc` render row-by-row without buffering the whole bar
+/// series. Only the built-ins are streamable; custom closures ([`Calc::with_fn`]) stay batch.
+///
+/// Each implementation is byte-for-byte equivalent to its batch [`Indicator::compute`] counterpart
+/// (verified in the tests), so streamed and buffered output are identical.
+pub trait StreamingIndicator {
+    fn name(&self) -> String;
+    fn decimals(&self) -> u8 {
+        4
+    }
+    /// Consumes the next bar, returning its column value (`None` during warm-up).
+    fn update(&mut self, bar: &Bar) -> Option<f64>;
+}
+
+/// Which bar field an incremental moving average reads.
+#[derive(Clone, Copy)]
+enum Source {
+    Close,
+    Volume,
+}
+
+impl Source {
+    fn value(self, bar: &Bar) -> f64 {
+        match self {
+            Source::Close => bar.close,
+            Source::Volume => bar.volume as f64,
+        }
+    }
+}
+
+/// Incremental simple moving average: a ring of the last `period` values plus their running sum,
+/// adding and subtracting in the same order as [`simple_ma`].
+struct RollingSma {
+    period: usize,
+    buf: VecDeque<f64>,
+    sum: f64,
+}
+
+impl RollingSma {
+    fn new(period: usize) -> Self {
+        Self {
+            period,
+            buf: VecDeque::with_capacity(period),
+            sum: 0.0,
+        }
+    }
+
+    fn push(&mut self, value: f64) -> Option<f64> {
+        if self.period == 0 {
+            return None;
+        }
+        self.buf.push_back(value);
+        self.sum += value;
+        if self.buf.len() > self.period {
+            self.sum -= self.buf.pop_front().expect("buffer is non-empty");
+        }
+        (self.buf.len() == self.period).then(|| self.sum / self.period as f64)
+    }
+}
+
+/// Incremental EMA, seeded with the `period`-value SMA at the warm-up boundary exactly like
+/// [`exp_ma`], then advanced by the same recurrence.
+struct OnlineEma {
+    period: usize,
+    alpha: f64,
+    seed_sum: f64,
+    seed_count: usize,
+    ema: Option<f64>,
+}
+
+impl OnlineEma {
+    fn new(period: usize) -> Self {
+        Self {
+            period,
+            alpha: 2.0 / (period as f64 + 1.0),
+            seed_sum: 0.0,
+            seed_count: 0,
+            ema: None,
+        }
+    }
+
+    fn push(&mut self, value: f64) -> Option<f64> {
+        if self.period == 0 {
+            return None;
+        }
+        match self.ema {
+            Some(prev) => {
+                let next = self.alpha * value + (1.0 - self.alpha) * prev;
+                self.ema = Some(next);
+                Some(next)
+            }
+            None => {
+                self.seed_sum += value;
+                self.seed_count += 1;
+                if self.seed_count == self.period {
+                    let seed = self.seed_sum / self.period as f64;
+                    self.ema = Some(seed);
+                    Some(seed)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// Incremental DEMA: `2*EMA - EMA(EMA)`, composing two [`OnlineEma`]s so the outer one consumes the
+/// inner's warmed output stream exactly as [`double_ema`] feeds `e1`'s tail into `e2`.
+struct OnlineDema {
+    inner: OnlineEma,
+    outer: OnlineEma,
+}
+
+impl OnlineDema {
+    fn new(period: usize) -> Self {
+        Self {
+            inner: OnlineEma::new(period),
+            outer: OnlineEma::new(period),
+        }
+    }
+
+    fn push(&mut self, value: f64) -> Option<f64> {
+        let a = self.inner.push(value)?;
+        let b = self.outer.push(a)?;
+        Some(2.0 * a - b)
+    }
+}
+
+/// Incremental Wilder RSI, mirroring [`Rsi::compute`]'s seed-then-smooth recurrence.
+struct OnlineRsi {
+    period: usize,
+    prev_close: Option<f64>,
+    deltas: usize,
+    seed_gain: f64,
+    seed_loss: f64,
+    avg_gain: f64,
+    avg_loss: f64,
+    seeded: bool,
+}
+
+impl OnlineRsi {
+    fn new(period: usize) -> Self {
+        Self {
+            period,
+            prev_close: None,
+            deltas: 0,
+            seed_gain: 0.0,
+            seed_loss: 0.0,
+            avg_gain: 0.0,
+            avg_loss: 0.0,
+            seeded: false,
+        }
+    }
+
+    fn push(&mut self, close: f64) -> Option<f64> {
+        if self.period == 0 {
+            return None;
+        }
+        let Some(prev) = self.prev_close else {
+            self.prev_close = Some(close);
+            return None;
+        };
+        let change = close - prev;
+        self.prev_close = Some(close);
+        self.deltas += 1;
+        let n = self.period as f64;
+        if self.seeded {
+            let (gain, loss) = if change >= 0.0 {
+                (change, 0.0)
+            } else {
+                (0.0, -change)
+            };
+            self.avg_gain = (self.avg_gain * (n - 1.0) + gain) / n;
+            self.avg_loss = (self.avg_loss * (n - 1.0) + loss) / n;
+            Some(rsi_value(self.avg_gain, self.avg_loss))
+        } else {
+            if change >= 0.0 {
+                self.seed_gain += change;
+            } else {
+                self.seed_loss -= change;
+            }
+            if self.deltas == self.period {
+                self.avg_gain = self.seed_gain / n;
+                self.avg_loss = self.seed_loss / n;
+                self.seeded = true;
+                Some(rsi_value(self.avg_gain, self.avg_loss))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Incremental bar-to-bar return.
+struct OnlineReturns {
+    method: ReturnMethod,
+    prev_close: Option<f64>,
+}
+
+impl OnlineReturns {
+    fn new(method: ReturnMethod) -> Self {
+        Self {
+            method,
+            prev_close: None,
+        }
+    }
+
+    fn push(&mut self, close: f64) -> Option<f64> {
+        let out = self
+            .prev_close
+            .map(|prev| one_return(self.method, prev, close));
+        self.prev_close = Some(close);
+        out
+    }
+}
+
+/// Incremental rolling realized volatility: keeps the last `period` log returns and recomputes
+/// [`sample_stdev`] over that window (same two-pass math and ordering as [`Volatility::compute`]).
+struct OnlineVolatility {
+    period: usize,
+    prev_close: Option<f64>,
+    window: VecDeque<f64>,
+}
+
+impl OnlineVolatility {
+    fn new(period: usize) -> Self {
+        Self {
+            period,
+            prev_close: None,
+            window: VecDeque::with_capacity(period),
+        }
+    }
+
+    fn push(&mut self, close: f64) -> Option<f64> {
+        let Some(prev) = self.prev_close else {
+            self.prev_close = Some(close);
+            return None;
+        };
+        let ret = (close / prev).ln();
+        self.prev_close = Some(close);
+        self.window.push_back(ret);
+        if self.window.len() > self.period {
+            self.window.pop_front();
+        }
+        if self.period >= 2 && self.window.len() == self.period {
+            let window: Vec<f64> = self.window.iter().copied().collect();
+            Some(sample_stdev(&window))
+        } else {
+            None
+        }
+    }
+}
+
+/// The engine backing one streaming column.
+enum StreamKind {
+    Sma { source: Source, state: RollingSma },
+    Ema { source: Source, state: OnlineEma },
+    Dema { source: Source, state: OnlineDema },
+    Rsi(OnlineRsi),
+    Ret(OnlineReturns),
+    Vol(OnlineVolatility),
+}
+
+/// A built-in indicator in incremental form, carrying the same name and precision as its batch
+/// counterpart.
+struct BuiltinStream {
+    name: String,
+    decimals: u8,
+    kind: StreamKind,
+}
+
+impl StreamingIndicator for BuiltinStream {
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn decimals(&self) -> u8 {
+        self.decimals
+    }
+
+    fn update(&mut self, bar: &Bar) -> Option<f64> {
+        match &mut self.kind {
+            StreamKind::Sma { source, state } => state.push(source.value(bar)),
+            StreamKind::Ema { source, state } => state.push(source.value(bar)),
+            StreamKind::Dema { source, state } => state.push(source.value(bar)),
+            StreamKind::Rsi(state) => state.push(bar.close),
+            StreamKind::Ret(state) => state.push(bar.close),
+            StreamKind::Vol(state) => state.push(bar.close),
+        }
+    }
+}
+
+/// Parses a spec token into a [`StreamingIndicator`] (the incremental twin of [`parse_spec`]).
+pub fn parse_streaming_spec(token: &str) -> Option<Result<Box<dyn StreamingIndicator>>> {
+    let (kind, arg) = indicator_spec(token)?;
+    let result = (|| -> Result<Box<dyn StreamingIndicator>> {
+        Ok(match kind {
+            "sma" => {
+                let p = parse_period(kind, arg)?;
+                Box::new(BuiltinStream {
+                    name: format!("sma_{p}"),
+                    decimals: 4,
+                    kind: StreamKind::Sma {
+                        source: Source::Close,
+                        state: RollingSma::new(p),
+                    },
+                })
+            }
+            "ema" => {
+                let p = parse_period(kind, arg)?;
+                Box::new(BuiltinStream {
+                    name: format!("ema_{p}"),
+                    decimals: 4,
+                    kind: StreamKind::Ema {
+                        source: Source::Close,
+                        state: OnlineEma::new(p),
+                    },
+                })
+            }
+            "dema" => {
+                let p = parse_period(kind, arg)?;
+                Box::new(BuiltinStream {
+                    name: format!("dema_{p}"),
+                    decimals: 4,
+                    kind: StreamKind::Dema {
+                        source: Source::Close,
+                        state: OnlineDema::new(p),
+                    },
+                })
+            }
+            "vsma" => {
+                let p = parse_period(kind, arg)?;
+                Box::new(BuiltinStream {
+                    name: format!("vsma_{p}"),
+                    decimals: 0,
+                    kind: StreamKind::Sma {
+                        source: Source::Volume,
+                        state: RollingSma::new(p),
+                    },
+                })
+            }
+            "vema" => {
+                let p = parse_period(kind, arg)?;
+                Box::new(BuiltinStream {
+                    name: format!("vema_{p}"),
+                    decimals: 0,
+                    kind: StreamKind::Ema {
+                        source: Source::Volume,
+                        state: OnlineEma::new(p),
+                    },
+                })
+            }
+            "vdema" => {
+                let p = parse_period(kind, arg)?;
+                Box::new(BuiltinStream {
+                    name: format!("vdema_{p}"),
+                    decimals: 0,
+                    kind: StreamKind::Dema {
+                        source: Source::Volume,
+                        state: OnlineDema::new(p),
+                    },
+                })
+            }
+            "rsi" => {
+                let p = parse_period(kind, arg)?;
+                Box::new(BuiltinStream {
+                    name: format!("rsi_{p}"),
+                    decimals: 4,
+                    kind: StreamKind::Rsi(OnlineRsi::new(p)),
+                })
+            }
+            "vol" => {
+                let p = parse_period(kind, arg)?;
+                Box::new(BuiltinStream {
+                    name: format!("vol_{p}"),
+                    decimals: 8,
+                    kind: StreamKind::Vol(OnlineVolatility::new(p)),
+                })
+            }
+            "ret" => {
+                let method = parse_ret_method(arg)?;
+                Box::new(BuiltinStream {
+                    name: match method {
+                        ReturnMethod::Log => "ret_log".into(),
+                        ReturnMethod::Simple => "ret_simple".into(),
+                    },
+                    decimals: 8,
+                    kind: StreamKind::Ret(OnlineReturns::new(method)),
+                })
+            }
+            _ => unreachable!("indicator_spec only yields known kinds"),
+        })
     })();
     Some(result)
 }
@@ -496,9 +921,23 @@ pub fn summarize(
     let returns: Vec<f64> = (1..bars.len())
         .map(|i| one_return(method, bars[i - 1].close, bars[i].close))
         .collect();
+    summary_from_returns(method, &returns, annualize, periods_per_year)
+}
+
+/// Builds a [`CalcSummary`] from an already-computed return series, shared by [`summarize`] and the
+/// streaming [`SummaryAccumulator`] so both produce identical statistics.
+fn summary_from_returns(
+    method: ReturnMethod,
+    returns: &[f64],
+    annualize: bool,
+    periods_per_year: f64,
+) -> Option<CalcSummary> {
+    if returns.is_empty() {
+        return None;
+    }
     let count = returns.len();
     let mean = returns.iter().sum::<f64>() / count as f64;
-    let stdev = sample_stdev(&returns);
+    let stdev = sample_stdev(returns);
     let min = returns.iter().copied().fold(f64::INFINITY, f64::min);
     let max = returns.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let annualized = (annualize && periods_per_year > 0.0).then(|| stdev * periods_per_year.sqrt());
@@ -648,5 +1087,62 @@ mod tests {
         let summary = summarize(&bars, ReturnMethod::Log, true, 252.0).unwrap();
         assert_eq!(summary.count, 3);
         assert!(summary.annualized.is_some());
+    }
+
+    /// A non-trivial price/volume path with trend, reversals, and flats, for equivalence tests.
+    fn synthetic_bars(n: usize) -> Vec<Bar> {
+        (0..n)
+            .map(|i| {
+                let x = i as f64;
+                let c = 100.0 + 10.0 * (x * 0.15).sin() + 0.05 * x - 3.0 * (x * 0.4).cos();
+                Bar {
+                    time: i as u32 * 60,
+                    open: c,
+                    high: c,
+                    low: c,
+                    close: c,
+                    volume: 1000 + (i as i64 * 37) % 500,
+                    vwap: c,
+                    trades: 1,
+                }
+            })
+            .collect()
+    }
+
+    /// Every streaming indicator must be byte-for-byte identical to its batch counterpart, so
+    /// row-by-row `calc` output matches the buffered path exactly.
+    #[test]
+    fn streaming_matches_batch() {
+        let bars = synthetic_bars(200);
+        let specs = [
+            "sma:5",
+            "ema:5",
+            "dema:4",
+            "vsma:3",
+            "vema:3",
+            "vdema:3",
+            "rsi:14",
+            "vol:10",
+            "ret:log",
+            "ret:simple",
+        ];
+        for spec in specs {
+            let batch = parse_spec(spec).unwrap().unwrap();
+            let mut stream = parse_streaming_spec(spec).unwrap().unwrap();
+            assert_eq!(batch.name(), stream.name(), "{spec}: name");
+            assert_eq!(batch.decimals(), stream.decimals(), "{spec}: decimals");
+            let batch_values = batch.compute(&bars);
+            let online: Vec<Option<f64>> = bars.iter().map(|b| stream.update(b)).collect();
+            assert_eq!(batch_values.len(), online.len(), "{spec}: length");
+            for (i, (b, o)) in batch_values.iter().zip(&online).enumerate() {
+                match (b, o) {
+                    (None, None) => {}
+                    (Some(b), Some(o)) => {
+                        assert_eq!(b.to_bits(), o.to_bits(), "{spec}[{i}]: {b} vs {o}")
+                    }
+                    _ => panic!("{spec}[{i}]: warm-up mismatch {b:?} vs {o:?}"),
+                }
+            }
+        }
     }
 }

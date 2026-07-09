@@ -99,7 +99,6 @@ impl ReturnMethod {
 #[serde(default, deny_unknown_fields)]
 pub struct CalcDefaults {
     pub interval: Option<String>,
-    pub method: ReturnMethod,
     pub fill: bool,
     pub annualize: bool,
     pub periods_per_year: f64,
@@ -109,7 +108,6 @@ impl Default for CalcDefaults {
     fn default() -> Self {
         Self {
             interval: None,
-            method: ReturnMethod::Log,
             fill: false,
             annualize: false,
             periods_per_year: 252.0,
@@ -126,7 +124,6 @@ mod tests {
         let config = AnalysisConfig::default();
         assert!(config.session(true).is_ok());
         assert!(config.session(false).is_ok());
-        assert_eq!(config.calc.method, ReturnMethod::Log);
         assert_eq!(config.calc.periods_per_year, 252.0);
     }
 

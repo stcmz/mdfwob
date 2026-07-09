@@ -3,29 +3,28 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
+use fwob::formatting::FrameFormat;
 use fwob::{FormatVersion, detect_format};
 
 use std::collections::BTreeMap;
 
 use crate::{
     analysis::{
-        calc::{Calc, parse_spec, summarize},
-        config::{AnalysisConfig, DEFAULT_EXTENDED_HOURS, DEFAULT_RTH_HOURS, ReturnMethod},
+        calc::{StreamingIndicator, parse_spec, parse_streaming_spec},
+        config::{AnalysisConfig, DEFAULT_EXTENDED_HOURS, DEFAULT_RTH_HOURS},
         interval::{Granularity, Interval},
         model::Bar,
-        output::{
-            AnalysisFormat, BarStream, BarWriter, CalcSeries, guard_symbol_count, write_calc,
-            write_stat,
-        },
+        output::{AnalysisFormat, FrameStream, FrameWriter, guard_symbol_count, write_stat},
         plot::{Canvas, PlotOptions, Series, render},
         read::{
             InputKind, TickQuery, discover_inputs, file_symbol, input_kind, open_tick_reader,
             stream_bars_file, stream_ticks,
         },
         resample::{BarClock, BarResampler, ForwardFiller, Resampler},
-        schema::{bar_schema, with_symbol_column},
+        schema::{bar_schema, calc_schema, encode_bar, encode_calc_row, with_symbol_column},
         session::Session,
         stat::StatAccumulator,
+        summary::{SummaryCollector, SummaryColumn},
     },
     config::{Config, StockContractConfig},
     downloader::{DownloadPlan, Downloader, parse_epoch_seconds},
@@ -512,9 +511,10 @@ impl BarsArgs {
                 // whole tick history (e.g. 1s over billions of ticks) keeps bounded memory instead
                 // of buffering the entire bar series first.
                 for (symbol, paths) in &by_symbol {
-                    let mut writer = BarWriter::create(symbol, dir)?;
+                    let path = dir.join(format!("{symbol}.fwob"));
+                    let mut writer = FrameWriter::create(&path, bar_schema(), symbol)?;
                     stream_bars(paths, interval, &clock, &query, fill, |bar| {
-                        writer.push(&bar)
+                        writer.push(|buf| encode_bar(&bar, buf))
                     })?;
                     writer.finish()?;
                 }
@@ -535,10 +535,10 @@ impl BarsArgs {
                 // On an interactive terminal flush each row so bars appear as their buckets close;
                 // when redirected, stay buffered for throughput.
                 let autoflush = std::io::stdout().is_terminal();
-                let mut stream = BarStream::new(&schema, strings, frame, autoflush, &mut out)?;
+                let mut stream = FrameStream::new(&schema, strings, frame, autoflush, &mut out)?;
                 for (index, (_symbol, paths)) in by_symbol.iter().enumerate() {
                     stream_bars(paths, interval, &clock, &query, fill, |bar| {
-                        stream.emit(index, &bar)
+                        stream.emit(index, |buf| encode_bar(&bar, buf))
                     })?;
                 }
             }
@@ -902,13 +902,11 @@ struct CalcArgs {
     tz: Option<String>,
     #[arg(long)]
     output: Option<PathBuf>,
-    /// Return method for the --summary scalars (log|simple). Default log.
-    #[arg(long)]
-    method: Option<String>,
-    /// Print a whole-series return/volatility summary footer.
+    /// Print a per-column summary footer as colored TOML. A `ret:log`/`ret:simple` column is
+    /// summarized as a fitted normal (mean, stdev, skew, excess kurtosis, quartiles, Jarque-Bera).
     #[arg(long)]
     summary: bool,
-    /// Annualize the summary realized volatility.
+    /// Annualize the summary's return volatility (needs a `ret:log`/`ret:simple` column).
     #[arg(long)]
     annualize: bool,
     /// Annualization factor for --annualize (sqrt scaling). Default 252.
@@ -939,11 +937,6 @@ impl CalcArgs {
         // Like `bars`/`plot`, default to 1d when neither a token nor a config value is given; tick
         // and bar inputs alike resample/re-resample to it.
         let interval = resolve_interval(interval_token, acfg.calc.interval.as_deref())?;
-        let method = match self.method.as_deref() {
-            Some(token) => ReturnMethod::from_token(token)
-                .ok_or_else(|| anyhow::anyhow!("--method must be log or simple"))?,
-            None => acfg.calc.method,
-        };
         let annualize = self.annualize || acfg.calc.annualize;
         let periods_per_year = self.periods_per_year.unwrap_or(acfg.calc.periods_per_year);
         let fill = fill || acfg.calc.fill;
@@ -955,72 +948,133 @@ impl CalcArgs {
         let end = self.end.clone().or(range_end);
         let (start, end) = parse_bounds(start.as_deref(), end.as_deref(), &session.time_zone())?;
         let files = resolve_files(&paths, &acfg)?;
+        let query = TickQuery {
+            start,
+            end,
+            session: filter.clone(),
+        };
 
-        let mut groups: BTreeMap<String, Vec<Bar>> = BTreeMap::new();
+        // Group input files by the symbol they report (header only), preserving discovery order so a
+        // symbol's files feed one resampler as a single ascending stream (mirrors `bars`). Each
+        // symbol is then processed and emitted on its own, so rows appear as their bars close and
+        // only one symbol's state is live at a time.
+        let mut by_symbol: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
         for path in &files {
-            let result = (|| -> Result<(String, Vec<Bar>)> {
-                // Tick and bar files both stream through the resampler at `interval` (bars are
-                // re-resampled, e.g. 1s→1m), honoring the time-range/session window.
-                let symbol = file_symbol(path)?;
-                let query = TickQuery {
-                    start,
-                    end,
-                    session: filter.clone(),
-                };
-                let mut bars = Vec::new();
-                stream_bars(
-                    std::slice::from_ref(path),
-                    interval,
-                    &clock,
-                    &query,
-                    fill,
-                    |bar| {
-                        bars.push(bar);
-                        Ok(())
-                    },
-                )?;
-                Ok((symbol, bars))
-            })();
-            match result {
-                Ok((symbol, mut bars)) => groups.entry(symbol).or_default().append(&mut bars),
+            match file_symbol(path) {
+                Ok(symbol) => by_symbol.entry(symbol).or_default().push(path.clone()),
                 Err(error) => {
-                    tracing::error!(path = %path.display(), error = %format!("{error:#}"), "failed to read");
+                    tracing::error!(path = %path.display(), error = %format!("{error:#}"), "failed to read")
                 }
             }
         }
 
-        let mut series = Vec::new();
-        for (symbol, mut bars) in groups {
-            bars.sort_by_key(|bar| bar.time);
-            let columns = {
-                let mut calc = Calc::new(&bars);
-                for spec in &spec_tokens {
-                    let indicator =
-                        parse_spec(spec).expect("spec token validated during parsing")?;
-                    calc = calc.with_boxed(indicator);
-                }
-                calc.run().columns
-            };
-            let summary = if self.summary {
-                summarize(&bars, method, annualize, periods_per_year)
-            } else {
-                None
-            };
-            series.push(CalcSeries {
-                symbol,
-                bars,
-                columns,
-                summary,
-            });
-        }
+        // Column names and precisions are identical across symbols (same specs), so derive the
+        // shared schema once; the stateful streaming indicators are re-created per symbol.
+        let meta = build_streaming_indicators(&spec_tokens)?;
+        let names: Vec<String> = meta.iter().map(|i| i.name()).collect();
+        let decimals: Vec<u8> = meta.iter().map(|i| i.decimals()).collect();
+        drop(meta);
 
         let out_dir = self.output.clone().or_else(|| acfg.output_dir.clone());
-        let stdout = std::io::stdout();
-        let mut out = std::io::BufWriter::new(stdout.lock());
-        write_calc(&series, format, out_dir.as_deref(), &mut out)?;
-        out.flush()?;
+        match format {
+            AnalysisFormat::Fwob => {
+                let dir = out_dir
+                    .as_deref()
+                    .context("calc --format fwob requires --output DIR")?;
+                std::fs::create_dir_all(dir)
+                    .with_context(|| format!("failed to create {}", dir.display()))?;
+                for (symbol, paths) in &by_symbol {
+                    let mut indicators = build_streaming_indicators(&spec_tokens)?;
+                    let path = dir.join(format!("{symbol}.fwob"));
+                    let mut writer =
+                        FrameWriter::create(&path, calc_schema(&names, &decimals)?, symbol)?;
+                    stream_bars(paths, interval, &clock, &query, fill, |bar| {
+                        let values: Vec<Option<f64>> =
+                            indicators.iter_mut().map(|i| i.update(&bar)).collect();
+                        writer.push(|buf| {
+                            encode_calc_row(bar.time, bar.close, &values, &decimals, buf)
+                        })
+                    })?;
+                    writer.finish()?;
+                }
+            }
+            AnalysisFormat::Frame(frame) => {
+                let include_symbol = by_symbol.len() > 1;
+                guard_symbol_count(include_symbol, by_symbol.len())?;
+                let base = calc_schema(&names, &decimals)?;
+                let schema = if include_symbol {
+                    with_symbol_column(&base)
+                } else {
+                    base
+                };
+                let symbols: Vec<String> = by_symbol.keys().cloned().collect();
+                let strings: &[String] = if include_symbol { &symbols } else { &[] };
+                let stdout = std::io::stdout();
+                let mut out = std::io::BufWriter::new(stdout.lock());
+                // On an interactive terminal flush each row so it appears the moment its bar closes;
+                // when redirected, stay buffered for throughput.
+                let autoflush = std::io::stdout().is_terminal();
+                // The summary footer is a colored-TOML block (table/markdown only); color it only on
+                // a terminal, honoring NO_COLOR — the same rule `fwob inspect` uses.
+                let show_summary =
+                    self.summary && matches!(frame, FrameFormat::Table | FrameFormat::Markdown);
+                let color =
+                    std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+                let summary_columns: Vec<SummaryColumn> = names
+                    .iter()
+                    .zip(&decimals)
+                    .map(|(name, decimals)| SummaryColumn {
+                        name: name.clone(),
+                        decimals: *decimals,
+                    })
+                    .collect();
+                let mut collectors: Vec<(String, SummaryCollector)> = Vec::new();
+                {
+                    let mut stream =
+                        FrameStream::new(&schema, strings, frame, autoflush, &mut out)?;
+                    for (index, (symbol, paths)) in by_symbol.iter().enumerate() {
+                        let mut indicators = build_streaming_indicators(&spec_tokens)?;
+                        let mut collector =
+                            show_summary.then(|| SummaryCollector::new(&summary_columns));
+                        stream_bars(paths, interval, &clock, &query, fill, |bar| {
+                            let values: Vec<Option<f64>> =
+                                indicators.iter_mut().map(|i| i.update(&bar)).collect();
+                            stream.emit(index, |buf| {
+                                encode_calc_row(bar.time, bar.close, &values, &decimals, buf)
+                            })?;
+                            if let Some(collector) = collector.as_mut() {
+                                collector.push_row(&values);
+                            }
+                            Ok(())
+                        })?;
+                        if let Some(collector) = collector {
+                            collectors.push((symbol.clone(), collector));
+                        }
+                    }
+                }
+                // Colored-TOML summary footers after all rows, one `[summary]` block per symbol.
+                for (symbol, collector) in &collectors {
+                    let base = if include_symbol {
+                        format!("{symbol}.summary")
+                    } else {
+                        "summary".to_string()
+                    };
+                    writeln!(out)?;
+                    collector.render(&mut out, color, &base, annualize, periods_per_year)?;
+                }
+                out.flush()?;
+            }
+        }
         Ok(())
     }
+}
+
+/// Builds a fresh set of stateful [`StreamingIndicator`]s from validated spec tokens.
+fn build_streaming_indicators(specs: &[String]) -> Result<Vec<Box<dyn StreamingIndicator>>> {
+    specs
+        .iter()
+        .map(|spec| parse_streaming_spec(spec).expect("spec token validated during parsing"))
+        .collect()
 }
 
 // ---- analysis CLI helpers ----------------------------------------------------

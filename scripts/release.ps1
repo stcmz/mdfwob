@@ -88,6 +88,20 @@ $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
     $utf8NoBom
 )
 
+# Keep the mdfwob -> mdfwob-core path dependency's version requirement in lockstep with the release
+# (the members inherit the workspace version, but this internal requirement is a separate literal).
+$corePath = "crates/mdfwob/Cargo.toml"
+$coreManifest = Get-Content $corePath -Raw
+$updatedCore = [regex]::Replace(
+    $coreManifest,
+    '(mdfwob-core = \{ version = ")\d+\.\d+\.\d+(")',
+    "`${1}$newVersion`${2}"
+)
+if ($updatedCore -eq $coreManifest) {
+    throw "Could not update the mdfwob-core dependency version in $corePath."
+}
+[System.IO.File]::WriteAllText((Resolve-Path $corePath), $updatedCore, $utf8NoBom)
+
 cargo update --workspace
 Assert-NativeSuccess "Updating Cargo.lock"
 cargo fmt --all --check
@@ -99,7 +113,7 @@ Assert-NativeSuccess "Running tests"
 cargo build --release --locked
 Assert-NativeSuccess "Building the release binary"
 
-git add Cargo.toml Cargo.lock
+git add Cargo.toml Cargo.lock crates/mdfwob/Cargo.toml
 Assert-NativeSuccess "Staging the version update"
 git commit -m "Release $newVersion"
 Assert-NativeSuccess "Committing the version update"

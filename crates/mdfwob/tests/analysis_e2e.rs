@@ -179,7 +179,13 @@ fn cli_stat_bars_calc_run() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("sma_2"));
     assert!(stdout.contains("ret_log"));
-    assert!(stdout.contains("# summary:"));
+    // The summary footer is a colored-TOML block (plain here since stdout is piped): a `[summary]`
+    // table, a `[summary.ret_log]` fitted-normal block (driven by the ret:log column), and a
+    // per-indicator `[summary.sma_2]` block.
+    assert!(stdout.contains("[summary]"), "{stdout}");
+    assert!(stdout.contains("[summary.ret_log]"), "{stdout}");
+    assert!(stdout.contains("skew = "), "{stdout}");
+    assert!(stdout.contains("[summary.sma_2]"), "{stdout}");
 
     // calc with NO interval token defaults to 1d (like bars/plot) instead of erroring on a tick
     // file. The 20-minute tick span collapses into a single 1d bar.
