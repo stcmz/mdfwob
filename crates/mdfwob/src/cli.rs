@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use fwob::formatting::FrameFormat;
-use fwob::{FormatVersion, detect_format};
+use fwob::toml::TomlWriter;
+use fwob::{FormatVersion, Reader};
+use fwob_core::Key;
 
 use std::collections::BTreeMap;
 
@@ -12,18 +14,27 @@ use crate::{
     analysis::{
         calc::{StreamingIndicator, parse_spec, parse_streaming_spec},
         config::{AnalysisConfig, DEFAULT_EXTENDED_HOURS, DEFAULT_RTH_HOURS},
+        inspect::{
+            classify_hours, detect_bar_granularity, field_semantic_label, field_type_label,
+            preview_bars, preview_ticks,
+        },
         interval::{Granularity, Interval},
         model::Bar,
-        output::{AnalysisFormat, FrameStream, FrameWriter, guard_symbol_count, write_stat},
+        output::{
+            AnalysisFormat, FrameStream, FrameWriter, format_epoch_tz, guard_symbol_count,
+            write_stat,
+        },
         plot::{Canvas, PlotOptions, Series, render},
         read::{
-            InputKind, TickQuery, discover_inputs, file_symbol, input_kind, open_tick_reader,
-            stream_bars_file, stream_ticks,
+            InputKind, TickQuery, decode_tick, detect_kind, discover_inputs, file_symbol,
+            input_kind, open_tick_reader, stream_bars_file, stream_ticks,
         },
         resample::{BarClock, BarResampler, ForwardFiller, Resampler},
-        schema::{bar_schema, calc_schema, encode_bar, encode_calc_row, with_symbol_column},
+        schema::{
+            bar_schema, calc_schema, decode_bar, encode_bar, encode_calc_row, with_symbol_column,
+        },
         session::Session,
-        stat::StatAccumulator,
+        stat::stat_file,
         summary::{SummaryCollector, SummaryColumn},
     },
     config::{Config, StockContractConfig},
@@ -44,6 +55,7 @@ impl Cli {
     pub fn run(self) -> Result<()> {
         match self.command {
             Command::Download(args) => args.run(),
+            Command::Inspect(args) => args.run(),
             Command::Verify(args) => args.run(),
             Command::Stat(args) => args.run(),
             Command::Bars(args) => args.run(),
@@ -57,7 +69,9 @@ impl Cli {
 enum Command {
     /// Download configured or ad hoc historical market data.
     Download(DownloadArgs),
-    /// Fully verify a FWOB v1 or v2 output file.
+    /// Quick metadata overview of a tick or bar file (colored, tz-aware TOML; no full scan).
+    Inspect(InspectArgs),
+    /// Verify a tick or bar file's integrity and schema, with a scanned market summary.
     Verify(VerifyArgs),
     /// Summarize tick or bar files: one row per file with price/volume stats.
     Stat(StatArgs),
@@ -299,16 +313,218 @@ fn split_config_target(items: Vec<String>) -> Result<(Option<PathBuf>, Vec<Strin
     Ok((None, items))
 }
 
+/// Whether colored TOML should be emitted: a terminal, and `NO_COLOR` unset (matching `fwob`).
+fn color_enabled() -> bool {
+    std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+}
+
+fn kind_label(kind: InputKind) -> &'static str {
+    match kind {
+        InputKind::Tick => "tick",
+        InputKind::Bar => "bar",
+    }
+}
+
+/// Extracts the `time` epoch second from a boundary [`Key`] (the tick/bar key is a `u32` second).
+fn key_epoch(key: Key) -> Option<u32> {
+    match key {
+        Key::U32(value) => Some(value),
+        Key::I64(value) => u32::try_from(value).ok(),
+        _ => None,
+    }
+}
+
+/// Number of leading frames sampled by `inspect` for granularity/hours detection and the preview.
+const INSPECT_SAMPLE: u64 = 1_024;
+/// Rows shown in the `inspect` frame preview.
+const PREVIEW_ROWS: usize = 10;
+
+#[derive(Debug, Args)]
+struct InspectArgs {
+    /// A tick or bar FILE.fwob.
+    path: PathBuf,
+    /// Override the session window (HH:MM-HH:MM) used to classify regular vs extended hours.
+    #[arg(long)]
+    session: Option<String>,
+    /// Timezone (IANA name) for rendered timestamps and hours classification. Default
+    /// America/New_York.
+    #[arg(long)]
+    tz: Option<String>,
+}
+
+impl InspectArgs {
+    fn run(self) -> Result<()> {
+        let acfg = AnalysisConfig::default();
+        let display = resolve_session(&acfg, false, self.session.as_deref(), self.tz.as_deref())?;
+        let rth = resolve_session(&acfg, true, self.session.as_deref(), self.tz.as_deref())?;
+        let tz = display.time_zone();
+
+        let mut reader = Reader::open(&self.path)
+            .with_context(|| format!("failed to open {}", self.path.display()))?;
+        let kind = detect_kind(&reader)
+            .with_context(|| format!("failed to inspect {}", self.path.display()))?;
+        let format = match reader.format_version() {
+            FormatVersion::V1 => "fwob-v1",
+            FormatVersion::V2 => "fwob-v2",
+        };
+        let title = reader.title().to_string();
+        let schema = reader.schema().clone();
+        let frame_count = reader.frame_count();
+        let physical_bytes = std::fs::metadata(&self.path)
+            .with_context(|| format!("failed to stat {}", self.path.display()))?
+            .len();
+
+        let first = reader.first_key()?.and_then(key_epoch);
+        let last = reader.last_key()?.and_then(key_epoch);
+
+        // Bounded leading sample for granularity/hours/preview — never a full scan.
+        let sample_n = frame_count.min(INSPECT_SAMPLE);
+        let mut times: Vec<u32> = Vec::new();
+        let mut ticks: Vec<crate::analysis::model::Tick> = Vec::new();
+        let mut bars: Vec<Bar> = Vec::new();
+        for frame in reader.frames(0..sample_n)? {
+            let frame = frame?;
+            match kind {
+                InputKind::Tick => {
+                    let tick = decode_tick(frame.bytes());
+                    times.push(tick.time);
+                    ticks.push(tick);
+                }
+                InputKind::Bar => {
+                    let bar = decode_bar(frame.bytes())?;
+                    times.push(bar.time);
+                    bars.push(bar);
+                }
+            }
+        }
+
+        let stdout = std::io::stdout();
+        let mut out = std::io::BufWriter::new(stdout.lock());
+        let mut w = TomlWriter::new(&mut out, color_enabled());
+
+        w.section("file")?;
+        w.kv_str("format", format)?;
+        w.kv_str("title", &title)?;
+        w.kv_str("kind", kind_label(kind))?;
+        w.kv_str("frame_type", &schema.frame_type)?;
+        w.kv_num("key_field_index", schema.key_field_index)?;
+
+        w.blank()?;
+        w.section("storage")?;
+        w.kv_num("physical_bytes", physical_bytes)?;
+        w.kv_num("frame_count", frame_count)?;
+
+        w.blank()?;
+        w.section("range")?;
+        w.kv_str("timezone", tz.iana_name().unwrap_or("UTC"))?;
+        if let Some(first) = first {
+            w.kv_str("first", &format_epoch_tz(first, &tz))?;
+        }
+        if let Some(last) = last {
+            w.kv_str("last", &format_epoch_tz(last, &tz))?;
+        }
+        if kind == InputKind::Bar
+            && let Some(granularity) = detect_bar_granularity(&times)
+        {
+            w.kv_str("granularity", &granularity)?;
+        }
+        if !times.is_empty() {
+            w.kv_str("hours", classify_hours(&times, &rth))?;
+        }
+
+        w.blank()?;
+        w.section("schema")?;
+        w.kv_num("field_count", schema.fields.len())?;
+        for field in &schema.fields {
+            w.blank()?;
+            w.array_section("schema.fields")?;
+            w.kv_str("name", &field.name)?;
+            w.kv_str("type", field_type_label(field.field_type))?;
+            w.kv_num("length", field.length)?;
+            w.kv_num("offset", field.offset)?;
+            if field.semantic != fwob_core::FieldSemantic::None {
+                w.kv_str("semantic", &field_semantic_label(field.semantic))?;
+            }
+        }
+
+        let preview = match kind {
+            InputKind::Tick => preview_ticks(&ticks, &tz, PREVIEW_ROWS),
+            InputKind::Bar => preview_bars(&bars, &tz, PREVIEW_ROWS),
+        };
+        if !preview.is_empty() {
+            w.blank()?;
+            w.section("frames")?;
+            w.kv_multiline("preview", &preview)?;
+        }
+        out.flush()?;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Args)]
 struct VerifyArgs {
+    /// A tick or bar FILE.fwob.
     path: PathBuf,
+    /// Override the session window (HH:MM-HH:MM); only affects the timezone of rendered timestamps.
+    #[arg(long)]
+    session: Option<String>,
+    /// Timezone (IANA name) for rendered timestamps. Default America/New_York.
+    #[arg(long)]
+    tz: Option<String>,
 }
 
 impl VerifyArgs {
     fn run(self) -> Result<()> {
-        fwob::Maintenance::verify(&self.path, fwob::ReaderOptions::default())
+        let acfg = AnalysisConfig::default();
+        let tz =
+            resolve_session(&acfg, false, self.session.as_deref(), self.tz.as_deref())?.time_zone();
+
+        // Structural integrity: walk every page/frame (header, ordering, string table).
+        let report = fwob::Maintenance::verify(&self.path, fwob::ReaderOptions::default())
             .with_context(|| format!("failed to verify {}", self.path.display()))?;
-        println!("verified {}", self.path.display());
+        // Identity: confirm it is a canonical Tick/Bar file matching our structs.
+        let reader = Reader::open(&self.path)
+            .with_context(|| format!("failed to open {}", self.path.display()))?;
+        let kind = detect_kind(&reader)
+            .with_context(|| format!("failed to verify {}", self.path.display()))?;
+        let title = reader.title().to_string();
+        drop(reader);
+        // Decoded market summary (the scan reads every frame's fields).
+        let row = stat_file(&self.path, &TickQuery::default())?;
+
+        let stdout = std::io::stdout();
+        let mut out = std::io::BufWriter::new(stdout.lock());
+        let mut w = TomlWriter::new(&mut out, color_enabled());
+
+        w.section("verify")?;
+        w.kv_str("status", "ok")?;
+        w.kv_str("title", &title)?;
+        w.kv_str("kind", kind_label(kind))?;
+        w.kv_num("frame_count", report.frame_count)?;
+        w.kv_num("string_count", report.string_count)?;
+        w.kv_num("file_length", report.file_length)?;
+
+        w.blank()?;
+        w.section("data")?;
+        w.kv_str("timezone", tz.iana_name().unwrap_or("UTC"))?;
+        if let Some(first) = row.first {
+            w.kv_str("first", &format_epoch_tz(first, &tz))?;
+        }
+        if let Some(last) = row.last {
+            w.kv_str("last", &format_epoch_tz(last, &tz))?;
+        }
+        w.kv_num("trades", row.trades)?;
+        if row.min.is_finite() {
+            w.kv_float("min", row.min, 4)?;
+        }
+        if row.max.is_finite() {
+            w.kv_float("max", row.max, 4)?;
+        }
+        if row.vwap.is_finite() {
+            w.kv_float("vwap", row.vwap, 4)?;
+        }
+        w.kv_num("volume", row.volume)?;
+        out.flush()?;
         Ok(())
     }
 }
@@ -375,28 +591,7 @@ impl StatArgs {
         let mut rows = Vec::new();
         let mut failures = 0u32;
         for path in &files {
-            let result = (|| -> Result<_> {
-                let format_label = format_label(path)?;
-                let mut acc = StatAccumulator::new();
-                match input_kind(path)? {
-                    InputKind::Tick => {
-                        let (mut reader, symbol) = open_tick_reader(path)?;
-                        stream_ticks(&mut reader, &query, |tick| {
-                            acc.push_tick(&tick);
-                            Ok(())
-                        })?;
-                        Ok(acc.finish(symbol, "tick", format_label))
-                    }
-                    InputKind::Bar => {
-                        let symbol = stream_bars_file(path, &query, |bar| {
-                            acc.push_bar(&bar);
-                            Ok(())
-                        })?;
-                        Ok(acc.finish(symbol, "bar", format_label))
-                    }
-                }
-            })();
-            match result {
+            match stat_file(path, &query) {
                 Ok(row) => rows.push(row),
                 Err(error) => {
                     failures += 1;
@@ -1360,13 +1555,6 @@ fn parse_range_token(token: &str) -> Option<(Option<String>, Option<String>)> {
         (!lhs.is_empty()).then(|| lhs.to_owned()),
         (!rhs.is_empty()).then(|| rhs.to_owned()),
     ))
-}
-
-fn format_label(path: &Path) -> Result<String> {
-    Ok(match detect_format(path)? {
-        FormatVersion::V1 => "fwob-v1".to_owned(),
-        FormatVersion::V2 => "fwob-v2".to_owned(),
-    })
 }
 
 fn analysis_output_dir(acfg: &AnalysisConfig) -> PathBuf {

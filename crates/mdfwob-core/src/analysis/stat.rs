@@ -1,6 +1,14 @@
 //! Per-file summary statistics, computed identically from tick or bar inputs.
 
+use std::path::Path;
+
+use anyhow::Result;
+use fwob::{FormatVersion, detect_format};
+
 use crate::analysis::model::{Bar, Tick};
+use crate::analysis::read::{
+    InputKind, TickQuery, input_kind, open_tick_reader, stream_bars_file, stream_ticks,
+};
 
 /// One summary row for a tick or bar file.
 ///
@@ -124,6 +132,39 @@ pub fn compute_stat(symbol: String, format: String, ticks: &[Tick]) -> StatRow {
         acc.push_tick(tick);
     }
     acc.finish(symbol, "tick", format)
+}
+
+/// The `fwob-v1`/`fwob-v2` label for a file's storage format.
+pub fn format_label(path: &Path) -> Result<String> {
+    Ok(match detect_format(path)? {
+        FormatVersion::V1 => "fwob-v1".to_owned(),
+        FormatVersion::V2 => "fwob-v2".to_owned(),
+    })
+}
+
+/// Scans one tick or bar file end-to-end (honoring `query`'s window/session filter) into a
+/// [`StatRow`]. Validates the file is a canonical Tick/Bar file via [`input_kind`], then streams
+/// every frame through a [`StatAccumulator`]. Shared by the `stat` command and `verify`'s `[data]`.
+pub fn stat_file(path: &Path, query: &TickQuery) -> Result<StatRow> {
+    let format = format_label(path)?;
+    let mut acc = StatAccumulator::new();
+    match input_kind(path)? {
+        InputKind::Tick => {
+            let (mut reader, symbol) = open_tick_reader(path)?;
+            stream_ticks(&mut reader, query, |tick| {
+                acc.push_tick(&tick);
+                Ok(())
+            })?;
+            Ok(acc.finish(symbol, "tick", format))
+        }
+        InputKind::Bar => {
+            let symbol = stream_bars_file(path, query, |bar| {
+                acc.push_bar(&bar);
+                Ok(())
+            })?;
+            Ok(acc.finish(symbol, "bar", format))
+        }
+    }
 }
 
 #[cfg(test)]

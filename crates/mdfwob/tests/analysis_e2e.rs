@@ -282,3 +282,128 @@ fn cli_plot_accepts_tick_and_bar_files() {
 
     let _ = fs::remove_dir_all(dir);
 }
+
+#[test]
+fn cli_inspect_and_verify() {
+    let dir = temp_dir("inspectverify");
+    let tick = write_tick_file(&dir); // AAPL: 20 one-minute ticks, 09:30..09:49 ET (all RTH)
+    let tick_str = tick.to_str().unwrap();
+    let exe = env!("CARGO_BIN_EXE_mdfwob");
+
+    // inspect (piped => plain, valid TOML). Timestamps honor the exchange tz (winter ET = -05:00).
+    let out = Command::new(exe)
+        .args(["inspect", tick_str])
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "inspect failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("[file]"), "{s}");
+    assert!(s.contains("kind = \"tick\""), "{s}");
+    assert!(s.contains("frame_type = \"Tick\""), "{s}");
+    assert!(s.contains("[range]"), "{s}");
+    assert!(s.contains("timezone = \"America/New_York\""), "{s}");
+    assert!(s.contains("-05:00"), "expected tz offset, not UTC: {s}");
+    assert!(s.contains("hours = \"rth\""), "{s}");
+    assert!(s.contains("[schema]"), "{s}");
+    assert!(s.contains("[frames]"), "{s}");
+    // Pruned storage-layer sections must be absent.
+    assert!(!s.contains("[compression]"), "{s}");
+    assert!(!s.contains("[pages]"), "{s}");
+    // A tick file has no bar granularity.
+    assert!(!s.contains("granularity"), "{s}");
+
+    // --tz UTC renders +00:00 offsets.
+    let out = Command::new(exe)
+        .args(["inspect", "--tz", "UTC", tick_str])
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("timezone = \"UTC\""), "{s}");
+    assert!(s.contains("+00:00"), "{s}");
+
+    // verify: structural + identity + a scanned [data] block.
+    let out = Command::new(exe)
+        .args(["verify", tick_str])
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "verify failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("[verify]"), "{s}");
+    assert!(s.contains("status = \"ok\""), "{s}");
+    assert!(s.contains("kind = \"tick\""), "{s}");
+    assert!(s.contains("frame_count = 20"), "{s}");
+    assert!(s.contains("[data]"), "{s}");
+    assert!(s.contains("trades = 20"), "{s}");
+    assert!(s.contains("min = 185.0000"), "{s}");
+    assert!(s.contains("vwap = "), "{s}");
+
+    // Produce a bar file and inspect it → kind = bar, with a detected 5m granularity.
+    let bar_dir = dir.join("bars");
+    let out = Command::new(exe)
+        .args([
+            "bars",
+            tick_str,
+            "5m",
+            "fwob",
+            "--output",
+            bar_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "bars fwob failed");
+    let bar_file = bar_dir.join("AAPL.fwob");
+    let out = Command::new(exe)
+        .args(["inspect", bar_file.to_str().unwrap()])
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("kind = \"bar\""), "{s}");
+    assert!(s.contains("granularity = \"5m\""), "{s}");
+
+    // Strict: a Calc-schema file (not Tick/Bar) is rejected by both commands.
+    let calc_dir = dir.join("calc");
+    let out = Command::new(exe)
+        .args([
+            "calc",
+            bar_file.to_str().unwrap(),
+            "sma:2",
+            "fwob",
+            "--output",
+            calc_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "calc fwob failed");
+    let calc_file = calc_dir.join("AAPL.fwob");
+    let cf = calc_file.to_str().unwrap();
+    for cmd in ["inspect", "verify"] {
+        let out = Command::new(exe)
+            .args([cmd, cf])
+            .env("NO_COLOR", "1")
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{cmd} should reject a Calc file");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(combined.contains("Calc"), "{cmd} output: {combined}");
+    }
+
+    let _ = fs::remove_dir_all(dir);
+}

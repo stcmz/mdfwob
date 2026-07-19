@@ -66,7 +66,11 @@ a full scan explicitly:
 mdfwob verify AAPL.fwob
 ```
 
-The verify command supports both FWOB v1 and v2.
+`verify` is tick/bar-aware: after the structural scan it confirms the file is a
+canonical `Tick` or `Bar` file (rejecting anything else), and prints a colored
+`[verify]` + `[data]` TOML report with a decoded market summary
+(min/max/vwap/volume/trades, tz-aware time range). It supports both FWOB v1 and
+v2. For a quick metadata overview without a full scan, use `inspect` (below).
 
 Config-driven batch run:
 
@@ -166,8 +170,9 @@ mdfwob download SPCX --request-interval-ms 1000
 
 ## Analysis
 
-Four subcommands analyze the FWOB files mdfwob produces. They read both the tick
-files it downloads and the bar files `bars --format fwob` writes. They share the
+Five subcommands analyze the FWOB files mdfwob produces. They read both the tick
+files it downloads and the bar files `bars --format fwob` writes. `inspect` takes
+a single file plus `--tz`/`--session`; `stat`/`bars`/`calc`/`plot` share the
 fwob-family positional-token style: paths/symbols, an interval token
 (`Ns`/`Nm`/`Nh`/`Nd`/`Nw`/`Nmo`/`Ny` for seconds/minutes/hours/days/weeks/
 months/years), an output-format token (`table` default, plus `csv`, `md`,
@@ -191,6 +196,14 @@ mdfwob plot AAPL.fwob 5m rsi:14 volume       # candlesticks to the console (Sixe
 mdfwob plot AAPL.fwob 1d sma:50 -o chart.png # ...or write a PNG
 ```
 
+- **`inspect`** prints a quick, colored-TOML overview of a single tick or bar
+  file — a `[file]`/`[storage]` header, a tz-aware `[range]` (first/last, plus a
+  detected bar `granularity` like `1m`/`1d` and an `hours` flag of
+  `rth`/`extended`/`n/a`), the `[schema]` column layout, and a `[frames]` preview
+  with timestamps in the exchange timezone and full semantics honored. It reads
+  only the header and a bounded leading sample (no full scan). `--tz`/`--session`
+  set the timezone and RTH window. Non-Tick/Bar files are rejected (use `fwob
+  inspect` for the generic storage dump).
 - **`stat`** prints one summary row per file (tick or bar): symbol, `kind`
   (`tick`/`bar`), format, trade count, time range, price min/max, VWAP, and
   signed volume. Every field is derivable from either format, so a tick file and

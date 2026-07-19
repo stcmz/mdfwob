@@ -374,6 +374,19 @@ fn fmt_dt(epoch: u32) -> String {
     }
 }
 
+/// Formats a UTC epoch second as an RFC3339 timestamp in `tz`, carrying a numeric offset (e.g.
+/// `2015-01-02T09:30:00-05:00`). Used by `inspect`/`verify` so timestamps honor the exchange
+/// timezone instead of bare UTC.
+pub fn format_epoch_tz(epoch: u32, tz: &TimeZone) -> String {
+    match Timestamp::from_second(i64::from(epoch)) {
+        Ok(ts) => ts
+            .to_zoned(tz.clone())
+            .strftime("%Y-%m-%dT%H:%M:%S%:z")
+            .to_string(),
+        Err(_) => epoch.to_string(),
+    }
+}
+
 fn fmt_time(epoch: u32, human: bool) -> String {
     if human {
         fmt_dt(epoch)
@@ -400,7 +413,7 @@ fn comma_group(digits: &str) -> String {
     out
 }
 
-fn comma_i64(value: i64) -> String {
+pub(crate) fn comma_i64(value: i64) -> String {
     if value < 0 {
         format!("-{}", comma_group(&value.unsigned_abs().to_string()))
     } else {
@@ -408,11 +421,11 @@ fn comma_i64(value: i64) -> String {
     }
 }
 
-fn comma_u64(value: u64) -> String {
+pub(crate) fn comma_u64(value: u64) -> String {
     comma_group(&value.to_string())
 }
 
-fn fmt_price(value: f64) -> String {
+pub(crate) fn fmt_price(value: f64) -> String {
     if !value.is_finite() {
         return "-".into();
     }

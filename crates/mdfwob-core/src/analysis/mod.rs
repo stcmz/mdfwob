@@ -7,6 +7,7 @@
 
 pub mod calc;
 pub mod config;
+pub mod inspect;
 pub mod interval;
 pub mod model;
 pub mod output;
@@ -33,5 +34,5 @@ pub use read::{
 };
 pub use resample::{BarClock, ForwardFiller, Resampler, resample};
 pub use session::Session;
-pub use stat::{StatAccumulator, StatRow, compute_stat};
+pub use stat::{StatAccumulator, StatRow, compute_stat, stat_file};
 pub use summary::{SummaryCollector, SummaryColumn};
