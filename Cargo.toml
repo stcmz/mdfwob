@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/mdfwob-core", "crates/mdfwob"]
 
 [workspace.package]
-version = "1.9.0"
+version = "1.10.0"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
