@@ -407,3 +407,56 @@ fn cli_inspect_and_verify() {
 
     let _ = fs::remove_dir_all(dir);
 }
+
+#[test]
+fn cli_ls_lists_tick_and_bar_files() {
+    let dir = temp_dir("cli-ls");
+    write_tick_file(&dir); // AAPL.fwob tick file (09:30..09:49 ET, all RTH)
+    let exe = env!("CARGO_BIN_EXE_mdfwob");
+
+    // Add a bar file alongside it so the listing has two rows of differing kind.
+    let bar_dir = dir.join("bars");
+    let out = Command::new(exe)
+        .args([
+            "bars",
+            dir.join("AAPL.fwob").to_str().unwrap(),
+            "5m",
+            "fwob",
+            "--output",
+            bar_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "bars fwob failed");
+
+    // ls the tick directory (table): one row, kind = tick, tz-aware time, hours column.
+    let out = Command::new(exe)
+        .args(["ls", dir.to_str().unwrap()])
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "ls failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("file"), "{s}"); // header
+    assert!(s.contains("granularity"), "{s}");
+    assert!(s.contains("AAPL"), "{s}");
+    assert!(s.contains("tick"), "{s}");
+    assert!(s.contains("-05:00"), "expected tz-aware time: {s}"); // winter ET
+
+    // ls the bar dir as CSV: kind = bar, a detected 5m granularity.
+    let out = Command::new(exe)
+        .args(["ls", bar_dir.to_str().unwrap(), "csv"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.starts_with("file,symbol,kind,format,frames"), "{s}");
+    assert!(s.contains(",bar,"), "{s}");
+    assert!(s.contains(",5m,"), "{s}");
+
+    let _ = fs::remove_dir_all(dir);
+}

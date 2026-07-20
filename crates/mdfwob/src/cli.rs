@@ -16,10 +16,11 @@ use crate::{
         config::{AnalysisConfig, DEFAULT_EXTENDED_HOURS, DEFAULT_RTH_HOURS},
         inspect::{
             classify_hours, detect_bar_granularity, field_semantic_label, field_type_label,
-            preview_bars, preview_ticks,
+            preview_bars, preview_rows, preview_ticks,
         },
         interval::{Granularity, Interval},
-        model::Bar,
+        ls::{LsFormat, ls_file, write_ls},
+        model::{Bar, Tick},
         output::{
             AnalysisFormat, FrameStream, FrameWriter, format_epoch_tz, guard_symbol_count,
             write_stat,
@@ -55,6 +56,7 @@ impl Cli {
     pub fn run(self) -> Result<()> {
         match self.command {
             Command::Download(args) => args.run(),
+            Command::Ls(args) => args.run(),
             Command::Inspect(args) => args.run(),
             Command::Verify(args) => args.run(),
             Command::Stat(args) => args.run(),
@@ -69,6 +71,8 @@ impl Cli {
 enum Command {
     /// Download configured or ad hoc historical market data.
     Download(DownloadArgs),
+    /// List tick/bar files: one tz-aware row per file (table/md/csv/jsonl; no full scan).
+    Ls(LsArgs),
     /// Quick metadata overview of a tick or bar file (colored, tz-aware TOML; no full scan).
     Inspect(InspectArgs),
     /// Verify a tick or bar file's integrity and schema, with a scanned market summary.
@@ -334,10 +338,78 @@ fn key_epoch(key: Key) -> Option<u32> {
     }
 }
 
-/// Number of leading frames sampled by `inspect` for granularity/hours detection and the preview.
+/// Frames sampled per end by `inspect` for granularity/hours detection and the head/tail preview.
 const INSPECT_SAMPLE: u64 = 1_024;
-/// Rows shown in the `inspect` frame preview.
-const PREVIEW_ROWS: usize = 10;
+
+#[derive(Debug, Args)]
+#[command(override_usage = "mdfwob ls [CONFIG.toml] [PATHS_OR_SYMBOLS...] [FORMAT] [OPTIONS]")]
+#[command(
+    after_help = "Tokens (any order): tick/bar FILE.fwob, a DIR (its immediate *.fwob), or a \
+bare SYMBOL (resolved under output_dir); and one output format: table (default), md, csv, jsonl. \
+With no path, lists the current directory's *.fwob files."
+)]
+struct LsArgs {
+    /// Override the session window (HH:MM-HH:MM) used to classify regular vs extended hours.
+    #[arg(long)]
+    session: Option<String>,
+    /// Timezone (IANA name) for rendered timestamps and hours classification. Default
+    /// America/New_York.
+    #[arg(long)]
+    tz: Option<String>,
+    /// Optional CONFIG.toml, then files/dirs/symbols and an optional format token.
+    #[arg(value_name = "ITEM", num_args = 0..)]
+    items: Vec<String>,
+}
+
+impl LsArgs {
+    fn run(self) -> Result<()> {
+        let (config_path, tokens) = split_config_target(self.items)?;
+        let acfg = load_analysis_config(config_path.as_deref())?;
+        let mut format = None;
+        let mut paths = Vec::new();
+        for token in &tokens {
+            if let Some(parsed) = LsFormat::parse(token) {
+                if format.replace(parsed).is_some() {
+                    bail!("multiple output format tokens given");
+                }
+            } else {
+                paths.push(token.clone());
+            }
+        }
+        let format = format.unwrap_or_default();
+        let display = resolve_session(&acfg, false, self.session.as_deref(), self.tz.as_deref())?;
+        let rth = resolve_session(&acfg, true, self.session.as_deref(), self.tz.as_deref())?;
+        let tz = display.time_zone();
+
+        // Default to the current directory when no path/symbol is given (like `fwob ls`).
+        let files = if paths.is_empty() && acfg.symbols.is_empty() {
+            resolve_files(&[".".to_string()], &acfg)?
+        } else {
+            resolve_files(&paths, &acfg)?
+        };
+
+        let mut rows = Vec::new();
+        let mut failures = 0u32;
+        for path in &files {
+            match ls_file(path.display().to_string(), path, &rth, INSPECT_SAMPLE) {
+                Ok(row) => rows.push(row),
+                Err(error) => {
+                    failures += 1;
+                    tracing::error!(path = %path.display(), error = %format!("{error:#}"), "failed to read");
+                }
+            }
+        }
+        if rows.is_empty() && failures > 0 {
+            bail!("all {failures} input(s) failed to read");
+        }
+
+        let stdout = std::io::stdout();
+        let mut out = std::io::BufWriter::new(stdout.lock());
+        write_ls(&rows, format, &tz, &mut out)?;
+        out.flush()?;
+        Ok(())
+    }
+}
 
 #[derive(Debug, Args)]
 struct InspectArgs {
@@ -378,22 +450,45 @@ impl InspectArgs {
         let last = reader.last_key()?.and_then(key_epoch);
 
         // Bounded leading sample for granularity/hours/preview — never a full scan.
-        let sample_n = frame_count.min(INSPECT_SAMPLE);
+        // Read a leading window (for granularity/hours + the preview head) and, for larger files, a
+        // trailing window (for hours coverage + the preview tail). Bounded — never a full scan.
+        let lead_n = frame_count.min(INSPECT_SAMPLE);
         let mut times: Vec<u32> = Vec::new();
-        let mut ticks: Vec<crate::analysis::model::Tick> = Vec::new();
-        let mut bars: Vec<Bar> = Vec::new();
-        for frame in reader.frames(0..sample_n)? {
+        let mut lead_ticks: Vec<Tick> = Vec::new();
+        let mut lead_bars: Vec<Bar> = Vec::new();
+        for frame in reader.frames(0..lead_n)? {
             let frame = frame?;
             match kind {
                 InputKind::Tick => {
                     let tick = decode_tick(frame.bytes());
                     times.push(tick.time);
-                    ticks.push(tick);
+                    lead_ticks.push(tick);
                 }
                 InputKind::Bar => {
                     let bar = decode_bar(frame.bytes())?;
                     times.push(bar.time);
-                    bars.push(bar);
+                    lead_bars.push(bar);
+                }
+            }
+        }
+        // Trailing window: start no earlier than the leading window's end so the two never overlap.
+        let mut tail_ticks: Vec<Tick> = Vec::new();
+        let mut tail_bars: Vec<Bar> = Vec::new();
+        if frame_count > lead_n {
+            let tail_start = frame_count.saturating_sub(INSPECT_SAMPLE).max(lead_n);
+            for frame in reader.frames(tail_start..frame_count)? {
+                let frame = frame?;
+                match kind {
+                    InputKind::Tick => {
+                        let tick = decode_tick(frame.bytes());
+                        times.push(tick.time);
+                        tail_ticks.push(tick);
+                    }
+                    InputKind::Bar => {
+                        let bar = decode_bar(frame.bytes())?;
+                        times.push(bar.time);
+                        tail_bars.push(bar);
+                    }
                 }
             }
         }
@@ -448,8 +543,10 @@ impl InspectArgs {
         }
 
         let preview = match kind {
-            InputKind::Tick => preview_ticks(&ticks, &tz, PREVIEW_ROWS),
-            InputKind::Bar => preview_bars(&bars, &tz, PREVIEW_ROWS),
+            InputKind::Tick => {
+                preview_ticks(&preview_rows(frame_count, &lead_ticks, &tail_ticks), &tz)
+            }
+            InputKind::Bar => preview_bars(&preview_rows(frame_count, &lead_bars, &tail_bars), &tz),
         };
         if !preview.is_empty() {
             w.blank()?;

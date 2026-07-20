@@ -113,59 +113,89 @@ pub fn field_semantic_label(semantic: FieldSemantic) -> String {
     }
 }
 
-/// Renders up to `limit` ticks as an aligned table (timestamps in `tz`, prices at 4 decimals).
-pub fn preview_ticks(ticks: &[Tick], tz: &TimeZone, limit: usize) -> String {
-    let headers = ["time", "price", "size"];
-    let aligns = [false, true, true];
-    let rows: Vec<Vec<String>> = ticks
-        .iter()
-        .take(limit)
-        .map(|tick| {
-            vec![
-                format_epoch_tz(tick.time, tz),
-                fmt_price(tick.price),
-                comma_i64(i64::from(tick.size)),
-            ]
-        })
-        .collect();
-    align_table(&headers, &aligns, &rows)
+/// How many frames the preview shows from the head and (separately) from the tail — matching
+/// `fwob inspect`'s constant. A file with more than `2 * FRAME_PREVIEW_COUNT` frames shows the
+/// first and last `FRAME_PREVIEW_COUNT` with an ellipsis between; a smaller file shows every frame.
+pub const FRAME_PREVIEW_COUNT: usize = 3;
+
+const TICK_HEADERS: [&str; 3] = ["time", "price", "size"];
+const TICK_ALIGNS: [bool; 3] = [false, true, true];
+const BAR_HEADERS: [&str; 8] = [
+    "time", "open", "high", "low", "close", "volume", "vwap", "trades",
+];
+const BAR_ALIGNS: [bool; 8] = [false, true, true, true, true, true, true, true];
+
+/// Selects the preview rows (head + optional ellipsis + tail) from decoded leading (`head`) and
+/// trailing (`tail`) windows of a `frame_count`-frame file, mirroring `fwob`'s `preview_indices`:
+/// all frames when `frame_count <= 2 * FRAME_PREVIEW_COUNT`, otherwise the first and last
+/// `FRAME_PREVIEW_COUNT` with a `None` (ellipsis) between. `tail` may be empty when the file is
+/// small enough that `head` already reaches the end; then the tail is taken from `head`.
+pub fn preview_rows<T: Copy>(frame_count: u64, head: &[T], tail: &[T]) -> Vec<Option<T>> {
+    let per_side = FRAME_PREVIEW_COUNT;
+    let count = frame_count as usize;
+    if count <= per_side * 2 {
+        return head.iter().take(count).copied().map(Some).collect();
+    }
+    let mut out = Vec::with_capacity(per_side * 2 + 1);
+    out.extend(head.iter().take(per_side).copied().map(Some));
+    out.push(None);
+    let tail_src = if tail.is_empty() { head } else { tail };
+    let start = tail_src.len().saturating_sub(per_side);
+    out.extend(tail_src[start..].iter().copied().map(Some));
+    out
 }
 
-/// Renders up to `limit` bars as an aligned table (timestamps in `tz`, prices at 4 decimals,
-/// volume/trades comma-grouped).
-pub fn preview_bars(bars: &[Bar], tz: &TimeZone, limit: usize) -> String {
-    let headers = [
-        "time", "open", "high", "low", "close", "volume", "vwap", "trades",
-    ];
-    let aligns = [false, true, true, true, true, true, true, true];
-    let rows: Vec<Vec<String>> = bars
+fn tick_cells(tick: &Tick, tz: &TimeZone) -> Vec<String> {
+    vec![
+        format_epoch_tz(tick.time, tz),
+        fmt_price(tick.price),
+        comma_i64(i64::from(tick.size)),
+    ]
+}
+
+fn bar_cells(bar: &Bar, tz: &TimeZone) -> Vec<String> {
+    vec![
+        format_epoch_tz(bar.time, tz),
+        fmt_price(bar.open),
+        fmt_price(bar.high),
+        fmt_price(bar.low),
+        fmt_price(bar.close),
+        comma_i64(bar.volume),
+        fmt_price(bar.vwap),
+        comma_u64(bar.trades),
+    ]
+}
+
+/// Renders preview `rows` (from [`preview_rows`]) as an aligned tick table; `None` is an ellipsis
+/// row. Timestamps render in `tz`, prices at 4 decimals.
+pub fn preview_ticks(rows: &[Option<Tick>], tz: &TimeZone) -> String {
+    let cells: Vec<Option<Vec<String>>> = rows
         .iter()
-        .take(limit)
-        .map(|bar| {
-            vec![
-                format_epoch_tz(bar.time, tz),
-                fmt_price(bar.open),
-                fmt_price(bar.high),
-                fmt_price(bar.low),
-                fmt_price(bar.close),
-                comma_i64(bar.volume),
-                fmt_price(bar.vwap),
-                comma_u64(bar.trades),
-            ]
-        })
+        .map(|r| r.as_ref().map(|t| tick_cells(t, tz)))
         .collect();
-    align_table(&headers, &aligns, &rows)
+    align_table(&TICK_HEADERS, &TICK_ALIGNS, &cells)
+}
+
+/// Renders preview `rows` (from [`preview_rows`]) as an aligned bar table; `None` is an ellipsis
+/// row. Timestamps render in `tz`, prices at 4 decimals, volume/trades comma-grouped.
+pub fn preview_bars(rows: &[Option<Bar>], tz: &TimeZone) -> String {
+    let cells: Vec<Option<Vec<String>>> = rows
+        .iter()
+        .map(|r| r.as_ref().map(|b| bar_cells(b, tz)))
+        .collect();
+    align_table(&BAR_HEADERS, &BAR_ALIGNS, &cells)
 }
 
 /// Formats `headers` + `rows` as a whitespace-aligned table (two-space column gap). `aligns[i]`
-/// right-justifies column `i`.
-fn align_table(headers: &[&str], aligns: &[bool], rows: &[Vec<String>]) -> String {
+/// right-justifies column `i`; a `None` row renders as an ellipsis (`...` in every column), like
+/// `fwob inspect`.
+fn align_table(headers: &[&str], aligns: &[bool], rows: &[Option<Vec<String>>]) -> String {
     if rows.is_empty() {
         return String::new();
     }
     let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
-    for row in rows {
-        for (i, cell) in row.iter().enumerate() {
+    for cells in rows.iter().flatten() {
+        for (i, cell) in cells.iter().enumerate() {
             widths[i] = widths[i].max(cell.chars().count());
         }
     }
@@ -188,10 +218,14 @@ fn align_table(headers: &[&str], aligns: &[bool], rows: &[Vec<String>]) -> Strin
         out.push_str(line.trim_end());
         out.push('\n');
     };
+    let ellipsis: Vec<String> = vec!["...".to_owned(); headers.len()];
     let header_cells: Vec<String> = headers.iter().map(|h| (*h).to_owned()).collect();
     push_row(&mut out, &header_cells);
     for row in rows {
-        push_row(&mut out, row);
+        match row {
+            Some(cells) => push_row(&mut out, cells),
+            None => push_row(&mut out, &ellipsis),
+        }
     }
     out
 }
@@ -262,21 +296,65 @@ mod tests {
     fn tick_preview_is_aligned_and_tz_aware() {
         let tz = TimeZone::get("America/New_York").unwrap();
         let ticks = [
-            Tick {
+            Some(Tick {
                 time: 1_704_205_800,
                 price: 100.25,
                 size: 500,
-            },
-            Tick {
+            }),
+            Some(Tick {
                 time: 1_704_205_860,
                 price: 100.5,
                 size: 1_200,
-            },
+            }),
         ];
-        let table = preview_ticks(&ticks, &tz, 10);
+        let table = preview_ticks(&ticks, &tz);
         assert!(table.contains("time"), "{table}");
         assert!(table.contains("100.2500"), "{table}");
         // Winter ET offset.
         assert!(table.contains("-05:00"), "{table}");
+    }
+
+    #[test]
+    fn preview_rows_head_tail_and_ellipsis() {
+        // Small file (<= 2*N): every frame, no ellipsis.
+        let all: Vec<u32> = (0..5).collect();
+        let rows = preview_rows(5, &all, &[]);
+        assert_eq!(rows.len(), 5);
+        assert!(rows.iter().all(Option::is_some));
+
+        // Large file: head N + ellipsis + tail N, taken from leading/trailing windows.
+        let head: Vec<u32> = (0..10).collect();
+        let tail: Vec<u32> = (90..100).collect();
+        let rows = preview_rows(100, &head, &tail);
+        assert_eq!(rows.len(), FRAME_PREVIEW_COUNT * 2 + 1);
+        assert_eq!(rows[0], Some(0));
+        assert_eq!(rows[FRAME_PREVIEW_COUNT], None); // ellipsis
+        assert_eq!(*rows.last().unwrap(), Some(99));
+
+        // No distinct tail window (file fits in the leading sample): tail taken from head.
+        let rows = preview_rows(10, &head, &[]);
+        assert_eq!(rows[0], Some(0));
+        assert_eq!(rows[FRAME_PREVIEW_COUNT], None);
+        assert_eq!(*rows.last().unwrap(), Some(9));
+    }
+
+    #[test]
+    fn ellipsis_row_renders() {
+        let tz = TimeZone::get("UTC").unwrap();
+        let rows = vec![
+            Some(Tick {
+                time: 1_704_205_800,
+                price: 1.0,
+                size: 1,
+            }),
+            None,
+            Some(Tick {
+                time: 1_704_205_860,
+                price: 2.0,
+                size: 2,
+            }),
+        ];
+        let table = preview_ticks(&rows, &tz);
+        assert!(table.contains("..."), "{table}");
     }
 }

@@ -279,10 +279,10 @@ fn stat_row_cells(row: &StatRow, human: bool) -> Vec<String> {
     ]
 }
 
-struct Table {
-    headers: Vec<String>,
-    aligns: Vec<bool>,
-    rows: Vec<Vec<String>>,
+pub(crate) struct Table {
+    pub headers: Vec<String>,
+    pub aligns: Vec<bool>,
+    pub rows: Vec<Vec<String>>,
 }
 
 impl Table {
@@ -296,7 +296,7 @@ impl Table {
         widths
     }
 
-    fn render_table(&self) -> String {
+    pub fn render_table(&self) -> String {
         let widths = self.widths();
         let mut out = String::new();
         push_padded(&mut out, &self.headers, &widths, &self.aligns);
@@ -306,7 +306,7 @@ impl Table {
         out
     }
 
-    fn render_markdown(&self) -> String {
+    pub fn render_markdown(&self) -> String {
         let mut out = String::new();
         out.push_str(&format!("| {} |\n", self.headers.join(" | ")));
         let seps: Vec<&str> = self
@@ -322,7 +322,7 @@ impl Table {
         out
     }
 
-    fn render_csv(&self) -> String {
+    pub fn render_csv(&self) -> String {
         let mut out = String::new();
         out.push_str(&self.headers.join(","));
         out.push('\n');

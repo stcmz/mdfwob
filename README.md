@@ -170,10 +170,11 @@ mdfwob download SPCX --request-interval-ms 1000
 
 ## Analysis
 
-Five subcommands analyze the FWOB files mdfwob produces. They read both the tick
+Six subcommands analyze the FWOB files mdfwob produces. They read both the tick
 files it downloads and the bar files `bars --format fwob` writes. `inspect` takes
-a single file plus `--tz`/`--session`; `stat`/`bars`/`calc`/`plot` share the
-fwob-family positional-token style: paths/symbols, an interval token
+a single file plus `--tz`/`--session`; `ls` takes files/dirs + a format token +
+`--tz`/`--session`; `stat`/`bars`/`calc`/`plot` share the fwob-family
+positional-token style: paths/symbols, an interval token
 (`Ns`/`Nm`/`Nh`/`Nd`/`Nw`/`Nmo`/`Ny` for seconds/minutes/hours/days/weeks/
 months/years), an output-format token (`table` default, plus `csv`, `md`,
 `jsonl`, `raw`, `hex`, and — for `bars`/`calc` — `fwob`), and the `rth` token
@@ -183,6 +184,8 @@ files; no path uses the current directory. `--start`/`--end` accept a date
 (`YYYY-MM-DD`, UTC) or RFC3339; a bare end date is inclusive of that day.
 
 ```text
+mdfwob ls data/                       # one tz-aware row per tick/bar file
+mdfwob ls data/ csv                   # ...as CSV (also md, jsonl)
 mdfwob stat data/ md rth
 mdfwob bars AAPL.fwob                  # 1d bars (the default period)
 mdfwob bars AAPL.fwob 5m
@@ -196,6 +199,13 @@ mdfwob plot AAPL.fwob 5m rsi:14 volume       # candlesticks to the console (Sixe
 mdfwob plot AAPL.fwob 1d sma:50 -o chart.png # ...or write a PNG
 ```
 
+- **`ls`** lists tick/bar files, one row per file, in `table` (default), `md`,
+  `csv`, or `jsonl` form — the market-data analog of `fwob ls`. Columns are
+  tick/bar oriented: `file`, `symbol`, `kind` (`tick`/`bar`), `format`, `frames`,
+  tz-aware `first`/`last`, detected bar `granularity`, an `hours` flag
+  (`rth`/`extended`/`n/a`), and `bytes`. Like `inspect` it reads only headers,
+  boundary keys, and a bounded leading sample (no full scan); `--tz`/`--session`
+  set the timezone and RTH window. With no path it lists the current directory.
 - **`inspect`** prints a quick, colored-TOML overview of a single tick or bar
   file — a `[file]`/`[storage]` header, a tz-aware `[range]` (first/last, plus a
   detected bar `granularity` like `1m`/`1d` and an `hours` flag of
