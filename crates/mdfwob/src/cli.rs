@@ -16,7 +16,7 @@ use crate::{
         config::{AnalysisConfig, DEFAULT_EXTENDED_HOURS, DEFAULT_RTH_HOURS},
         inspect::{
             classify_hours, detect_bar_granularity, field_semantic_label, field_type_label,
-            preview_bars, preview_rows, preview_ticks,
+            preview_bars, preview_rows, preview_ticks, sample_windows,
         },
         interval::{Granularity, Interval},
         ls::{LsFormat, ls_file, write_ls},
@@ -449,45 +449,36 @@ impl InspectArgs {
         let first = reader.first_key()?.and_then(key_epoch);
         let last = reader.last_key()?.and_then(key_epoch);
 
-        // Bounded leading sample for granularity/hours/preview — never a full scan.
-        // Read a leading window (for granularity/hours + the preview head) and, for larger files, a
-        // trailing window (for hours coverage + the preview tail). Bounded — never a full scan.
-        let lead_n = frame_count.min(INSPECT_SAMPLE);
+        // Sample the same leading + trailing windows `ls` uses (shared `sample_windows`), so their
+        // granularity/hours classification is identical. Bounded — never a full scan. The leading
+        // window feeds the preview head; the trailing window the preview tail.
+        let (lead, tail) = sample_windows(frame_count, INSPECT_SAMPLE);
         let mut times: Vec<u32> = Vec::new();
         let mut lead_ticks: Vec<Tick> = Vec::new();
         let mut lead_bars: Vec<Bar> = Vec::new();
-        for frame in reader.frames(0..lead_n)? {
-            let frame = frame?;
-            match kind {
-                InputKind::Tick => {
-                    let tick = decode_tick(frame.bytes());
-                    times.push(tick.time);
-                    lead_ticks.push(tick);
-                }
-                InputKind::Bar => {
-                    let bar = decode_bar(frame.bytes())?;
-                    times.push(bar.time);
-                    lead_bars.push(bar);
-                }
-            }
-        }
-        // Trailing window: start no earlier than the leading window's end so the two never overlap.
         let mut tail_ticks: Vec<Tick> = Vec::new();
         let mut tail_bars: Vec<Bar> = Vec::new();
-        if frame_count > lead_n {
-            let tail_start = frame_count.saturating_sub(INSPECT_SAMPLE).max(lead_n);
-            for frame in reader.frames(tail_start..frame_count)? {
+        for (range, is_tail) in std::iter::once((lead, false)).chain(tail.map(|t| (t, true))) {
+            for frame in reader.frames(range)? {
                 let frame = frame?;
                 match kind {
                     InputKind::Tick => {
                         let tick = decode_tick(frame.bytes());
                         times.push(tick.time);
-                        tail_ticks.push(tick);
+                        if is_tail {
+                            tail_ticks.push(tick);
+                        } else {
+                            lead_ticks.push(tick);
+                        }
                     }
                     InputKind::Bar => {
                         let bar = decode_bar(frame.bytes())?;
                         times.push(bar.time);
-                        tail_bars.push(bar);
+                        if is_tail {
+                            tail_bars.push(bar);
+                        } else {
+                            lead_bars.push(bar);
+                        }
                     }
                 }
             }

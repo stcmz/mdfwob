@@ -2,6 +2,8 @@
 //! frame sample, schema-field labels, and a timezone- and semantic-aware frame preview. Pure
 //! functions over decoded values so they are unit-testable without a file.
 
+use std::ops::Range;
+
 use fwob_core::{FieldSemantic, FieldType, TimestampUnit};
 use jiff::{Timestamp, tz::TimeZone};
 
@@ -10,6 +12,19 @@ use crate::analysis::output::{comma_i64, comma_u64, fmt_price, format_epoch_tz};
 use crate::analysis::session::Session;
 
 const DAY: u32 = 86_400;
+
+/// The leading and (optional) trailing frame-index windows to sample from a `frame_count`-frame
+/// file, each up to `per_end` frames and never overlapping. `inspect` and `ls` both sample these
+/// exact windows so their granularity and hours classification are identical: the trailing window
+/// is `None` only when the leading window already reaches the end of the file.
+pub fn sample_windows(frame_count: u64, per_end: u64) -> (Range<u64>, Option<Range<u64>>) {
+    let lead_n = frame_count.min(per_end);
+    let tail = (frame_count > lead_n).then(|| {
+        let start = frame_count.saturating_sub(per_end).max(lead_n);
+        start..frame_count
+    });
+    (0..lead_n, tail)
+}
 
 /// Detects a bar series' interval label (`1m`, `30m`, `1h`, `1d`, `1w`, `1mo`, `1y`, …) from the
 /// minimum positive gap between consecutive bar times. Intraday gaps map exactly; day-and-larger
@@ -312,6 +327,18 @@ mod tests {
         assert!(table.contains("100.2500"), "{table}");
         // Winter ET offset.
         assert!(table.contains("-05:00"), "{table}");
+    }
+
+    #[test]
+    fn sample_windows_are_non_overlapping_head_and_tail() {
+        // Small file: leading window covers everything, no trailing window.
+        assert_eq!(sample_windows(5, 1024), (0..5, None));
+        // File larger than one window but smaller than two: tail abuts the lead (no overlap, no gap).
+        assert_eq!(sample_windows(1500, 1024), (0..1024, Some(1024..1500)));
+        // File larger than two windows: head [0,1024) and tail [count-1024, count).
+        assert_eq!(sample_windows(5000, 1024), (0..1024, Some(3976..5000)));
+        // Exactly one window: no tail.
+        assert_eq!(sample_windows(1024, 1024), (0..1024, None));
     }
 
     #[test]

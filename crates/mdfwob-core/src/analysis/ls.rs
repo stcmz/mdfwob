@@ -11,7 +11,7 @@ use fwob::Reader;
 use fwob_core::Key;
 use jiff::tz::TimeZone;
 
-use crate::analysis::inspect::{classify_hours, detect_bar_granularity};
+use crate::analysis::inspect::{classify_hours, detect_bar_granularity, sample_windows};
 use crate::analysis::output::{Table, comma_u64, format_epoch_tz};
 use crate::analysis::read::{InputKind, decode_tick, detect_kind};
 use crate::analysis::schema::decode_bar;
@@ -92,15 +92,18 @@ pub fn ls_file(file: String, path: &Path, rth: &Session, sample: u64) -> Result<
     let first = reader.first_key()?.and_then(key_epoch);
     let last = reader.last_key()?.and_then(key_epoch);
 
-    let sample_n = frame_count.min(sample);
+    // Sample the same leading + trailing windows `inspect` uses, so their granularity/hours match.
+    let (lead, tail) = sample_windows(frame_count, sample);
     let mut times: Vec<u32> = Vec::new();
-    for frame in reader.frames(0..sample_n)? {
-        let frame = frame?;
-        let time = match kind {
-            InputKind::Tick => decode_tick(frame.bytes()).time,
-            InputKind::Bar => decode_bar(frame.bytes())?.time,
-        };
-        times.push(time);
+    for range in std::iter::once(lead).chain(tail) {
+        for frame in reader.frames(range)? {
+            let frame = frame?;
+            let time = match kind {
+                InputKind::Tick => decode_tick(frame.bytes()).time,
+                InputKind::Bar => decode_bar(frame.bytes())?.time,
+            };
+            times.push(time);
+        }
     }
     let granularity = (kind == InputKind::Bar)
         .then(|| detect_bar_granularity(&times))
