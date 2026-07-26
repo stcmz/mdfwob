@@ -257,22 +257,16 @@ impl Accumulator {
     }
 }
 
-/// Incremental resampler onto a fixed `interval`. Feed an ascending stream with
-/// [`Resampler::push`] (ticks) and/or [`Resampler::push_bar`] (pre-aggregated source bars),
-/// passing a sink that receives each bar **the moment its bucket closes** (so rows can stream
-/// straight to the terminal); flush the final open bucket with [`Resampler::finish`]. Nothing is
-/// ever all held in memory at once.
-///
-/// Both inputs share one bucket state, so a symbol whose history is split across tick *and* bar
-/// files (say, archived daily bars plus recent ticks) resamples as a single series — each source
-/// contributes to whichever bucket its timestamp lands in. Re-bucketing bars to a *finer* interval
-/// than the source cannot sub-divide them; it just re-times each source bar into its own bucket.
+/// Incremental tick → bar resampler. Feed ascending ticks with [`Resampler::push`], passing a
+/// sink that receives each bar **the moment its bucket closes** (so rows can stream straight to
+/// the terminal); flush the final open bucket with [`Resampler::finish`]. Neither the ticks nor
+/// the resulting bars are ever all held in memory at once.
 pub struct Resampler {
     interval: Interval,
     clock: BarClock,
     current: Option<Accumulator>,
     /// Exclusive end of the open bucket, cached so the (potentially expensive) timezone bucket
-    /// computation runs once per bucket instead of once per input.
+    /// computation runs once per bucket instead of once per tick.
     bucket_end: u32,
 }
 
@@ -286,48 +280,76 @@ impl Resampler {
         }
     }
 
-    /// Advances to the bucket holding `time`, emitting the just-completed bar if one closes.
-    /// Returns the new bucket's start when a bucket was opened, or `None` when `time` belongs to
-    /// the already-open bucket. Input is ascending, so it belongs to the open bucket while
-    /// `time < bucket_end`.
-    fn roll(&mut self, time: u32, emit: &mut impl FnMut(Bar) -> Result<()>) -> Result<Option<u32>> {
-        if self.current.is_some() && time < self.bucket_end {
-            return Ok(None);
-        }
-        if let Some(acc) = self.current.take() {
-            emit(acc.finish())?;
-        }
-        let start = self.clock.bucket_start(self.interval, time);
-        self.bucket_end = self
-            .clock
-            .advance(self.interval, start)
-            .max(start.saturating_add(1));
-        Ok(Some(start))
-    }
-
     /// Folds `tick` into the open bucket, emitting the just-completed bar through `emit` when the
     /// tick opens a new bucket. Ticks must be ascending.
     pub fn push(&mut self, tick: &Tick, emit: &mut impl FnMut(Bar) -> Result<()>) -> Result<()> {
-        match self.roll(tick.time, emit)? {
-            Some(start) => self.current = Some(Accumulator::new(start, tick)),
-            None => self.open_bucket().update(tick),
+        match &mut self.current {
+            // Ticks are ascending, so a tick belongs to the open bucket while `time < bucket_end`.
+            Some(acc) if tick.time < self.bucket_end => acc.update(tick),
+            _ => {
+                if let Some(acc) = self.current.take() {
+                    emit(acc.finish())?;
+                }
+                let start = self.clock.bucket_start(self.interval, tick.time);
+                self.bucket_end = self
+                    .clock
+                    .advance(self.interval, start)
+                    .max(start.saturating_add(1));
+                self.current = Some(Accumulator::new(start, tick));
+            }
         }
         Ok(())
     }
 
-    /// Folds a pre-aggregated source `bar` into the open bucket, emitting the just-completed bar
-    /// when it opens a new one. Source bars must be ascending by time.
-    pub fn push_bar(&mut self, bar: &Bar, emit: &mut impl FnMut(Bar) -> Result<()>) -> Result<()> {
-        match self.roll(bar.time, emit)? {
-            Some(start) => self.current = Some(Accumulator::from_bar(start, bar)),
-            None => self.open_bucket().update_bar(bar),
+    /// Emits the final open bucket (if any).
+    pub fn finish(mut self, emit: &mut impl FnMut(Bar) -> Result<()>) -> Result<()> {
+        if let Some(acc) = self.current.take() {
+            emit(acc.finish())?;
         }
         Ok(())
     }
+}
 
-    /// The open bucket. Only called on the `roll` → `None` path, which implies one is open.
-    fn open_bucket(&mut self) -> &mut Accumulator {
-        self.current.as_mut().expect("bucket is open")
+/// Incremental bar → bar resampler: re-buckets an ascending stream of source bars into a coarser
+/// (or equal) `interval`, aggregating OHLCV the same way [`Resampler`] aggregates ticks. Feeding a
+/// finer interval than the source simply re-times each bar into its own bucket (no sub-division is
+/// possible). Mirrors [`Resampler`]: emit fires as each bucket closes; [`BarResampler::finish`]
+/// flushes the final open bucket.
+pub struct BarResampler {
+    interval: Interval,
+    clock: BarClock,
+    current: Option<Accumulator>,
+    bucket_end: u32,
+}
+
+impl BarResampler {
+    pub fn new(interval: Interval, clock: BarClock) -> Self {
+        Self {
+            interval,
+            clock,
+            current: None,
+            bucket_end: 0,
+        }
+    }
+
+    /// Folds `bar` into the open target bucket, emitting the just-completed bar when `bar` opens a
+    /// new bucket. Source bars must be ascending by time.
+    pub fn push(&mut self, bar: &Bar, emit: &mut impl FnMut(Bar) -> Result<()>) -> Result<()> {
+        match &mut self.current {
+            Some(acc) if bar.time < self.bucket_end => acc.update_bar(bar),
+            _ => {
+                if let Some(acc) = self.current.take() {
+                    emit(acc.finish())?;
+                }
+                let start = self.clock.bucket_start(self.interval, bar.time);
+                self.bucket_end = self
+                    .clock
+                    .advance(self.interval, start)
+                    .max(start.saturating_add(1));
+                self.current = Some(Accumulator::from_bar(start, bar));
+            }
+        }
+        Ok(())
     }
 
     /// Emits the final open bucket (if any).
@@ -485,9 +507,9 @@ mod tests {
         ];
         let mut out = Vec::new();
         {
-            let mut r = Resampler::new(interval, BarClock::Utc);
+            let mut r = BarResampler::new(interval, BarClock::Utc);
             for bar in &input {
-                r.push_bar(bar, &mut |b| {
+                r.push(bar, &mut |b| {
                     out.push(b);
                     Ok(())
                 })
@@ -513,50 +535,6 @@ mod tests {
         assert_eq!(out[1].time, 60);
         assert_eq!(out[1].trades, 2);
         assert!((out[1].vwap - 11.3).abs() < 1e-9);
-    }
-
-    /// A symbol split across a bar file and a tick file (disjoint in time) resamples as one series:
-    /// both sources feed the same bucket state, and a bucket fed by both merges their OHLCV.
-    #[test]
-    fn one_resampler_merges_bar_and_tick_sources() {
-        let interval = Interval::parse("1m").unwrap().unwrap();
-        let source = Bar {
-            time: 10,
-            open: 10.0,
-            high: 12.0,
-            low: 9.0,
-            close: 11.0,
-            volume: 100,
-            vwap: 10.5,
-            trades: 4,
-        };
-        let mut out = Vec::new();
-        {
-            let mut r = Resampler::new(interval, BarClock::Utc);
-            let mut emit = |b: Bar| {
-                out.push(b);
-                Ok(())
-            };
-            // Bucket [0,60): a source bar, then a tick landing in the same bucket.
-            r.push_bar(&source, &mut emit).unwrap();
-            r.push(&tick(30, 13.0, 50), &mut emit).unwrap();
-            // Bucket [60,120): a tick only.
-            r.push(&tick(70, 8.0, 10), &mut emit).unwrap();
-            r.finish(&mut emit).unwrap();
-        }
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0].time, 0);
-        assert_eq!(out[0].open, 10.0); // the bar opened the bucket
-        assert_eq!(out[0].high, 13.0); // the tick raised the high
-        assert_eq!(out[0].low, 9.0); // the bar's low stands
-        assert_eq!(out[0].close, 13.0); // the tick closed the bucket
-        assert_eq!(out[0].volume, 150);
-        assert_eq!(out[0].trades, 5); // 4 from the bar + 1 for the tick
-        // Price mass sums across both source kinds: (10.5*100 + 13.0*50) / 150.
-        assert!((out[0].vwap - (10.5 * 100.0 + 13.0 * 50.0) / 150.0).abs() < 1e-9);
-        assert_eq!(out[1].time, 60);
-        assert_eq!(out[1].close, 8.0);
-        assert_eq!(out[1].trades, 1);
     }
 
     #[test]

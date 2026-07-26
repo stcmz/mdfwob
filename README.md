@@ -183,15 +183,6 @@ months/years), an output-format token (`table` default, plus `csv`, `md`,
 files; no path uses the current directory. `--start`/`--end` accept a date
 (`YYYY-MM-DD`, UTC) or RFC3339; a bare end date is inclusive of that day.
 
-Several files of the same symbol are read as **one** series, so a history split
-across formats (archived bars plus recent ticks) can be passed together: the
-files are ordered by time — the order they are given in does not matter — and
-resampled through a single resampler. Sources that **overlap** in time are
-rejected, since each would contribute to the same buckets and silently
-double-count volume and trades; the usual case is passing both a tick file and
-its own pre-aggregated bar file. Restrict the range so they do not overlap, or
-pass only one of them.
-
 ```text
 mdfwob ls data/                       # one tz-aware row per tick/bar file
 mdfwob ls data/ csv                   # ...as CSV (also md, jsonl)

@@ -45,23 +45,6 @@ fn write_tick_file(dir: &Path) -> PathBuf {
     path
 }
 
-/// Writes a tick file titled `AAPL` (so it groups with the other `AAPL` files regardless of file
-/// name), one tick per minute from `base` for `count` ticks.
-fn write_tick_window(dir: &Path, name: &str, base: u32, count: u32) -> PathBuf {
-    let path = dir.join(name);
-    let mut writer = Writer::create_v2(&path, tick_schema(), WriterOptions::new("AAPL"))
-        .expect("create tick file");
-    let mut buf = Vec::new();
-    for i in 0..count {
-        Tick::new(base + i * 60, 185.0 + f64::from(i) * 0.1, 100)
-            .unwrap()
-            .encode(&mut buf);
-    }
-    writer.append_presorted_frames(&buf).unwrap();
-    writer.finish().unwrap();
-    path
-}
-
 #[test]
 fn library_api_reads_resamples_and_computes() {
     let dir = temp_dir("lib");
@@ -421,105 +404,6 @@ fn cli_inspect_and_verify() {
         );
         assert!(combined.contains("Calc"), "{cmd} output: {combined}");
     }
-
-    let _ = fs::remove_dir_all(dir);
-}
-
-/// A symbol's history may be split across tick *and* bar files, so long as they do not overlap in
-/// time; sources that do overlap are rejected rather than silently double-counted.
-#[test]
-fn cli_bars_mixes_tick_and_bar_files_and_rejects_overlap() {
-    let dir = temp_dir("climix");
-    let exe = env!("CARGO_BIN_EXE_mdfwob");
-    // 2024-01-02 14:30:00Z (09:30 ET) and the same clock time the next day: two disjoint windows
-    // of 20 one-minute ticks each, which at 5m is 4 buckets apiece.
-    let base = 1_704_205_800u32;
-    let early = write_tick_window(&dir, "early.fwob", base, 20);
-    let late = write_tick_window(&dir, "late.fwob", base + 86_400, 20);
-
-    // Pre-aggregate only the earlier window into a 5m bar file.
-    let bar_dir = dir.join("bars");
-    let out = Command::new(exe)
-        .args([
-            "bars",
-            early.to_str().unwrap(),
-            "5m",
-            "fwob",
-            "--output",
-            bar_dir.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "bars fwob failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let early_bars = bar_dir.join("AAPL.fwob");
-
-    // Mixed kinds, disjoint in time: one ascending series spanning both windows. The later file is
-    // passed first to prove the result does not depend on the order the files are given in.
-    let out = Command::new(exe)
-        .args([
-            "bars",
-            late.to_str().unwrap(),
-            early_bars.to_str().unwrap(),
-            "5m",
-            "csv",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "mixing disjoint tick and bar files failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    // `csv` renders the key as a raw epoch second.
-    let times: Vec<u32> = stdout
-        .lines()
-        .skip(1) // header
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| l.split(',').next().unwrap().parse().unwrap())
-        .collect();
-    assert_eq!(times.len(), 8, "expected 4 buckets per window: {stdout}");
-    assert!(
-        times.windows(2).all(|w| w[0] < w[1]),
-        "rows must be ascending: {stdout}"
-    );
-    // The bar file's window opens the series and the tick file's closes it, in time order.
-    assert_eq!(times[0], base, "{stdout}");
-    assert_eq!(times[7], base + 86_400 + 900, "{stdout}");
-
-    // The bar file *is* the aggregate of `early`, so feeding both would count that window twice.
-    let out = Command::new(exe)
-        .args([
-            "bars",
-            early.to_str().unwrap(),
-            early_bars.to_str().unwrap(),
-            "5m",
-            "csv",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        !out.status.success(),
-        "overlapping sources should be rejected"
-    );
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        combined.contains("overlapping times"),
-        "expected an overlap error: {combined}"
-    );
-    // The failure must precede any output, not arrive after a table header.
-    assert!(
-        !combined.contains("open,high"),
-        "no table header should be written before the error: {combined}"
-    );
 
     let _ = fs::remove_dir_all(dir);
 }
