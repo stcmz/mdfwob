@@ -7,6 +7,7 @@ use fwob::formatting::FrameFormat;
 use fwob::toml::TomlWriter;
 use fwob::{FormatVersion, Reader};
 use fwob_core::Key;
+use jiff::tz::TimeZone;
 
 use std::collections::BTreeMap;
 
@@ -28,9 +29,9 @@ use crate::{
         plot::{Canvas, PlotOptions, Series, render},
         read::{
             InputKind, TickQuery, decode_tick, detect_kind, discover_inputs, file_symbol,
-            input_kind, open_tick_reader, stream_bars_file, stream_ticks,
+            open_tick_reader, stream_bars_file, stream_ticks,
         },
-        resample::{BarClock, BarResampler, ForwardFiller, Resampler},
+        resample::{BarClock, ForwardFiller, Resampler},
         schema::{
             bar_schema, calc_schema, decode_bar, encode_bar, encode_calc_row, with_symbol_column,
         },
@@ -766,18 +767,10 @@ impl BarsArgs {
             session: use_rth.then(|| session.clone()),
         };
 
-        // Group input files (tick or bar) by the symbol they report, preserving discovery order so
-        // a symbol's files feed one resampler as a single ascending stream. Only the header of each
-        // file is read here; the heavy scan happens during streaming.
-        let mut by_symbol: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
-        for path in &files {
-            match file_symbol(path) {
-                Ok(symbol) => by_symbol.entry(symbol).or_default().push(path.clone()),
-                Err(error) => {
-                    tracing::error!(path = %path.display(), error = %format!("{error:#}"), "failed to read")
-                }
-            }
-        }
+        // Group input files (tick or bar) by the symbol they report and order each symbol's files
+        // into one ascending stream. Only headers are read here; the heavy scan happens during
+        // streaming.
+        let by_symbol = plan_by_symbol(&files, &query, &session.time_zone())?;
 
         let out_dir = self.output.clone().or_else(|| acfg.output_dir.clone());
         let stdout = std::io::stdout();
@@ -793,10 +786,10 @@ impl BarsArgs {
                 // Stream each bucket straight into the bar file so a fine-interval conversion of a
                 // whole tick history (e.g. 1s over billions of ticks) keeps bounded memory instead
                 // of buffering the entire bar series first.
-                for (symbol, paths) in &by_symbol {
+                for (symbol, segments) in &by_symbol {
                     let path = dir.join(format!("{symbol}.fwob"));
                     let mut writer = FrameWriter::create(&path, bar_schema(), symbol)?;
-                    stream_bars(paths, interval, &clock, &query, fill, |bar| {
+                    stream_bars(segments, interval, &clock, &query, fill, |bar| {
                         writer.push(|buf| encode_bar(&bar, buf))
                     })?;
                     writer.finish()?;
@@ -819,8 +812,8 @@ impl BarsArgs {
                 // when redirected, stay buffered for throughput.
                 let autoflush = std::io::stdout().is_terminal();
                 let mut stream = FrameStream::new(&schema, strings, frame, autoflush, &mut out)?;
-                for (index, (_symbol, paths)) in by_symbol.iter().enumerate() {
-                    stream_bars(paths, interval, &clock, &query, fill, |bar| {
+                for (index, (_symbol, segments)) in by_symbol.iter().enumerate() {
+                    stream_bars(segments, interval, &clock, &query, fill, |bar| {
                         stream.emit(index, |buf| encode_bar(&bar, buf))
                     })?;
                 }
@@ -936,30 +929,16 @@ impl PlotArgs {
             end,
             session: filter.clone(),
         };
+        // One resampler per symbol, not per file, so a symbol split across several files plots as a
+        // single ascending series instead of concatenated per-file series.
         let mut groups: BTreeMap<String, Vec<Bar>> = BTreeMap::new();
-        for path in &files {
-            let result = (|| -> Result<(String, Vec<Bar>)> {
-                let symbol = file_symbol(path)?;
-                let mut bars = Vec::new();
-                stream_bars(
-                    std::slice::from_ref(path),
-                    interval,
-                    &clock,
-                    &query,
-                    fill,
-                    |bar| {
-                        bars.push(bar);
-                        Ok(())
-                    },
-                )?;
-                Ok((symbol, bars))
-            })();
-            match result {
-                Ok((symbol, mut bars)) => groups.entry(symbol).or_default().append(&mut bars),
-                Err(error) => {
-                    tracing::error!(path = %path.display(), error = %format!("{error:#}"), "failed to read")
-                }
-            }
+        for (symbol, segments) in &plan_by_symbol(&files, &query, &session.time_zone())? {
+            let mut bars = Vec::new();
+            stream_bars(segments, interval, &clock, &query, fill, |bar| {
+                bars.push(bar);
+                Ok(())
+            })?;
+            groups.insert(symbol.clone(), bars);
         }
         if groups.is_empty() {
             bail!("no plottable inputs resolved");
@@ -1065,60 +1044,136 @@ fn write_chart_file(canvas: &Canvas, path: &Path) -> Result<()> {
     }
 }
 
-/// Streams a symbol's bars to `sink` as each bucket closes, feeding all of `paths` through one
-/// resampler (so multiple files of the same symbol form a single ascending stream) and applying
-/// forward-fill when requested.
+/// One input file's contribution to a symbol's stream: its kind, plus the portion of its key range
+/// that falls inside the query window. Built from headers alone (see [`plan_segments`]).
+#[derive(Debug, Clone)]
+struct Segment {
+    path: PathBuf,
+    kind: InputKind,
+    /// Inclusive first/last key second, already clamped to the query window.
+    first: u32,
+    last: u32,
+}
+
+/// Orders one symbol's input files into a single ascending, non-overlapping stream.
 ///
-/// Accepts both tick files (resampled from ticks) and pre-aggregated bar files (re-resampled from
-/// bars to the requested `interval`, e.g. 1s→1m), so every downstream command honors the interval
-/// regardless of input format. A symbol's files must all be the same kind. Ticks are read in bulk
-/// chunks and never fully materialized; bar files honor the `query` window by bar time.
+/// Tick and bar files may be mixed freely — both resample onto the requested interval, so a symbol
+/// whose history is split across formats (archived bars plus recent ticks) reads as one series.
+/// What the resampler actually requires is not a uniform kind but an **ascending** stream, so the
+/// files are sorted by their first key rather than trusted in discovery order, and each file's
+/// range is clamped to the query window first (a file outside the window contributes nothing and
+/// is dropped rather than being allowed to conflict).
+///
+/// Overlapping ranges are rejected: the sources would each contribute to the same buckets, summing
+/// their volume and trades into totals that silently double-count. This is the usual shape of the
+/// mistake — passing both a tick file and its own pre-aggregated bar file.
+///
+/// Cheap: only headers and boundary keys are read; the heavy scan happens later, while streaming.
+fn plan_segments(paths: &[PathBuf], query: &TickQuery, tz: &TimeZone) -> Result<Vec<Segment>> {
+    let mut segments: Vec<Segment> = Vec::new();
+    for path in paths {
+        let mut reader =
+            Reader::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+        let kind = detect_kind(&reader)?;
+        let (Some(first), Some(last)) = (
+            reader.first_key()?.and_then(key_epoch),
+            reader.last_key()?.and_then(key_epoch),
+        ) else {
+            continue; // empty file
+        };
+        let first = first.max(query.start.unwrap_or(u32::MIN));
+        let last = last.min(query.end.unwrap_or(u32::MAX));
+        if first > last {
+            continue; // nothing inside the window
+        }
+        segments.push(Segment {
+            path: path.clone(),
+            kind,
+            first,
+            last,
+        });
+    }
+    segments.sort_by_key(|s| (s.first, s.last));
+
+    for pair in segments.windows(2) {
+        let (earlier, later) = (&pair[0], &pair[1]);
+        if later.first < earlier.last {
+            bail!(
+                "{} and {} cover overlapping times ({} to {}) for one symbol; \
+                 combining them would double-count volume and trades — \
+                 pass only one of them, or restrict the range so they do not overlap",
+                earlier.path.display(),
+                later.path.display(),
+                format_epoch_tz(later.first, tz),
+                format_epoch_tz(earlier.last.min(later.last), tz),
+            )
+        }
+    }
+    Ok(segments)
+}
+
+/// Groups input files by the symbol they report and plans each symbol's stream (see
+/// [`plan_segments`]). Files that cannot be read are reported and skipped, matching the per-file
+/// tolerance of the rest of the CLI; an ordering conflict within one symbol is fatal.
+///
+/// Planning every symbol up front means a conflict surfaces before any output is written, rather
+/// than after a table header (or part of a table) has already reached the terminal.
+fn plan_by_symbol(
+    files: &[PathBuf],
+    query: &TickQuery,
+    tz: &TimeZone,
+) -> Result<BTreeMap<String, Vec<Segment>>> {
+    let mut by_symbol: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+    for path in files {
+        match file_symbol(path) {
+            Ok(symbol) => by_symbol.entry(symbol).or_default().push(path.clone()),
+            Err(error) => {
+                tracing::error!(path = %path.display(), error = %format!("{error:#}"), "failed to read")
+            }
+        }
+    }
+    by_symbol
+        .into_iter()
+        .map(|(symbol, paths)| Ok((symbol, plan_segments(&paths, query, tz)?)))
+        .collect()
+}
+
+/// Streams a symbol's bars to `sink` as each bucket closes, feeding all of `segments` through one
+/// resampler (so a symbol's files form a single ascending stream) and applying forward-fill when
+/// requested.
+///
+/// Accepts tick files (resampled from ticks) and pre-aggregated bar files (re-resampled from bars
+/// to the requested `interval`, e.g. 1s→1m) in any combination, so every downstream command honors
+/// the interval regardless of input format. Ticks are read in bulk chunks and never fully
+/// materialized; bar files honor the `query` window by bar time.
 fn stream_bars(
-    paths: &[PathBuf],
+    segments: &[Segment],
     interval: Interval,
     clock: &BarClock,
     query: &TickQuery,
     fill: bool,
     sink: impl FnMut(Bar) -> Result<()>,
 ) -> Result<()> {
-    let mut kind: Option<InputKind> = None;
-    for path in paths {
-        let this = input_kind(path)?;
-        match kind {
-            Some(existing) if existing != this => {
-                bail!(
-                    "cannot mix tick and bar files for one symbol ({})",
-                    path.display()
-                )
-            }
-            _ => kind = Some(this),
-        }
-    }
-
     let mut filler = ForwardFiller::new(interval, clock.clone(), fill, sink);
-    match kind {
-        Some(InputKind::Bar) => {
-            let mut resampler = BarResampler::new(interval, clock.clone());
-            for path in paths {
-                // Seek to the window instead of reading the whole bar file, so a narrow time range
-                // is proportionally fast.
-                stream_bars_file(path, query, |bar| {
-                    resampler.push(&bar, &mut |bar| filler.push(bar))
+    let mut resampler = Resampler::new(interval, clock.clone());
+    for segment in segments {
+        match segment.kind {
+            // Seek to the window instead of reading the whole bar file, so a narrow time range is
+            // proportionally fast.
+            InputKind::Bar => {
+                stream_bars_file(&segment.path, query, |bar| {
+                    resampler.push_bar(&bar, &mut |bar| filler.push(bar))
                 })?;
             }
-            resampler.finish(&mut |bar| filler.push(bar))
-        }
-        _ => {
-            let mut resampler = Resampler::new(interval, clock.clone());
-            for path in paths {
-                let (mut reader, _) = open_tick_reader(path)?;
+            InputKind::Tick => {
+                let (mut reader, _) = open_tick_reader(&segment.path)?;
                 stream_ticks(&mut reader, query, |tick| {
                     resampler.push(&tick, &mut |bar| filler.push(bar))
                 })?;
             }
-            resampler.finish(&mut |bar| filler.push(bar))
         }
     }
+    resampler.finish(&mut |bar| filler.push(bar))
 }
 
 /// Warns when a sub-day interval does not evenly divide the active trading session (RTH or
@@ -1236,19 +1291,11 @@ impl CalcArgs {
             session: filter.clone(),
         };
 
-        // Group input files by the symbol they report (header only), preserving discovery order so a
-        // symbol's files feed one resampler as a single ascending stream (mirrors `bars`). Each
-        // symbol is then processed and emitted on its own, so rows appear as their bars close and
-        // only one symbol's state is live at a time.
-        let mut by_symbol: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
-        for path in &files {
-            match file_symbol(path) {
-                Ok(symbol) => by_symbol.entry(symbol).or_default().push(path.clone()),
-                Err(error) => {
-                    tracing::error!(path = %path.display(), error = %format!("{error:#}"), "failed to read")
-                }
-            }
-        }
+        // Group input files by the symbol they report and order each symbol's files into one
+        // ascending stream (mirrors `bars`; headers only). Each symbol is then processed and emitted
+        // on its own, so rows appear as their bars close and only one symbol's state is live at a
+        // time.
+        let by_symbol = plan_by_symbol(&files, &query, &session.time_zone())?;
 
         // Column names and precisions are identical across symbols (same specs), so derive the
         // shared schema once; the stateful streaming indicators are re-created per symbol.
@@ -1265,12 +1312,12 @@ impl CalcArgs {
                     .context("calc --format fwob requires --output DIR")?;
                 std::fs::create_dir_all(dir)
                     .with_context(|| format!("failed to create {}", dir.display()))?;
-                for (symbol, paths) in &by_symbol {
+                for (symbol, segments) in &by_symbol {
                     let mut indicators = build_streaming_indicators(&spec_tokens)?;
                     let path = dir.join(format!("{symbol}.fwob"));
                     let mut writer =
                         FrameWriter::create(&path, calc_schema(&names, &decimals)?, symbol)?;
-                    stream_bars(paths, interval, &clock, &query, fill, |bar| {
+                    stream_bars(segments, interval, &clock, &query, fill, |bar| {
                         let values: Vec<Option<f64>> =
                             indicators.iter_mut().map(|i| i.update(&bar)).collect();
                         writer.push(|buf| {
@@ -1314,11 +1361,11 @@ impl CalcArgs {
                 {
                     let mut stream =
                         FrameStream::new(&schema, strings, frame, autoflush, &mut out)?;
-                    for (index, (symbol, paths)) in by_symbol.iter().enumerate() {
+                    for (index, (symbol, segments)) in by_symbol.iter().enumerate() {
                         let mut indicators = build_streaming_indicators(&spec_tokens)?;
                         let mut collector =
                             show_summary.then(|| SummaryCollector::new(&summary_columns));
-                        stream_bars(paths, interval, &clock, &query, fill, |bar| {
+                        stream_bars(segments, interval, &clock, &query, fill, |bar| {
                             let values: Vec<Option<f64>> =
                                 indicators.iter_mut().map(|i| i.update(&bar)).collect();
                             stream.emit(index, |buf| {
