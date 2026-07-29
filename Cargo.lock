@@ -910,9 +910,9 @@ dependencies = [
 
 [[package]]
 name = "fwob"
-version = "1.14.0"
+version = "1.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7453ac236c5861bba7313d04ac01220ac8fa5a69676867534e74e7165c16f5c3"
+checksum = "c378a948489546a5ed1bfe67b58bd4f2014ecf975c0cfcbfa662865f3eb41761"
 dependencies = [
  "anyhow",
  "clap",
@@ -929,9 +929,9 @@ dependencies = [
 
 [[package]]
 name = "fwob-core"
-version = "1.14.0"
+version = "1.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dbeccd989aa1bc47903c6d1ad76eac64b8be4ea16dc344a5256a00c1bb00cc61"
+checksum = "8f096cd8ca96182080d883e76c8594ae5a11cfff0084ec34486996cbebfcf65e"
 dependencies = [
  "fwob-derive",
  "rust_decimal",
@@ -940,9 +940,9 @@ dependencies = [
 
 [[package]]
 name = "fwob-derive"
-version = "1.14.0"
+version = "1.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51cfbdd26eb59698a1defa22b28ab52c717008850325fd04470cb7bb1b86a823"
+checksum = "2c8e0f9e5ec5757c791be5da1871dd02942daf4cf2e7a400fe7414a5816c2f92"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -951,9 +951,9 @@ dependencies = [
 
 [[package]]
 name = "fwob-v1"
-version = "1.14.0"
+version = "1.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "284cda76b3085c27d56f36a0215de728416bb44119ed092ca1a7cb81a9f7b85b"
+checksum = "e20021de6b2df7bba2e781ddfb20b609440275440653ad3583b83d23682a4629"
 dependencies = [
  "byteorder",
  "fwob-core",
@@ -962,9 +962,9 @@ dependencies = [
 
 [[package]]
 name = "fwob-v2"
-version = "1.14.0"
+version = "1.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1c18bbbb2a431ef72d5afedad314e37ee569d700c05f89ae5a92ddf6f604f43"
+checksum = "98eacd340835a2ae38946ff951dab54d2263531a90bcb74039be621a3d4cba10"
 dependencies = [
  "byteorder",
  "crc32fast",
@@ -1469,9 +1469,9 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "lz4_flex"
-version = "0.13.1"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ef0d4ed8669f8f8826eb00dc878084aa8f253506c4fd5e8f58f5bce72ddb97e"
+checksum = "ecbdfe44b1bd960b68170b417450a628c43f7cf56bb3c5317e61cb230ee7f226"
 dependencies = [
  "twox-hash",
 ]
