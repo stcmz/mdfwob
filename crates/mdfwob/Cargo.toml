@@ -14,9 +14,18 @@ categories = ["command-line-utilities"]
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
 
+[features]
+default = ["mcp"]
+# `mdfwob mcp`: a read-only Model Context Protocol server on stdio. On by default so
+# `cargo install mdfwob` ships it; library consumers can opt out with
+# `default-features = false`.
+mcp = ["dep:base64", "dep:rmcp", "dep:schemars", "tokio/io-std", "tokio/macros"]
+
 [dependencies]
 mdfwob-core = { version = "1.10.1", path = "../mdfwob-core" }
 anyhow = "1.0"
+# Only for encoding chart PNGs into MCP image content blocks.
+base64 = { version = "0.22", optional = true }
 clap = { version = "4.5", features = ["derive"] }
 ctrlc = "3.5"
 databento = "0.55.0"
@@ -27,6 +36,15 @@ fwob-v1 = "1.14"
 fwob-v2 = "1.14"
 ibapi = { version = "3.1.0", default-features = false, features = ["sync"] }
 jiff = "0.2"
+# Pinned to 3.1: its MSRV is 1.88, exactly this workspace's floor, so a minor bump
+# could silently push us past the `Rust MSRV 1.88` CI job.
+rmcp = { version = "3.1", optional = true, default-features = false, features = [
+    "server",
+    "macros",
+    "transport-io",
+] }
+# Kept in the same semver range rmcp depends on, so the two unify on one version.
+schemars = { version = "1", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # Cap below time 0.3.50, which fails to compile (unresolved `time_macros::timestamp`).

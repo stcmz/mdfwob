@@ -1,17 +1,159 @@
-//! Helpers for the `inspect` command: bar-granularity and trading-hours detection over a bounded
-//! frame sample, schema-field labels, and a timezone- and semantic-aware frame preview. Pure
-//! functions over decoded values so they are unit-testable without a file.
+//! The `inspect` overview: a bounded, no-full-scan read of one tick or bar file into an
+//! [`Inspection`], plus the pure helpers it is built from (bar-granularity and trading-hours
+//! detection over a frame sample, schema-field labels, and a timezone- and semantic-aware frame
+//! preview), which stay public so they are unit-testable without a file.
+//!
+//! [`inspect_file`] does the assembly once so every front end renders the *same* overview — the
+//! CLI as colored TOML, the MCP server as JSON — instead of each re-deriving it and drifting.
 
 use std::ops::Range;
+use std::path::Path;
 
-use fwob_core::{FieldSemantic, FieldType, TimestampUnit};
+use anyhow::{Context, Result};
+use fwob::{FormatVersion, Reader};
+use fwob_core::{FieldSemantic, FieldType, Schema, TimestampUnit};
 use jiff::{Timestamp, tz::TimeZone};
 
 use crate::analysis::model::{Bar, Tick};
 use crate::analysis::output::{comma_i64, comma_u64, fmt_price, format_epoch_tz};
+use crate::analysis::read::{InputKind, decode_tick, detect_kind, key_epoch};
+use crate::analysis::schema::decode_bar;
 use crate::analysis::session::Session;
 
 const DAY: u32 = 86_400;
+
+/// Everything the `inspect` overview reports about one tick or bar file.
+///
+/// Deliberately holds domain values (a [`Schema`], epoch seconds, an [`InputKind`]) rather than
+/// display strings, so each front end formats them its own way; the one exception is `preview`,
+/// which is a rendered table because both front ends want it verbatim.
+#[derive(Debug, Clone)]
+pub struct Inspection {
+    pub kind: InputKind,
+    pub format: FormatVersion,
+    /// The header title verbatim — empty when the file carries none. Reported as-is by
+    /// `mdfwob inspect`'s `title`; prefer [`symbol`](Self::symbol) when you need a name to show.
+    pub title: String,
+    /// The header title, or the file stem when the header carries none. Matches what `ls` reports.
+    pub symbol: String,
+    pub schema: Schema,
+    pub frame_count: u64,
+    pub physical_bytes: u64,
+    /// Boundary keys as epoch seconds.
+    pub first: Option<u32>,
+    pub last: Option<u32>,
+    /// Detected bar interval (`1m`, `1d`, …). `None` for tick files or too few bars to tell.
+    pub granularity: Option<String>,
+    /// `"rth"` / `"extended"`; `None` when the file has no frames to classify.
+    pub hours: Option<&'static str>,
+    /// Head/tail sample, already rendered in the requested timezone with field semantics honored.
+    pub preview: String,
+}
+
+impl Inspection {
+    /// The on-disk format as it is reported to users: `"fwob-v1"` or `"fwob-v2"`.
+    pub fn format_label(&self) -> &'static str {
+        match self.format {
+            FormatVersion::V1 => "fwob-v1",
+            FormatVersion::V2 => "fwob-v2",
+        }
+    }
+
+    /// `"tick"` or `"bar"`.
+    pub fn kind_label(&self) -> &'static str {
+        match self.kind {
+            InputKind::Tick => "tick",
+            InputKind::Bar => "bar",
+        }
+    }
+}
+
+/// Reads one tick or bar file's overview: header metadata, boundary keys, and — from up to
+/// `sample` frames at each end — the bar granularity, trading-hours classification, and a decoded
+/// preview rendered in `tz`.
+///
+/// Bounded by construction: only the header, the two boundary keys, and the sampled windows are
+/// read, never the whole file. `rth` supplies the regular-hours window used to classify `hours`.
+/// Fails if the file is not a canonical Tick/Bar file.
+pub fn inspect_file(path: &Path, rth: &Session, tz: &TimeZone, sample: u64) -> Result<Inspection> {
+    let mut reader =
+        Reader::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let kind =
+        detect_kind(&reader).with_context(|| format!("failed to inspect {}", path.display()))?;
+    let format = reader.format_version();
+    let title = reader.title().to_owned();
+    let symbol = if title.is_empty() {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_owned()
+    } else {
+        title.clone()
+    };
+    let schema = reader.schema().clone();
+    let frame_count = reader.frame_count();
+    let physical_bytes = std::fs::metadata(path)
+        .with_context(|| format!("failed to stat {}", path.display()))?
+        .len();
+    let first = reader.first_key()?.and_then(key_epoch);
+    let last = reader.last_key()?.and_then(key_epoch);
+
+    // The same windows `ls` samples (shared `sample_windows`), so the two agree on granularity and
+    // hours. The leading window also feeds the preview's head, the trailing window its tail.
+    let (lead, tail) = sample_windows(frame_count, sample);
+    let mut times: Vec<u32> = Vec::new();
+    let (mut lead_ticks, mut tail_ticks): (Vec<Tick>, Vec<Tick>) = (Vec::new(), Vec::new());
+    let (mut lead_bars, mut tail_bars): (Vec<Bar>, Vec<Bar>) = (Vec::new(), Vec::new());
+    for (range, is_tail) in std::iter::once((lead, false)).chain(tail.map(|t| (t, true))) {
+        for frame in reader.frames(range)? {
+            let frame = frame?;
+            match kind {
+                InputKind::Tick => {
+                    let tick = decode_tick(frame.bytes());
+                    times.push(tick.time);
+                    if is_tail {
+                        &mut tail_ticks
+                    } else {
+                        &mut lead_ticks
+                    }
+                    .push(tick);
+                }
+                InputKind::Bar => {
+                    let bar = decode_bar(frame.bytes())?;
+                    times.push(bar.time);
+                    if is_tail {
+                        &mut tail_bars
+                    } else {
+                        &mut lead_bars
+                    }
+                    .push(bar);
+                }
+            }
+        }
+    }
+
+    let preview = match kind {
+        InputKind::Tick => preview_ticks(&preview_rows(frame_count, &lead_ticks, &tail_ticks), tz),
+        InputKind::Bar => preview_bars(&preview_rows(frame_count, &lead_bars, &tail_bars), tz),
+    };
+
+    Ok(Inspection {
+        kind,
+        format,
+        title,
+        symbol,
+        schema,
+        frame_count,
+        physical_bytes,
+        first,
+        last,
+        granularity: (kind == InputKind::Bar)
+            .then(|| detect_bar_granularity(&times))
+            .flatten(),
+        hours: (!times.is_empty()).then(|| classify_hours(&times, rth)),
+        preview,
+    })
+}
 
 /// The leading and (optional) trailing frame-index windows to sample from a `frame_count`-frame
 /// file, each up to `per_end` frames and never overlapping. `inspect` and `ls` both sample these

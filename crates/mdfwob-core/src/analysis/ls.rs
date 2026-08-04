@@ -8,12 +8,11 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use fwob::Reader;
-use fwob_core::Key;
 use jiff::tz::TimeZone;
 
 use crate::analysis::inspect::{classify_hours, detect_bar_granularity, sample_windows};
 use crate::analysis::output::{Table, comma_u64, format_epoch_tz};
-use crate::analysis::read::{InputKind, decode_tick, detect_kind};
+use crate::analysis::read::{InputKind, decode_tick, detect_kind, key_epoch};
 use crate::analysis::schema::decode_bar;
 use crate::analysis::session::Session;
 use crate::analysis::stat::format_label;
@@ -56,14 +55,6 @@ pub struct LsRow {
     pub granularity: Option<String>,
     pub hours: &'static str,
     pub bytes: u64,
-}
-
-fn key_epoch(key: Key) -> Option<u32> {
-    match key {
-        Key::U32(value) => Some(value),
-        Key::I64(value) => u32::try_from(value).ok(),
-        _ => None,
-    }
 }
 
 /// Reads one file's listing row: metadata (symbol/kind/format/frame_count/bytes), boundary time

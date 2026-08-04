@@ -11,13 +11,14 @@
 //! sizes scale with the canvas so a 4K image looks proportional to a 1080p one.
 
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use font8x8::legacy::BASIC_LEGACY;
 use jiff::{Timestamp, tz::TimeZone};
 
+use crate::analysis::calc::parse_spec;
 use crate::analysis::model::Bar;
 
 /// Palette indices. The Sixel encoder and PNG writer share this exact table, so what a terminal
@@ -211,26 +212,116 @@ impl Canvas {
         encode_sixel(&self.px, self.width, self.height)
     }
 
+    /// Encodes the canvas as an indexed-color PNG in memory.
+    ///
+    /// Separate from [`write_png`](Self::write_png) so callers that need the bytes rather than a
+    /// file — serving the chart over a protocol, embedding it in a response — do not have to round
+    /// trip through a temporary file.
+    pub fn encode_png(&self) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut out, self.width, self.height);
+            encoder.set_color(png::ColorType::Indexed);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut palette = Vec::with_capacity(PALETTE.len() * 3);
+            for (r, g, b) in PALETTE {
+                palette.extend_from_slice(&[r, g, b]);
+            }
+            encoder.set_palette(palette);
+            let mut writer = encoder
+                .write_header()
+                .context("failed to write PNG header")?;
+            writer
+                .write_image_data(&self.px)
+                .context("failed to write PNG data")?;
+        }
+        Ok(out)
+    }
+
     /// Writes the canvas to `path` as an indexed-color PNG.
     pub fn write_png(&self, path: &Path) -> Result<()> {
-        let file =
-            File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
-        let mut encoder = png::Encoder::new(BufWriter::new(file), self.width, self.height);
-        encoder.set_color(png::ColorType::Indexed);
-        encoder.set_depth(png::BitDepth::Eight);
-        let mut palette = Vec::with_capacity(PALETTE.len() * 3);
-        for (r, g, b) in PALETTE {
-            palette.extend_from_slice(&[r, g, b]);
-        }
-        encoder.set_palette(palette);
-        let mut writer = encoder
-            .write_header()
-            .with_context(|| format!("failed to write PNG header to {}", path.display()))?;
-        writer
-            .write_image_data(&self.px)
+        let bytes = self.encode_png()?;
+        let mut file = BufWriter::new(
+            File::create(path).with_context(|| format!("failed to create {}", path.display()))?,
+        );
+        file.write_all(&bytes)
             .with_context(|| format!("failed to write PNG data to {}", path.display()))?;
+        file.flush()
+            .with_context(|| format!("failed to flush {}", path.display()))?;
         Ok(())
     }
+}
+
+/// Indicator series sorted into the panels that draw them, plus whether a volume panel is wanted.
+///
+/// Produced by [`layout_series`] so every front end routes specs identically — a `sma` is a price
+/// overlay and a `vsma` a volume overlay no matter who asked for the chart.
+#[derive(Debug, Clone, Default)]
+pub struct PlotLayout {
+    /// Price-scale lines drawn over the candles (`sma`/`ema`/`dema`).
+    pub overlays: Vec<Series>,
+    /// Own-scale indicators, each in its own stacked panel (`rsi`/`ret`/`vol`).
+    pub panels: Vec<Series>,
+    /// Volume-scale lines drawn over the volume panel (`vsma`/`vema`/`vdema`).
+    pub volume_overlays: Vec<Series>,
+    /// Whether to draw the volume panel at all.
+    pub volume: bool,
+}
+
+impl PlotLayout {
+    /// Every series label in draw order, plus a bare `vol` when the volume panel carries no
+    /// overlay of its own — this is what the chart title lists.
+    pub fn labels(&self) -> Vec<String> {
+        let mut labels: Vec<String> = self
+            .overlays
+            .iter()
+            .chain(self.panels.iter())
+            .chain(self.volume_overlays.iter())
+            .map(|series| series.label.clone())
+            .collect();
+        if self.volume && self.volume_overlays.is_empty() {
+            labels.push("vol".to_owned());
+        }
+        labels
+    }
+
+    /// The chart title: symbol, interval, then the series being drawn.
+    pub fn title(&self, symbol: &str, interval_label: &str) -> String {
+        format!("{symbol}  {interval_label}   {}", self.labels().join(" "))
+    }
+}
+
+/// Computes each spec against `bars` and routes it to the panel that should draw it.
+///
+/// A volume moving average implies the volume panel even when `volume` is false. With no specs at
+/// all the chart would be bare candles, so a 20-bar SMA overlay is added as the default.
+pub fn layout_series(bars: &[Bar], specs: &[String], volume: bool) -> Result<PlotLayout> {
+    let mut layout = PlotLayout::default();
+    for spec in specs {
+        let indicator = parse_spec(spec)
+            .with_context(|| format!("unknown indicator spec {spec:?}"))?
+            .with_context(|| format!("invalid indicator spec {spec:?}"))?;
+        let series = Series {
+            label: indicator.name(),
+            values: indicator.compute(bars),
+        };
+        match spec.split(':').next() {
+            Some("sma" | "ema" | "dema") => layout.overlays.push(series),
+            Some("vsma" | "vema" | "vdema") => layout.volume_overlays.push(series),
+            _ => layout.panels.push(series),
+        }
+    }
+    layout.volume = volume || !layout.volume_overlays.is_empty();
+    if layout.overlays.is_empty() && layout.panels.is_empty() && layout.volume_overlays.is_empty() {
+        let sma = parse_spec("sma:20")
+            .expect("\"sma:20\" is a valid spec")
+            .expect("20 is a valid period");
+        layout.overlays.push(Series {
+            label: sma.name(),
+            values: sma.compute(bars),
+        });
+    }
+    Ok(layout)
 }
 
 /// Renders `bars` into a candlestick [`Canvas`]. Returns an all-background canvas when `bars` is

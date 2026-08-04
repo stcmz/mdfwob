@@ -3,10 +3,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
+use fwob::Reader;
 use fwob::formatting::FrameFormat;
 use fwob::toml::TomlWriter;
-use fwob::{FormatVersion, Reader};
-use fwob_core::Key;
 
 use std::collections::BTreeMap;
 
@@ -14,26 +13,21 @@ use crate::{
     analysis::{
         calc::{StreamingIndicator, parse_spec, parse_streaming_spec},
         config::{AnalysisConfig, DEFAULT_EXTENDED_HOURS, DEFAULT_RTH_HOURS},
-        inspect::{
-            classify_hours, detect_bar_granularity, field_semantic_label, field_type_label,
-            preview_bars, preview_rows, preview_ticks, sample_windows,
-        },
+        inspect::{field_semantic_label, field_type_label, inspect_file},
         interval::{Granularity, Interval},
         ls::{LsFormat, ls_file, write_ls},
-        model::{Bar, Tick},
+        model::Bar,
         output::{
             AnalysisFormat, FrameStream, FrameWriter, format_epoch_tz, guard_symbol_count,
             write_stat,
         },
-        plot::{Canvas, PlotOptions, Series, render},
+        plot::{Canvas, PlotOptions, layout_series, render},
         read::{
-            InputKind, TickQuery, decode_tick, detect_kind, discover_inputs, file_symbol,
-            input_kind, open_tick_reader, stream_bars_file, stream_ticks,
+            InputKind, TickQuery, detect_kind, discover_inputs, file_symbol, input_kind,
+            open_tick_reader, stream_bars_file, stream_ticks,
         },
         resample::{BarClock, BarResampler, ForwardFiller, Resampler},
-        schema::{
-            bar_schema, calc_schema, decode_bar, encode_bar, encode_calc_row, with_symbol_column,
-        },
+        schema::{bar_schema, calc_schema, encode_bar, encode_calc_row, with_symbol_column},
         session::Session,
         stat::stat_file,
         summary::{SummaryCollector, SummaryColumn},
@@ -63,6 +57,8 @@ impl Cli {
             Command::Bars(args) => args.run(),
             Command::Calc(args) => args.run(),
             Command::Plot(args) => args.run(),
+            #[cfg(feature = "mcp")]
+            Command::Mcp(args) => args.run(),
         }
     }
 }
@@ -85,6 +81,9 @@ enum Command {
     Calc(CalcArgs),
     /// Render OHLC bars as a candlestick chart (Sixel to the console, or a PNG file).
     Plot(PlotArgs),
+    /// Serve the read-only analysis commands to an LLM agent over MCP (JSON-RPC on stdio).
+    #[cfg(feature = "mcp")]
+    Mcp(crate::mcp::McpArgs),
 }
 
 /// Shared help text describing every built-in indicator spec (what it is good for and how it is
@@ -322,24 +321,15 @@ fn color_enabled() -> bool {
     std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
 }
 
-fn kind_label(kind: InputKind) -> &'static str {
+pub(crate) fn kind_label(kind: InputKind) -> &'static str {
     match kind {
         InputKind::Tick => "tick",
         InputKind::Bar => "bar",
     }
 }
 
-/// Extracts the `time` epoch second from a boundary [`Key`] (the tick/bar key is a `u32` second).
-fn key_epoch(key: Key) -> Option<u32> {
-    match key {
-        Key::U32(value) => Some(value),
-        Key::I64(value) => u32::try_from(value).ok(),
-        _ => None,
-    }
-}
-
 /// Frames sampled per end by `inspect` for granularity/hours detection and the head/tail preview.
-const INSPECT_SAMPLE: u64 = 1_024;
+pub(crate) const INSPECT_SAMPLE: u64 = 1_024;
 
 #[derive(Debug, Args)]
 #[command(override_usage = "mdfwob ls [CONFIG.toml] [PATHS_OR_SYMBOLS...] [FORMAT] [OPTIONS]")]
@@ -431,91 +421,41 @@ impl InspectArgs {
         let rth = resolve_session(&acfg, true, self.session.as_deref(), self.tz.as_deref())?;
         let tz = display.time_zone();
 
-        let mut reader = Reader::open(&self.path)
-            .with_context(|| format!("failed to open {}", self.path.display()))?;
-        let kind = detect_kind(&reader)
-            .with_context(|| format!("failed to inspect {}", self.path.display()))?;
-        let format = match reader.format_version() {
-            FormatVersion::V1 => "fwob-v1",
-            FormatVersion::V2 => "fwob-v2",
-        };
-        let title = reader.title().to_string();
-        let schema = reader.schema().clone();
-        let frame_count = reader.frame_count();
-        let physical_bytes = std::fs::metadata(&self.path)
-            .with_context(|| format!("failed to stat {}", self.path.display()))?
-            .len();
-
-        let first = reader.first_key()?.and_then(key_epoch);
-        let last = reader.last_key()?.and_then(key_epoch);
-
-        // Sample the same leading + trailing windows `ls` uses (shared `sample_windows`), so their
-        // granularity/hours classification is identical. Bounded — never a full scan. The leading
-        // window feeds the preview head; the trailing window the preview tail.
-        let (lead, tail) = sample_windows(frame_count, INSPECT_SAMPLE);
-        let mut times: Vec<u32> = Vec::new();
-        let mut lead_ticks: Vec<Tick> = Vec::new();
-        let mut lead_bars: Vec<Bar> = Vec::new();
-        let mut tail_ticks: Vec<Tick> = Vec::new();
-        let mut tail_bars: Vec<Bar> = Vec::new();
-        for (range, is_tail) in std::iter::once((lead, false)).chain(tail.map(|t| (t, true))) {
-            for frame in reader.frames(range)? {
-                let frame = frame?;
-                match kind {
-                    InputKind::Tick => {
-                        let tick = decode_tick(frame.bytes());
-                        times.push(tick.time);
-                        if is_tail {
-                            tail_ticks.push(tick);
-                        } else {
-                            lead_ticks.push(tick);
-                        }
-                    }
-                    InputKind::Bar => {
-                        let bar = decode_bar(frame.bytes())?;
-                        times.push(bar.time);
-                        if is_tail {
-                            tail_bars.push(bar);
-                        } else {
-                            lead_bars.push(bar);
-                        }
-                    }
-                }
-            }
-        }
+        // The whole overview is assembled in core, so this command and the MCP server report
+        // identical facts; all that differs is the rendering below.
+        let report = inspect_file(&self.path, &rth, &tz, INSPECT_SAMPLE)?;
+        let schema = &report.schema;
 
         let stdout = std::io::stdout();
         let mut out = std::io::BufWriter::new(stdout.lock());
         let mut w = TomlWriter::new(&mut out, color_enabled());
 
         w.section("file")?;
-        w.kv_str("format", format)?;
-        w.kv_str("title", &title)?;
-        w.kv_str("kind", kind_label(kind))?;
+        w.kv_str("format", report.format_label())?;
+        w.kv_str("title", &report.title)?;
+        w.kv_str("kind", report.kind_label())?;
         w.kv_str("frame_type", &schema.frame_type)?;
         w.kv_num("key_field_index", schema.key_field_index)?;
 
         w.blank()?;
         w.section("storage")?;
-        w.kv_num("physical_bytes", physical_bytes)?;
-        w.kv_num("frame_count", frame_count)?;
+        w.kv_num("physical_bytes", report.physical_bytes)?;
+        w.kv_num("frame_count", report.frame_count)?;
 
         w.blank()?;
         w.section("range")?;
         w.kv_str("timezone", tz.iana_name().unwrap_or("UTC"))?;
-        if let Some(first) = first {
+        if let Some(first) = report.first {
             w.kv_str("first", &format_epoch_tz(first, &tz))?;
         }
-        if let Some(last) = last {
+        if let Some(last) = report.last {
             w.kv_str("last", &format_epoch_tz(last, &tz))?;
         }
-        if kind == InputKind::Bar
-            && let Some(granularity) = detect_bar_granularity(&times)
-        {
-            w.kv_str("granularity", &granularity)?;
+        if let Some(granularity) = &report.granularity {
+            w.kv_str("granularity", granularity)?;
         }
-        if !times.is_empty() {
-            w.kv_str("hours", classify_hours(&times, &rth))?;
+        if let Some(hours) = report.hours {
+            w.kv_str("hours", hours)?;
         }
 
         w.blank()?;
@@ -533,16 +473,10 @@ impl InspectArgs {
             }
         }
 
-        let preview = match kind {
-            InputKind::Tick => {
-                preview_ticks(&preview_rows(frame_count, &lead_ticks, &tail_ticks), &tz)
-            }
-            InputKind::Bar => preview_bars(&preview_rows(frame_count, &lead_bars, &tail_bars), &tz),
-        };
-        if !preview.is_empty() {
+        if !report.preview.is_empty() {
             w.blank()?;
             w.section("frames")?;
-            w.kv_multiline("preview", &preview)?;
+            w.kv_multiline("preview", &report.preview)?;
         }
         out.flush()?;
         Ok(())
@@ -981,47 +915,10 @@ impl PlotArgs {
                 continue;
             }
 
-            // Compute each indicator spec against this symbol's bars and route it by kind: sma/ema
-            // overlay the price panel, vsma/vema overlay the volume panel, and the rest (rsi/ret/vol)
-            // get their own stacked panel.
-            let mut overlays: Vec<Series> = Vec::new();
-            let mut panels: Vec<Series> = Vec::new();
-            let mut volume_overlays: Vec<Series> = Vec::new();
-            for spec in &specs {
-                let indicator = parse_spec(spec).expect("spec token validated during parsing")?;
-                let series = Series {
-                    label: indicator.name(),
-                    values: indicator.compute(&bars),
-                };
-                match spec.split(':').next() {
-                    Some("sma") | Some("ema") | Some("dema") => overlays.push(series),
-                    Some("vsma") | Some("vema") | Some("vdema") => volume_overlays.push(series),
-                    _ => panels.push(series),
-                }
-            }
-            // A volume MA implies the volume panel.
-            let volume = volume || !volume_overlays.is_empty();
-            // With no overlays/panels at all, keep the previous default: a single SMA(20) overlay.
-            if overlays.is_empty() && panels.is_empty() && volume_overlays.is_empty() {
-                let sma = parse_spec("sma:20")
-                    .expect("valid spec")
-                    .expect("valid period");
-                overlays.push(Series {
-                    label: sma.name(),
-                    values: sma.compute(&bars),
-                });
-            }
-
-            let mut label_parts: Vec<String> = overlays
-                .iter()
-                .chain(panels.iter())
-                .chain(volume_overlays.iter())
-                .map(|s| s.label.clone())
-                .collect();
-            if volume && volume_overlays.is_empty() {
-                label_parts.push("vol".to_string());
-            }
-            let title = format!("{symbol}  {}   {}", interval.label(), label_parts.join(" "));
+            // Routed in core (sma/ema overlay the price panel, vsma/vema the volume panel, the
+            // rest get their own), so this chart and the MCP server's are laid out identically.
+            let layout = layout_series(&bars, &specs, volume)?;
+            let title = layout.title(&symbol, &interval.label());
 
             let opts = PlotOptions {
                 width: self.width,
@@ -1029,10 +926,10 @@ impl PlotArgs {
                 title,
                 // Label the axis in the same session tz the bars were anchored to.
                 tz: session.time_zone(),
-                overlays,
-                panels,
-                volume,
-                volume_overlays,
+                overlays: layout.overlays,
+                panels: layout.panels,
+                volume: layout.volume,
+                volume_overlays: layout.volume_overlays,
             };
             let canvas = render(&bars, &opts);
             match &self.output {
@@ -1073,7 +970,7 @@ fn write_chart_file(canvas: &Canvas, path: &Path) -> Result<()> {
 /// bars to the requested `interval`, e.g. 1s→1m), so every downstream command honors the interval
 /// regardless of input format. A symbol's files must all be the same kind. Ticks are read in bulk
 /// chunks and never fully materialized; bar files honor the `query` window by bar time.
-fn stream_bars(
+pub(crate) fn stream_bars(
     paths: &[PathBuf],
     interval: Interval,
     clock: &BarClock,
@@ -1361,7 +1258,7 @@ fn build_streaming_indicators(specs: &[String]) -> Result<Vec<Box<dyn StreamingI
 
 // ---- analysis CLI helpers ----------------------------------------------------
 
-fn load_analysis_config(path: Option<&Path>) -> Result<AnalysisConfig> {
+pub(crate) fn load_analysis_config(path: Option<&Path>) -> Result<AnalysisConfig> {
     match path {
         Some(path) => Ok(Config::read(path)
             .with_context(|| format!("failed to read config {}", path.display()))?
@@ -1539,7 +1436,7 @@ fn resolve_interval(token: Option<Interval>, config: Option<&str>) -> Result<Int
         .expect("\"1d\" is a valid interval"))
 }
 
-fn resolve_session(
+pub(crate) fn resolve_session(
     acfg: &AnalysisConfig,
     use_rth: bool,
     session_override: Option<&str>,
@@ -1563,7 +1460,7 @@ fn resolve_session(
     Session::new(tz, hours)
 }
 
-fn parse_bounds(
+pub(crate) fn parse_bounds(
     start: Option<&str>,
     end: Option<&str>,
     tz: &jiff::tz::TimeZone,
@@ -1579,7 +1476,7 @@ fn parse_bounds(
 /// (`2026-01-01T09:30:00`) or a bare date (`2026-01-01`) is interpreted in the exchange timezone
 /// `tz`, which is far less surprising for exchange data than UTC. A bare *end* date is inclusive,
 /// expanding to the very end of that local day.
-fn parse_time_bound(value: &str, is_end: bool, tz: &jiff::tz::TimeZone) -> Result<u32> {
+pub(crate) fn parse_time_bound(value: &str, is_end: bool, tz: &jiff::tz::TimeZone) -> Result<u32> {
     use jiff::{Timestamp, civil};
 
     let to_u32 = |secs: i64| {
@@ -1645,7 +1542,7 @@ fn parse_range_token(token: &str) -> Option<(Option<String>, Option<String>)> {
     ))
 }
 
-fn analysis_output_dir(acfg: &AnalysisConfig) -> PathBuf {
+pub(crate) fn analysis_output_dir(acfg: &AnalysisConfig) -> PathBuf {
     acfg.output_dir
         .clone()
         .unwrap_or_else(|| PathBuf::from("."))

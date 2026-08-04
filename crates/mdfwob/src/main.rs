@@ -22,7 +22,12 @@ impl FormatTime for LocalTimer {
 }
 
 fn main() -> Result<()> {
+    // Logs go to stderr so stdout carries only the command's data product. This matters for every
+    // redirect (`mdfwob bars ... csv > out.csv` would otherwise interleave a warning line into the
+    // CSV) and it is load-bearing for `mdfwob mcp`, where stdout is the JSON-RPC transport and a
+    // single stray log line desynchronizes the client.
     fmt()
+        .with_writer(std::io::stderr)
         .with_timer(LocalTimer)
         .with_env_filter(EnvFilter::from_default_env().add_directive("mdfwob=info".parse()?))
         .init();

@@ -170,8 +170,10 @@ mdfwob download SPCX --request-interval-ms 1000
 
 ## Analysis
 
-Six subcommands analyze the FWOB files mdfwob produces. They read both the tick
-files it downloads and the bar files `bars --format fwob` writes. `inspect` takes
+Seven subcommands analyze the FWOB files mdfwob produces (six below, plus
+[`mcp`](#mcp-server) which serves the read-only ones to an LLM agent). They read
+both the tick files it downloads and the bar files `bars --format fwob` writes.
+`inspect` takes
 a single file plus `--tz`/`--session`; `ls` takes files/dirs + a format token +
 `--tz`/`--session`; `stat`/`bars`/`calc`/`plot` share the fwob-family
 positional-token style: paths/symbols, an interval token
@@ -281,6 +283,44 @@ The same TOML file used for downloads can carry an `[analysis]` section (see
 `contracts.example.toml`); only that section is read by the analysis commands,
 and CLI tokens/flags override it. A symbol universe under `[analysis].symbols`
 is used when no positional path/symbol is given.
+
+### MCP server
+
+`mdfwob mcp` serves the read-only analysis commands to an LLM agent over the
+[Model Context Protocol](https://modelcontextprotocol.io) — JSON-RPC on
+stdin/stdout, so an MCP client spawns it as a child process and owns its
+lifetime. There is no port and no daemon. Register it with Claude Code, Claude
+Desktop, Cursor, or any other MCP client:
+
+```json
+{
+  "mcpServers": {
+    "mdfwob": { "command": "mdfwob", "args": ["mcp", "--root", "/path/to/data"] }
+  }
+}
+```
+
+Seven tools are exposed — `mdfwob_ls`, `mdfwob_inspect`, `mdfwob_verify`,
+`mdfwob_stat`, `mdfwob_bars`, `mdfwob_calc`, and `mdfwob_plot` (which returns a
+PNG image block). Two things differ from the CLI, both because the caller is a
+model rather than a person:
+
+- **Parameters are named and typed**, with a JSON Schema per tool. The
+  positional token bag above is a grammar a model has to guess at; over MCP,
+  `interval`, `specs`, `limit`, and the time window are ordinary schema'd fields.
+- **Values are in human units.** Prices are real prices and times are ISO-8601 in
+  the exchange timezone — not the raw stored integers (prices ×10⁴, epoch
+  seconds) that the `csv`/`jsonl`/`raw` formats carry.
+
+Row-returning tools cap their output (`limit`, default 1000, max 10000). When a
+result is truncated it holds the **most recent** rows and says so, and `calc`
+still runs its indicators over the full series, so warm-up stays correct.
+
+The server is read-only by construction: it exposes no write path and no
+downloader, and `--root` (defaulting to the config's `output_dir`, else the
+current directory) bounds every file it will open — symbols resolve to
+`<ROOT>/<SYMBOL>.fwob`, and absolute paths or `..` escapes are refused. Build
+without it via `--no-default-features` (the `mcp` feature is on by default).
 
 ### Library API
 

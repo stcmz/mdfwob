@@ -19,6 +19,16 @@ pub enum InputKind {
     Bar,
 }
 
+/// Extracts the `time` epoch second from a boundary [`Key`]. Tick and bar files both key on a
+/// `u32` second; the `I64` arm tolerates a file written with a wider key type.
+pub fn key_epoch(key: Key) -> Option<u32> {
+    match key {
+        Key::U32(value) => Some(value),
+        Key::I64(value) => u32::try_from(value).ok(),
+        _ => None,
+    }
+}
+
 /// Optional time window and session filter applied while reading ticks.
 #[derive(Debug, Clone, Default)]
 pub struct TickQuery {

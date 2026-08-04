@@ -10,6 +10,9 @@ pub mod cli;
 pub mod config;
 pub mod fwob_options;
 
+#[cfg(feature = "mcp")]
+pub mod mcp;
+
 mod downloader;
 mod providers;
 mod storage;
