@@ -22,7 +22,7 @@ default = ["mcp"]
 mcp = ["dep:base64", "dep:rmcp", "dep:schemars", "tokio/io-std", "tokio/macros"]
 
 [dependencies]
-mdfwob-core = { version = "1.10.1", path = "../mdfwob-core" }
+mdfwob-core = { version = "1.11.0", path = "../mdfwob-core" }
 anyhow = "1.0"
 # Only for encoding chart PNGs into MCP image content blocks.
 base64 = { version = "0.22", optional = true }
