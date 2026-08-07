@@ -22,6 +22,22 @@ use crate::analysis::model::Bar;
 use crate::analysis::output::format_epoch_tz;
 use crate::analysis::stat::StatRow;
 
+/// JSON Schema for a non-negative integer, with no `format` annotation.
+///
+/// `schemars` tags Rust integers with their width — `format: "uint64"`, `"uint"`, `"uint16"`. Those
+/// are not in the OpenAPI format registry that MCP clients validate schemas against, so each one
+/// produces a warning on every schema fetch (`unknown format "uint64" ignored…`), enough of them to
+/// bury the health-check output. The signed widths (`int32`/`int64`) *are* registered, so only the
+/// unsigned ones need this; applying it uniformly keeps the rule "integers carry no format".
+pub(crate) fn integer_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({ "type": "integer", "minimum": 0 })
+}
+
+/// Same, for an optional field: the wire value may be `null`.
+pub(crate) fn optional_integer_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({ "type": ["integer", "null"], "minimum": 0 })
+}
+
 /// Formats an epoch second in `tz`, e.g. `2024-01-02T09:30:00-05:00`.
 pub(crate) fn iso(epoch: u32, tz: &TimeZone) -> String {
     format_epoch_tz(epoch, tz)
@@ -64,6 +80,7 @@ pub(crate) struct LsEntry {
     pub kind: String,
     /// On-disk FWOB format, e.g. `"fwob-v2"`.
     pub format: String,
+    #[schemars(schema_with = "integer_schema")]
     pub frame_count: u64,
     pub first: Option<String>,
     pub last: Option<String>,
@@ -71,6 +88,7 @@ pub(crate) struct LsEntry {
     pub granularity: Option<String>,
     /// `"rth"`, `"extended"`, or `"n/a"`.
     pub hours: String,
+    #[schemars(schema_with = "integer_schema")]
     pub bytes: u64,
 }
 
@@ -97,6 +115,7 @@ pub(crate) struct StatEntry {
     pub symbol: String,
     pub kind: String,
     pub format: String,
+    #[schemars(schema_with = "integer_schema")]
     pub trades: u64,
     pub first: Option<String>,
     pub last: Option<String>,
@@ -136,6 +155,7 @@ pub(crate) struct BarRow {
     pub volume: i64,
     /// `null` when the bucket had no volume to weight by.
     pub vwap: Option<f64>,
+    #[schemars(schema_with = "integer_schema")]
     pub trades: u64,
 }
 
@@ -174,7 +194,9 @@ pub(crate) struct Series<T> {
     /// Bar interval the rows were resampled to, e.g. `"1d"`.
     pub interval: String,
     pub timezone: String,
+    #[schemars(schema_with = "integer_schema")]
     pub total: usize,
+    #[schemars(schema_with = "integer_schema")]
     pub returned: usize,
     pub truncated: bool,
     /// Present only when `truncated`, explaining how to get a complete answer.
@@ -190,7 +212,9 @@ pub(crate) struct InspectReport {
     pub kind: String,
     pub format: String,
     pub frame_type: String,
+    #[schemars(schema_with = "integer_schema")]
     pub frame_count: u64,
+    #[schemars(schema_with = "integer_schema")]
     pub bytes: u64,
     pub timezone: String,
     pub first: Option<String>,
@@ -244,7 +268,9 @@ pub(crate) struct FieldInfo {
     pub name: String,
     #[serde(rename = "type")]
     pub field_type: String,
+    #[schemars(schema_with = "integer_schema")]
     pub length: u16,
+    #[schemars(schema_with = "integer_schema")]
     pub offset: u32,
     pub semantic: String,
 }
@@ -257,6 +283,7 @@ pub(crate) struct VerifyReport {
     pub kind: String,
     /// Always `"ok"` — a failed verification is returned as a tool error instead.
     pub status: String,
+    #[schemars(schema_with = "integer_schema")]
     pub frame_count: u64,
     pub data: StatEntry,
 }

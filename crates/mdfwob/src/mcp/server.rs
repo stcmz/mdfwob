@@ -38,6 +38,7 @@ use crate::analysis::stat::stat_file;
 use crate::cli::{INSPECT_SAMPLE, kind_label, parse_bounds, resolve_session, stream_bars};
 use crate::mcp::dto::{
     BarRow, CalcRow, InspectReport, Listing, LsEntry, Series, StatEntry, VerifyReport, finite, iso,
+    optional_integer_schema,
 };
 use crate::mcp::root::Root;
 
@@ -119,6 +120,7 @@ pub(crate) struct BarsParams {
     /// Forward-fill intervals with no activity within a session.
     pub fill: Option<bool>,
     /// Maximum rows per symbol (default 1000, max 10000).
+    #[schemars(schema_with = "optional_integer_schema")]
     pub limit: Option<usize>,
 }
 
@@ -133,6 +135,7 @@ pub(crate) struct CalcParams {
     /// Forward-fill intervals with no activity within a session.
     pub fill: Option<bool>,
     /// Maximum rows per symbol (default 1000, max 10000).
+    #[schemars(schema_with = "optional_integer_schema")]
     pub limit: Option<usize>,
 }
 
@@ -150,8 +153,10 @@ pub(crate) struct PlotParams {
     /// Forward-fill intervals with no activity within a session.
     pub fill: Option<bool>,
     /// Image width in pixels (default 1920).
+    #[schemars(schema_with = "optional_integer_schema")]
     pub width: Option<u32>,
     /// Image height in pixels (default 1080).
+    #[schemars(schema_with = "optional_integer_schema")]
     pub height: Option<u32>,
 }
 

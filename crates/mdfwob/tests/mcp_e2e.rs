@@ -229,6 +229,22 @@ fn handshake_lists_only_read_only_tools() {
                 "{name} outputSchema must be an object schema, not a bare array"
             );
         }
+
+        // Every `format` must be one the client's validator recognizes. schemars tags Rust
+        // integers with their width (`uint64`, `uint`, `uint16`), and the *unsigned* spellings are
+        // absent from the OpenAPI format registry, so a validating client logs
+        // `unknown format "uint64" ignored…` for each occurrence — dozens of lines that bury the
+        // health-check output. Use `#[schemars(schema_with = "integer_schema")]` on new integer
+        // fields to keep them format-free.
+        for (path, format) in collect_formats(&tool["inputSchema"], "inputSchema")
+            .into_iter()
+            .chain(collect_formats(&tool["outputSchema"], "outputSchema"))
+        {
+            assert!(
+                RECOGNIZED_FORMATS.contains(&format.as_str()),
+                "{name} advertises unrecognized format {format:?} at {path}"
+            );
+        }
     }
 
     drop(server);
@@ -491,6 +507,51 @@ fn paths_outside_the_root_are_rejected() {
     drop(server);
     let _ = fs::remove_file(outside);
     let _ = fs::remove_dir_all(dir);
+}
+
+/// JSON Schema `format` values an MCP client's validator accepts without complaint: the OpenAPI
+/// numeric formats plus the common string ones. Notably absent are the unsigned integer widths
+/// (`uint`, `uint16`, `uint32`, `uint64`) that `schemars` emits by default.
+const RECOGNIZED_FORMATS: &[&str] = &[
+    "int32",
+    "int64",
+    "float",
+    "double",
+    "date",
+    "date-time",
+    "duration",
+    "time",
+    "email",
+    "hostname",
+    "ipv4",
+    "ipv6",
+    "uri",
+    "uuid",
+];
+
+/// Every `format` value in a schema, paired with the JSON pointer where it was found.
+fn collect_formats(schema: &Value, path: &str) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    match schema {
+        Value::Object(map) => {
+            for (key, value) in map {
+                if key == "format"
+                    && let Some(format) = value.as_str()
+                {
+                    found.push((format!("{path}/format"), format.to_owned()));
+                } else {
+                    found.extend(collect_formats(value, &format!("{path}/{key}")));
+                }
+            }
+        }
+        Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                found.extend(collect_formats(item, &format!("{path}/{i}")));
+            }
+        }
+        _ => {}
+    }
+    found
 }
 
 /// Minimal standard-alphabet base64 decoder, so the test asserts on the wire bytes rather than
