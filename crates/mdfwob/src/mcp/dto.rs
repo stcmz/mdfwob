@@ -37,6 +37,23 @@ pub(crate) fn finite(value: f64) -> Option<f64> {
     value.is_finite().then_some(value)
 }
 
+/// Envelope for a tool whose payload is a list.
+///
+/// MCP requires `outputSchema` to describe a JSON **object**, so a tool cannot advertise a
+/// top-level array — a client that validates the schema (Claude Code does) rejects the whole tool
+/// list. Every list-valued result is therefore wrapped in a named field, which also reads better
+/// than a bare array on the receiving end.
+#[derive(Debug, Serialize, JsonSchema)]
+pub(crate) struct Listing<T> {
+    pub items: Vec<T>,
+}
+
+impl<T> Listing<T> {
+    pub(crate) fn new(items: Vec<T>) -> Self {
+        Self { items }
+    }
+}
+
 /// One row of `mdfwob_ls`.
 #[derive(Debug, Serialize, JsonSchema)]
 pub(crate) struct LsEntry {

@@ -37,7 +37,7 @@ use crate::analysis::session::Session;
 use crate::analysis::stat::stat_file;
 use crate::cli::{INSPECT_SAMPLE, kind_label, parse_bounds, resolve_session, stream_bars};
 use crate::mcp::dto::{
-    BarRow, CalcRow, InspectReport, LsEntry, Series, StatEntry, VerifyReport, finite, iso,
+    BarRow, CalcRow, InspectReport, Listing, LsEntry, Series, StatEntry, VerifyReport, finite, iso,
 };
 use crate::mcp::root::Root;
 
@@ -310,7 +310,7 @@ impl McpServer {
     async fn mdfwob_ls(
         &self,
         Parameters(params): Parameters<LsParams>,
-    ) -> Result<Json<Vec<LsEntry>>, String> {
+    ) -> Result<Json<Listing<LsEntry>>, String> {
         let this = self.clone();
         blocking(move || {
             let display =
@@ -324,7 +324,7 @@ impl McpServer {
                     .with_context(|| format!("failed to read {}", this.root.display(path)))?;
                 rows.push(LsEntry::new(row, &tz));
             }
-            Ok(rows)
+            Ok(Listing::new(rows))
         })
         .await
         .map(Json)
@@ -366,9 +366,11 @@ impl McpServer {
     async fn mdfwob_stat(
         &self,
         Parameters(params): Parameters<Selection>,
-    ) -> Result<Json<Vec<StatEntry>>, String> {
+    ) -> Result<Json<Listing<StatEntry>>, String> {
         let this = self.clone();
-        blocking(move || this.stat(&params)).await.map(Json)
+        blocking(move || this.stat(&params).map(Listing::new))
+            .await
+            .map(Json)
     }
 
     /// Resample into OHLCV bars at any interval.
@@ -380,9 +382,11 @@ impl McpServer {
     async fn mdfwob_bars(
         &self,
         Parameters(params): Parameters<BarsParams>,
-    ) -> Result<Json<Vec<Series<BarRow>>>, String> {
+    ) -> Result<Json<Listing<Series<BarRow>>>, String> {
         let this = self.clone();
-        blocking(move || this.bars(&params)).await.map(Json)
+        blocking(move || this.bars(&params).map(Listing::new))
+            .await
+            .map(Json)
     }
 
     /// Indicator series over resampled bars.
@@ -394,9 +398,11 @@ impl McpServer {
     async fn mdfwob_calc(
         &self,
         Parameters(params): Parameters<CalcParams>,
-    ) -> Result<Json<Vec<Series<CalcRow>>>, String> {
+    ) -> Result<Json<Listing<Series<CalcRow>>>, String> {
         let this = self.clone();
-        blocking(move || this.calc(&params)).await.map(Json)
+        blocking(move || this.calc(&params).map(Listing::new))
+            .await
+            .map(Json)
     }
 
     /// Render a candlestick chart as a PNG.

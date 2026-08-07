@@ -211,6 +211,26 @@ fn handshake_lists_only_read_only_tools() {
         assert!(!props[field].is_null(), "{field} missing from bars schema");
     }
 
+    // MCP requires both schemas to describe an *object*. A tool that advertises a top-level array
+    // is rejected wholesale by a validating client — Claude Code refuses the entire tool list with
+    // `expected "object" (at tools.N.outputSchema.type)`, so every tool disappears, not just the
+    // offending one. Returning `Vec<T>` from a tool is the easy way to reintroduce that.
+    for tool in tools {
+        let name = tool["name"].as_str().unwrap();
+        assert_eq!(
+            tool["inputSchema"]["type"], "object",
+            "{name} inputSchema must be an object schema"
+        );
+        // `outputSchema` is optional (a tool returning only content blocks has none), but when
+        // present it must be an object schema.
+        if !tool["outputSchema"].is_null() {
+            assert_eq!(
+                tool["outputSchema"]["type"], "object",
+                "{name} outputSchema must be an object schema, not a bare array"
+            );
+        }
+    }
+
     drop(server);
     let _ = fs::remove_dir_all(dir);
 }
@@ -222,7 +242,7 @@ fn ls_reports_the_archive_in_human_units() {
     let mut server = Server::start(&dir);
 
     let rows = server.call("mdfwob_ls", json!({}));
-    let rows = rows.as_array().expect("ls rows");
+    let rows = rows["items"].as_array().expect("ls rows");
     assert_eq!(rows.len(), 1);
     let row = &rows[0];
     assert_eq!(row["symbol"], "AAPL");
@@ -251,7 +271,7 @@ fn bars_returns_real_prices_and_local_times() {
         "mdfwob_bars",
         json!({ "symbols": ["AAPL"], "interval": "5m" }),
     );
-    let series = &series.as_array().expect("series")[0];
+    let series = &series["items"].as_array().expect("series")[0];
     assert_eq!(series["symbol"], "AAPL");
     assert_eq!(series["interval"], "5m");
     assert_eq!(series["total"], 4);
@@ -285,7 +305,7 @@ fn limit_truncates_to_the_most_recent_rows() {
         "mdfwob_bars",
         json!({ "symbols": ["AAPL"], "interval": "5m" }),
     );
-    let all_rows = full.as_array().unwrap()[0]["rows"]
+    let all_rows = full["items"].as_array().unwrap()[0]["rows"]
         .as_array()
         .unwrap()
         .clone();
@@ -294,7 +314,7 @@ fn limit_truncates_to_the_most_recent_rows() {
         "mdfwob_bars",
         json!({ "symbols": ["AAPL"], "interval": "5m", "limit": 2 }),
     );
-    let series = &capped.as_array().expect("series")[0];
+    let series = &capped["items"].as_array().expect("series")[0];
     assert_eq!(series["total"], 4);
     assert_eq!(series["returned"], 2);
     assert_eq!(series["truncated"], json!(true));
@@ -331,7 +351,7 @@ fn calc_warms_up_over_the_full_series_even_when_truncated() {
             "limit": 2,
         }),
     );
-    let series = &series.as_array().expect("series")[0];
+    let series = &series["items"].as_array().expect("series")[0];
     assert_eq!(series["total"], 4);
     assert_eq!(series["returned"], 2);
 
@@ -355,7 +375,7 @@ fn stat_and_verify_agree_with_the_cli() {
     let mut server = Server::start(&dir);
 
     let rows = server.call("mdfwob_stat", json!({ "symbols": ["AAPL"] }));
-    let row = &rows.as_array().expect("stat rows")[0];
+    let row = &rows["items"].as_array().expect("stat rows")[0];
     assert_eq!(row["symbol"], "AAPL");
     assert_eq!(row["trades"], 20);
     assert_eq!(row["volume"], 2_000);

@@ -300,6 +300,18 @@ Desktop, Cursor, or any other MCP client:
 }
 ```
 
+With the Claude Code CLI:
+
+```sh
+claude mcp add mdfwob --scope user -- mdfwob mcp --root /path/to/data
+```
+
+> On Windows **PowerShell**, invoke `claude.cmd` rather than `claude`. The npm shim on `PATH` is
+> `claude.ps1`, and PowerShell consumes the `--` end-of-parameters marker before a *script* ever
+> sees it, so `--root` is then parsed as a flag to `claude mcp add` itself and fails with
+> `unknown option '--root'`. `claude.cmd` is a native command, so `--` is passed through. Bash and
+> cmd are unaffected.
+
 Seven tools are exposed — `mdfwob_ls`, `mdfwob_inspect`, `mdfwob_verify`,
 `mdfwob_stat`, `mdfwob_bars`, `mdfwob_calc`, and `mdfwob_plot` (which returns a
 PNG image block). Two things differ from the CLI, both because the caller is a
