@@ -75,3 +75,20 @@ exchange = "SMART" # Optional; defaults to SMART.
 multiplier = "100" # Optional; defaults to 100.
 trading_class = "MSFT" # Optional IBKR disambiguator for nonstandard contracts.
 local_symbol = "MSFT  260717C00450000" # Optional for IBKR; required for Databento.
+
+# Corporate actions, keyed by symbol. Stored trade prints stay raw; these are applied in memory
+# when prices are read, so the actual traded prices remain recoverable, a newly recorded split
+# never requires rewriting gigabytes, and one archive can serve raw, split-adjusted, and
+# total-return views of the same data.
+#
+# `date` is the ex-date (the first session that trades at the new price) in the exchange timezone.
+# `split` is new shares per old share: 4 is a 4-for-1, 0.1 a 1-for-10 reverse. `dividend` is cash
+# per share. Set exactly one of the two per row.
+#
+# This table may live here or in a file of its own -- unrelated sections are ignored when it is
+# read, so a single file can drive downloads, analysis, and adjustment alike.
+[actions]
+AAPL = [{ date = "2020-08-31", split = 4 }]
+AMZN = [{ date = "2022-06-06", split = 20 }]
+GOOG = [{ date = "2022-07-18", split = 20 }]
+GOOGL = [{ date = "2022-07-18", split = 20 }]

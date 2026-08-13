@@ -9,8 +9,8 @@ use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use fwob::Writer;
 use fwob::formatting::{FrameFormat, FrameFormatter};
+use fwob::{OperationOptions, Writer};
 use fwob_core::Schema;
 use fwob_v2::WriterOptions;
 use jiff::{Timestamp, tz::TimeZone};
@@ -175,6 +175,18 @@ impl FrameWriter {
     pub fn create(path: &Path, schema: Schema, title: &str) -> Result<Self> {
         let writer = Writer::create_v2(path, schema, WriterOptions::new(title))
             .with_context(|| format!("failed to create {}", path.display()))?;
+        Ok(Self {
+            writer,
+            buf: Vec::with_capacity(Self::FLUSH_BYTES + 4096),
+        })
+    }
+
+    /// Opens an existing file to append. Page size, codec, and encoding are inherited from the
+    /// file's last compressed page, so an incrementally grown file stays uniform with one written
+    /// in a single pass. Appended keys must be >= the file's current last key.
+    pub fn open_append(path: &Path) -> Result<Self> {
+        let writer = Writer::open(path, OperationOptions::default())
+            .with_context(|| format!("failed to open {} for append", path.display()))?;
         Ok(Self {
             writer,
             buf: Vec::with_capacity(Self::FLUSH_BYTES + 4096),

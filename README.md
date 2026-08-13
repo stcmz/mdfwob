@@ -284,6 +284,57 @@ The same TOML file used for downloads can carry an `[analysis]` section (see
 and CLI tokens/flags override it. A symbol universe under `[analysis].symbols`
 is used when no positional path/symbol is given.
 
+### Bar sidecars
+
+Resampling a decade of ticks into daily bars costs tens of seconds per file, and
+a research loop pays it on every run. `refresh` materializes the result next to
+the source as `<SYMBOL>.<INTERVAL>.bars.fwob`, which later commands can read
+directly:
+
+```text
+mdfwob refresh MSFT.fwob 1d rth       # 38 s: builds 2600 bars from 837M ticks
+mdfwob refresh MSFT.fwob 1d rth       # 0.1 s: appends only what is missing
+mdfwob refresh config.toml 1d rth     # every symbol in [analysis].symbols
+mdfwob bars MSFT.1d.bars.fwob         # reads the sidecar, byte-identical output
+```
+
+Only the missing tail is appended, and the stored **final** bucket is re-derived
+rather than trusted — a sidecar written while a session was still open holds a
+partial bar, and a partial bar that silently persists is a data error nothing
+downstream would catch. `--force` rebuilds from scratch.
+
+Sidecars hold **raw** bars. Corporate-action adjustment is applied when they are
+read, so a newly recorded split never silently invalidates a materialized file.
+
+### Corporate actions
+
+Stored prices are raw trade prints, so a split shows up as a discontinuity —
+AAPL's 4-for-1 drops the close from $498.90 to $127.62 overnight, which any
+return calculation reads as a −75% day. Actions are declared in an `[actions]`
+table and applied **in memory at read time**:
+
+```toml
+[actions]
+AAPL  = [{ date = "2020-08-31", split = 4 }]
+GOOGL = [{ date = "2022-07-18", split = 20 }]
+MSFT  = [{ date = "2024-02-15", dividend = 0.75 }]
+```
+
+`date` is the ex-date in the exchange timezone; `split` is new shares per old
+(4 is a 4-for-1, `0.1` a 1-for-10 reverse); `dividend` is cash per share. Set
+exactly one per row. Modes are `raw`, `split-only` (the default), and
+`total-return` (splits plus reinvested dividends).
+
+Adjusting on read rather than rewriting files keeps the actual traded prices
+recoverable, avoids rewriting gigabytes when a split lands, avoids compounding
+fixed-point rounding across successive actions, and lets one archive serve all
+three views. The table may live in the shared config file or in one of its own —
+unrelated sections are ignored when it is read.
+
+`detect_splits` infers actions from overnight gaps near a clean integer ratio.
+It is a drafting aid, not the live path: it cannot see dividends, and a genuine
+crash of the right size is indistinguishable from a split.
+
 ### MCP server
 
 `mdfwob mcp` serves the read-only analysis commands to an LLM agent over the

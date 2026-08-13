@@ -15,6 +15,11 @@ pub struct Config {
     /// drive both `download` and the analysis subcommands; only the relevant
     /// sections are read by each command.
     pub analysis: crate::analysis::config::AnalysisConfig,
+    /// Corporate actions (`[actions]`), keyed by symbol. Declared here so the shared file
+    /// accepts the table; adjustment itself reads it via
+    /// [`mdfwob_core::analysis::load_actions`], which tolerates any other sections and so also
+    /// works against a file holding nothing but `[actions]`.
+    pub actions: crate::analysis::adjust::ActionTable,
 }
 
 impl Config {

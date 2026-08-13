@@ -5,6 +5,7 @@
 //! summaries. Exposed as a library API in addition to the `mdfwob` CLI
 //! subcommands `stat`, `bars`, and `calc`.
 
+pub mod adjust;
 pub mod calc;
 pub mod config;
 pub mod inspect;
@@ -17,9 +18,14 @@ pub mod read;
 pub mod resample;
 pub mod schema;
 pub mod session;
+pub mod sidecar;
 pub mod stat;
 pub mod summary;
 
+pub use adjust::{
+    ActionKind, ActionSpec, ActionTable, AdjustmentMode, CorporateAction, adjust_bars,
+    detect_splits, load_actions,
+};
 pub use calc::{
     Calc, CalcColumn, CalcOutput, CalcSummary, Dema, Ema, Indicator, Returns, Rsi, Sma,
     StreamingIndicator, Volatility, VolumeDema, VolumeEma, VolumeSma, parse_spec,
@@ -36,5 +42,6 @@ pub use read::{
 };
 pub use resample::{BarClock, ForwardFiller, Resampler, resample};
 pub use session::Session;
+pub use sidecar::{RefreshOutcome, refresh_sidecar, sidecar_name, sidecar_path};
 pub use stat::{StatAccumulator, StatRow, compute_stat, stat_file};
 pub use summary::{SummaryCollector, SummaryColumn};

@@ -55,6 +55,7 @@ impl Cli {
             Command::Verify(args) => args.run(),
             Command::Stat(args) => args.run(),
             Command::Bars(args) => args.run(),
+            Command::Refresh(args) => args.run(),
             Command::Calc(args) => args.run(),
             Command::Plot(args) => args.run(),
             #[cfg(feature = "mcp")]
@@ -77,6 +78,8 @@ enum Command {
     Stat(StatArgs),
     /// Resample ticks (or re-resample bars) into OHLCV bars (table/csv/md/jsonl/raw/hex/fwob).
     Bars(BarsArgs),
+    /// Build or incrementally update `<SYMBOL>.<interval>.bars.fwob` sidecars.
+    Refresh(RefreshArgs),
     /// Compute per-bar indicator series (sma/ema/rsi/ret/vol) over bars or ticks.
     Calc(CalcArgs),
     /// Render OHLC bars as a candlestick chart (Sixel to the console, or a PNG file).
@@ -667,6 +670,172 @@ struct BarsArgs {
     output: Option<PathBuf>,
     #[arg(value_name = "ITEM", num_args = 0..)]
     items: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+#[command(
+    override_usage = "mdfwob refresh [CONFIG.toml] [PATHS_OR_SYMBOLS...] [INTERVAL] [rth] [OPTIONS]"
+)]
+#[command(
+    after_help = "Materializes `<SYMBOL>.<INTERVAL>.bars.fwob` next to each source file, so a
+research run seeks pre-built bars instead of re-resampling the tick history every time.
+
+Only the missing tail is appended. The stored final bucket is re-derived rather than trusted,
+because a sidecar written while a session was still open holds a partial bar.
+
+Sidecars store RAW bars: corporate-action adjustment is applied when they are read, so a newly
+recorded split never silently invalidates a materialized file.
+
+  mdfwob refresh MSFT.fwob 1d rth
+  mdfwob refresh config.toml 1d rth            # every symbol in [analysis].symbols
+  mdfwob refresh . 1d rth --output bars/"
+)]
+struct RefreshArgs {
+    /// Window start. Bare dates/times use the exchange tz.
+    #[arg(long)]
+    start: Option<String>,
+    /// Window end (a bare date includes the whole local day).
+    #[arg(long)]
+    end: Option<String>,
+    /// Keep only regular-trading-hours ticks.
+    #[arg(long = "use-rth")]
+    use_rth: bool,
+    /// Override the session window (HH:MM-HH:MM).
+    #[arg(long)]
+    session: Option<String>,
+    /// Override the session timezone (IANA name).
+    #[arg(long)]
+    tz: Option<String>,
+    /// Where sidecars are written. Defaults to each source file's own directory.
+    #[arg(long)]
+    output: Option<PathBuf>,
+    /// Rebuild from scratch instead of appending the missing tail.
+    #[arg(long)]
+    force: bool,
+    #[arg(value_name = "ITEM", num_args = 0..)]
+    items: Vec<String>,
+}
+
+impl RefreshArgs {
+    fn run(self) -> Result<()> {
+        let (config_path, tokens) = split_config_target(self.items)?;
+        let acfg = load_analysis_config(config_path.as_deref())?;
+        let BarsTokens {
+            paths,
+            interval: interval_token,
+            use_rth,
+            fill,
+            start: range_start,
+            end: range_end,
+            ..
+        } = classify_with_interval(&tokens)?;
+        let use_rth = self.use_rth || use_rth;
+        let interval = resolve_interval(interval_token, acfg.bars.interval.as_deref())?;
+        let fill = fill || acfg.bars.fill;
+        let session = resolve_session(&acfg, use_rth, self.session.as_deref(), self.tz.as_deref())?;
+        warn_uneven_interval(interval, &session, use_rth);
+        let clock = BarClock::Session(session.clone());
+        let start = self.start.clone().or(range_start);
+        let end = self.end.clone().or(range_end);
+        let (start, end) = parse_bounds(start.as_deref(), end.as_deref(), &session.time_zone())?;
+        let query = TickQuery {
+            start,
+            end,
+            session: use_rth.then(|| session.clone()),
+        };
+
+        // A sidecar is itself a bar file, so discovery would otherwise feed last run's output back
+        // in as a source and refresh it against itself.
+        let suffix = format!(".{}.bars.fwob", interval.label());
+        let files: Vec<PathBuf> = resolve_files(&paths, &acfg)?
+            .into_iter()
+            .filter(|path| {
+                !path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(&suffix))
+            })
+            .collect();
+
+        let mut by_symbol: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+        for path in &files {
+            match file_symbol(path) {
+                Ok(symbol) => by_symbol.entry(symbol).or_default().push(path.clone()),
+                Err(error) => {
+                    tracing::error!(path = %path.display(), error = %format!("{error:#}"), "failed to read")
+                }
+            }
+        }
+        if by_symbol.is_empty() {
+            bail!("no input files matched");
+        }
+
+        let stdout = std::io::stdout();
+        let mut out = std::io::BufWriter::new(stdout.lock());
+        writeln!(
+            out,
+            "{:<12}{:>12}{:>12}  last",
+            "symbol", "appended", "total"
+        )?;
+
+        let tz = session.time_zone();
+        let mut failed = 0usize;
+        for (symbol, sources) in &by_symbol {
+            if sources.len() > 1 {
+                tracing::error!(
+                    symbol,
+                    count = sources.len(),
+                    "refresh needs a single source file per symbol; skipping"
+                );
+                failed += 1;
+                continue;
+            }
+            let source = &sources[0];
+            let dir = self
+                .output
+                .clone()
+                .or_else(|| source.parent().map(Path::to_path_buf))
+                .unwrap_or_else(|| PathBuf::from("."));
+            std::fs::create_dir_all(&dir)
+                .with_context(|| format!("failed to create {}", dir.display()))?;
+
+            if self.force {
+                let path = crate::analysis::sidecar::sidecar_path(&dir, symbol, interval);
+                if path.exists() {
+                    std::fs::remove_file(&path)
+                        .with_context(|| format!("failed to remove {}", path.display()))?;
+                }
+            }
+
+            match crate::analysis::sidecar::refresh_sidecar(
+                source, &dir, symbol, interval, &clock, &query, fill,
+            ) {
+                Ok(outcome) => {
+                    let last = outcome
+                        .last_time
+                        .map(|time| format_epoch_tz(time, &tz))
+                        .unwrap_or_else(|| "-".to_string());
+                    writeln!(
+                        out,
+                        "{:<12}{:>12}{:>12}  {last}{}",
+                        symbol,
+                        outcome.appended,
+                        outcome.total,
+                        if outcome.rebuilt { "  (built)" } else { "" }
+                    )?;
+                }
+                Err(error) => {
+                    tracing::error!(symbol, error = %format!("{error:#}"), "refresh failed");
+                    failed += 1;
+                }
+            }
+        }
+        out.flush()?;
+        if failed > 0 {
+            bail!("{failed} symbol(s) failed to refresh");
+        }
+        Ok(())
+    }
 }
 
 impl BarsArgs {
