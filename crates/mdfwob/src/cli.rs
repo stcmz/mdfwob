@@ -55,7 +55,7 @@ impl Cli {
             Command::Verify(args) => args.run(),
             Command::Stat(args) => args.run(),
             Command::Bars(args) => args.run(),
-            Command::Refresh(args) => args.run(),
+            Command::Sync(args) => args.run(),
             Command::Calc(args) => args.run(),
             Command::Plot(args) => args.run(),
             #[cfg(feature = "mcp")]
@@ -78,8 +78,9 @@ enum Command {
     Stat(StatArgs),
     /// Resample ticks (or re-resample bars) into OHLCV bars (table/csv/md/jsonl/raw/hex/fwob).
     Bars(BarsArgs),
-    /// Build or incrementally update `<SYMBOL>.<interval>.bars.fwob` sidecars.
-    Refresh(RefreshArgs),
+    /// Build or incrementally update `<SYMBOL>.<INTERVAL>.<rth|ext>.bars.fwob` sidecars.
+    #[command(alias = "refresh")]
+    Sync(SyncArgs),
     /// Compute per-bar indicator series (sma/ema/rsi/ret/vol) over bars or ticks.
     Calc(CalcArgs),
     /// Render OHLC bars as a candlestick chart (Sixel to the console, or a PNG file).
@@ -674,23 +675,30 @@ struct BarsArgs {
 
 #[derive(Debug, Args)]
 #[command(
-    override_usage = "mdfwob refresh [CONFIG.toml] [PATHS_OR_SYMBOLS...] [INTERVAL] [rth] [OPTIONS]"
+    override_usage = "mdfwob sync [CONFIG.toml] [PATHS_OR_SYMBOLS...] [INTERVAL] [rth] [OPTIONS]"
 )]
 #[command(
-    after_help = "Materializes `<SYMBOL>.<INTERVAL>.bars.fwob` next to each source file, so a
-research run seeks pre-built bars instead of re-resampling the tick history every time.
+    after_help = "Materializes `<SYMBOL>.<INTERVAL>.<rth|ext>.bars.fwob` next to each source file,
+so a research run seeks pre-built bars instead of re-resampling the tick history every time.
 
-Only the missing tail is appended. The stored final bucket is re-derived rather than trusted,
-because a sidecar written while a session was still open holds a partial bar.
+With no path given, every `*.fwob` in the current directory is synced; paths, directories, and bare
+symbols all work, exactly as for `ls` and `bars`. Existing sidecars are never treated as sources.
+
+Only the missing tail is appended, and the stored final bucket is re-derived rather than trusted --
+a sidecar written while a session was still open holds a partial bar, so a half day that later
+completes is rebuilt correctly. Note that ONLY the final bucket is revisited: if an earlier day is
+backfilled after the fact, use --force to rebuild that symbol from scratch.
 
 Sidecars store RAW bars: corporate-action adjustment is applied when they are read, so a newly
 recorded split never silently invalidates a materialized file.
 
-  mdfwob refresh MSFT.fwob 1d rth
-  mdfwob refresh config.toml 1d rth            # every symbol in [analysis].symbols
-  mdfwob refresh . 1d rth --output bars/"
+  mdfwob sync                        # every *.fwob here, at the configured interval
+  mdfwob sync 1d rth                 # every *.fwob here, daily, regular hours
+  mdfwob sync MSFT.fwob AAPL 1d rth  # a path and a bare symbol
+  mdfwob sync config.toml 1d rth     # every symbol in [analysis].symbols
+  mdfwob sync . 1d rth --output bars/"
 )]
-struct RefreshArgs {
+struct SyncArgs {
     /// Window start. Bare dates/times use the exchange tz.
     #[arg(long)]
     start: Option<String>,
@@ -716,7 +724,7 @@ struct RefreshArgs {
     items: Vec<String>,
 }
 
-impl RefreshArgs {
+impl SyncArgs {
     fn run(self) -> Result<()> {
         let (config_path, tokens) = split_config_target(self.items)?;
         let acfg = load_analysis_config(config_path.as_deref())?;
@@ -746,15 +754,12 @@ impl RefreshArgs {
 
         // A sidecar is itself a bar file, so discovery would otherwise feed last run's output back
         // in as a source and refresh it against itself.
-        let suffix = format!(".{}.bars.fwob", interval.label());
+        // Every sidecar is excluded, not just this interval's: a directory holding both a `1h` and
+        // a `1d` sidecar would otherwise feed one back in as a source and build a sidecar of a
+        // sidecar. Re-deriving one interval from another is `bars --output`'s job.
         let files: Vec<PathBuf> = resolve_files(&paths, &acfg)?
             .into_iter()
-            .filter(|path| {
-                !path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.ends_with(&suffix))
-            })
+            .filter(|path| !crate::analysis::sidecar::is_sidecar(path))
             .collect();
 
         let mut by_symbol: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
@@ -800,7 +805,7 @@ impl RefreshArgs {
                 .with_context(|| format!("failed to create {}", dir.display()))?;
 
             if self.force {
-                let path = crate::analysis::sidecar::sidecar_path(&dir, symbol, interval);
+                let path = crate::analysis::sidecar::sidecar_path(&dir, symbol, interval, use_rth);
                 if path.exists() {
                     std::fs::remove_file(&path)
                         .with_context(|| format!("failed to remove {}", path.display()))?;
@@ -808,7 +813,16 @@ impl RefreshArgs {
             }
 
             match crate::analysis::sidecar::refresh_sidecar(
-                source, &dir, symbol, interval, &clock, &query, fill,
+                source,
+                &dir,
+                symbol,
+                &crate::analysis::sidecar::RefreshSpec {
+                    interval,
+                    use_rth,
+                    clock: &clock,
+                    query: &query,
+                    fill,
+                },
             ) {
                 Ok(outcome) => {
                     let last = outcome

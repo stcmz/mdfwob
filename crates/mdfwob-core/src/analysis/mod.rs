@@ -42,6 +42,8 @@ pub use read::{
 };
 pub use resample::{BarClock, ForwardFiller, Resampler, resample};
 pub use session::Session;
-pub use sidecar::{RefreshOutcome, refresh_sidecar, sidecar_name, sidecar_path};
+pub use sidecar::{
+    RefreshOutcome, RefreshSpec, is_sidecar, refresh_sidecar, sidecar_name, sidecar_path,
+};
 pub use stat::{StatAccumulator, StatRow, compute_stat, stat_file};
 pub use summary::{SummaryCollector, SummaryColumn};

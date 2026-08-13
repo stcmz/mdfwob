@@ -287,21 +287,32 @@ is used when no positional path/symbol is given.
 ### Bar sidecars
 
 Resampling a decade of ticks into daily bars costs tens of seconds per file, and
-a research loop pays it on every run. `refresh` materializes the result next to
-the source as `<SYMBOL>.<INTERVAL>.bars.fwob`, which later commands can read
+a research loop pays it on every run. `sync` materializes the result next to the
+source as `<SYMBOL>.<INTERVAL>.<rth|ext>.bars.fwob`, which later commands read
 directly:
 
 ```text
-mdfwob refresh MSFT.fwob 1d rth       # 38 s: builds 2600 bars from 837M ticks
-mdfwob refresh MSFT.fwob 1d rth       # 0.1 s: appends only what is missing
-mdfwob refresh config.toml 1d rth     # every symbol in [analysis].symbols
-mdfwob bars MSFT.1d.bars.fwob         # reads the sidecar, byte-identical output
+mdfwob sync MSFT.fwob 1d rth       # 38 s: builds 2600 bars from 837M ticks
+mdfwob sync MSFT.fwob 1d rth       # 0.1 s: appends only what is missing
+mdfwob sync 1d rth                 # every *.fwob in the current directory
+mdfwob sync MSFT AAPL 1d rth       # bare symbols, as for `ls` and `bars`
+mdfwob sync config.toml 1d rth     # every symbol in [analysis].symbols
+mdfwob bars MSFT.1d.rth.bars.fwob  # reads the sidecar, byte-identical output
 ```
 
+With no path given it syncs the whole directory. Existing sidecars are never
+treated as sources, at any interval — otherwise a directory holding a `1h`
+sidecar would grow a `1d` sidecar built from it.
+
 Only the missing tail is appended, and the stored **final** bucket is re-derived
-rather than trusted — a sidecar written while a session was still open holds a
-partial bar, and a partial bar that silently persists is a data error nothing
-downstream would catch. `--force` rebuilds from scratch.
+rather than trusted: a sidecar written while a session was still open holds a
+partial bar, so a half day that later completes is rebuilt correctly rather than
+frozen. **Only** that trailing bucket is revisited, though — if an earlier day is
+backfilled after the fact, `--force` rebuilds that symbol from scratch.
+
+The session is part of the filename because it is part of the contents: regular
+and extended hours give different bars for the same day, and a name that omitted
+it would let a run asking for one silently receive the other.
 
 Sidecars hold **raw** bars. Corporate-action adjustment is applied when they are
 read, so a newly recorded split never silently invalidates a materialized file.
