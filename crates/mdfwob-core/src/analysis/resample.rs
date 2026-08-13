@@ -53,6 +53,15 @@ impl BarClock {
         }
     }
 
+    /// Start of the bucket following the one beginning at `bucket_start`, i.e. that bucket's
+    /// exclusive end. Calendar-aware, so month lengths and DST are handled.
+    ///
+    /// Exposed so a consumer holding a materialized bar file can tell whether its source has grown
+    /// past the last stored bucket without duplicating the calendar arithmetic.
+    pub fn next_bucket_start(&self, interval: Interval, bucket_start: u32) -> u32 {
+        self.advance(interval, bucket_start)
+    }
+
     fn advance(&self, interval: Interval, bucket_start: u32) -> u32 {
         match interval.granularity() {
             Granularity::SubDay(secs) => bucket_start.saturating_add(secs),
