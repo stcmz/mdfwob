@@ -338,25 +338,26 @@ MSFT  = [{ date = "2024-02-15", dividend = 0.75 }]
 (4 is a 4-for-1, `0.1` a 1-for-10 reverse); `dividend` is cash per share. Set
 exactly one per row.
 
-`bars`, `calc`, `plot`, and `stat` take `--adjust` and `--actions`; no config
-file is required:
+`bars`, `calc`, `plot`, and `stat` take `--actions`; no config file is
+required. Supplying a table is itself the request to adjust -- a separate mode
+flag would only restate it:
 
 ```text
 mdfwob bars AAPL.fwob 1d rth 2020-08-28..2020-08-31
 #   498.9000    then    128.9100      <- the raw 4-for-1 discontinuity
-mdfwob bars AAPL.fwob 1d rth 2020-08-28..2020-08-31 \
-      --adjust split-only --actions actions.toml
+mdfwob bars AAPL.fwob 1d rth 2020-08-28..2020-08-31 --actions actions.toml
 #   124.7250    then    128.9100      <- continuous
 
-mdfwob calc AAPL.fwob 1d rth ret:simple --adjust split-only --actions actions.toml
+mdfwob calc AAPL.fwob 1d rth ret:simple --actions actions.toml
 #   -0.74161155 becomes 0.03355382
 ```
 
-The default is **`raw`**: this is the data layer, so what you see is what is
-stored, and no command silently rewrites prices because a config happened to be
-present. `--actions` takes any TOML carrying an `[actions]` table — a file of its
-own or a shared config. Asking to adjust with no table available is an error
-rather than a silent no-op, since that is indistinguishable from a typo'd path.
+Without `--actions`, prices are exactly what is stored: this is the data layer,
+and no command should rewrite prices because a config file happened to carry an
+`[actions]` section. The flag accepts any TOML holding that table — a file of
+its own or a shared config. Pointing it at a table with no entries is an error
+rather than a silent no-op, since the two are indistinguishable from a typo.d
+path.
 
 Splits need no market data: a bar's factor is the product of `1/ratio` over every
 split dated after it, which the action table alone determines. So adjustment
@@ -370,7 +371,7 @@ the ex-date — a price no forward pass has yet seen.
 ```text
 mdfwob stat AAPL.1d.rth.bars.fwob
 #   min 89.4700   max 515.1600   vwap 178.8921   volume 117,752,366,770
-mdfwob stat AAPL.1d.rth.bars.fwob --adjust split-only --actions actions.toml
+mdfwob stat AAPL.1d.rth.bars.fwob --actions actions.toml
 #   min 22.3675   max 344.5700   vwap  99.3030   volume 212,128,322,692
 ```
 
@@ -395,8 +396,7 @@ wrong number. Raw summaries of the same file are fine.
 plain, already-corrected bar file to research against:
 
 ```text
-mdfwob bars AAPL.fwob 1d rth fwob --output adjusted/ \
-      --adjust split-only --actions actions.toml
+mdfwob bars AAPL.fwob 1d rth fwob --output adjusted/ --actions actions.toml
 ```
 
 It warns that the file freezes the current action table, so regenerate it when a

@@ -347,11 +347,7 @@ impl Adjuster {
             tick.price *= price;
         }
         if volume != 1.0 {
-            // A 20:1 split multiplies a size by 20, which a large print can carry past i32. Clamp
-            // rather than wrap: an implausibly large size is obvious, a negated one is not.
-            tick.size = (tick.size as f64 * volume)
-                .round()
-                .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32;
+            tick.size = (tick.size as f64 * volume).round() as i32;
         }
     }
 }
