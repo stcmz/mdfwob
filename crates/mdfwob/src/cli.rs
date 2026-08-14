@@ -1026,17 +1026,18 @@ impl BarsArgs {
                 // whole tick history (e.g. 1s over billions of ticks) keeps bounded memory instead
                 // of buffering the entire bar series first.
                 if adjust_mode != AdjustmentMode::Raw {
-                    // A written file is a durable artifact; baking today's action table into it
-                    // means a split recorded tomorrow silently invalidates it. Adjust on read.
-                    bail!(
-                        "--format fwob writes raw bars, so --adjust does not apply; the file is \
-                         adjusted when it is read"
+                    // Deliberate one-off export, unlike a `sync` sidecar that other tools pick up
+                    // automatically. The user names the file and owns it -- but it freezes today's
+                    // action table, so a later split leaves it quietly wrong.
+                    tracing::warn!(
+                        "writing adjusted bars: this file freezes the current action table, so \
+                         regenerate it if a new corporate action is recorded"
                     );
                 }
                 for (symbol, paths) in &by_symbol {
                     let path = dir.join(format!("{symbol}.fwob"));
                     let mut writer = FrameWriter::create(&path, bar_schema(), symbol)?;
-                    let mut adj = Adjuster::default();
+                    let mut adj = AdjustArgs::adjuster(adjust_mode, &actions, symbol, &tz)?;
                     stream_bars(paths, interval, &clock, &query, fill, &mut adj, |bar| {
                         writer.push(|buf| encode_bar(&bar, buf))
                     })?;

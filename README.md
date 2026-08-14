@@ -365,9 +365,7 @@ rides along in the same streaming pass at constant memory, even for a whole-hist
 series): its factor is `(C − D) / C`, where `C` is the close immediately *before*
 the ex-date — a price no forward pass has yet seen.
 
-`stat` adjusts too, and every field survives it. A split divides price exactly as
-it multiplies size, so the price mass a VWAP is built from is unchanged and only
-its share-count denominator moves:
+`stat` adjusts too, and every field survives it:
 
 ```text
 mdfwob stat AAPL.1d.rth.bars.fwob
@@ -376,15 +374,35 @@ mdfwob stat AAPL.1d.rth.bars.fwob --adjust split-only --actions actions.toml
 #   min 22.3675   max 344.5700   vwap  99.3030   volume 212,128,322,692
 ```
 
+Within the pre-split period alone every field is a clean rescale — `min/4`,
+`max/4`, `vwap/4`, `volume × 4`. Across the whole history they *combine*, which
+is why the adjusted max is not `515.16 / 4`:
+
+| | pre-split, adjusted | post-split | whole period |
+| --- | --- | --- | --- |
+| min | 22.3675 | 103.1000 | **22.3675** (the lower) |
+| max | 128.7900 | 344.5700 | **344.5700** (the higher) |
+| vwap | 49.3114 | 172.2013 | **99.3030** (volume-weighted) |
+| volume | 125,834,607,896 | 86,293,714,796 | **212,128,322,692** (sum) |
+
 One case `stat` refuses: **bars coarser than a day, when adjusting.** An ex-date
 falls on a session boundary, so it can land *inside* a weekly or monthly bar,
 whose high, low, and VWAP would then mix pre- and post-split prices. No single
 factor corrects that, so a weekly file errors rather than returning a plausible
 wrong number. Raw summaries of the same file are fine.
 
-Two commands refuse to adjust entirely, on purpose: `sync` and
-`bars --format fwob` both write durable artifacts, and baking today's table into
-one means a split recorded tomorrow silently invalidates it.
+`bars --format fwob` **can** be adjusted, which is the way to materialize a
+plain, already-corrected bar file to research against:
+
+```text
+mdfwob bars AAPL.fwob 1d rth fwob --output adjusted/ \
+      --adjust split-only --actions actions.toml
+```
+
+It warns that the file freezes the current action table, so regenerate it when a
+new action is recorded. `sync` is the one command that still refuses: its
+sidecars are picked up *automatically* by other tools, so a stale one would go
+unnoticed, whereas an export you named and chose is yours to manage.
 
 Adjusting on read rather than rewriting files keeps the actual traded prices
 recoverable, avoids rewriting gigabytes when a split lands, avoids compounding
