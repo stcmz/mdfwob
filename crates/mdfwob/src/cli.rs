@@ -30,7 +30,7 @@ use crate::{
         resample::{BarClock, BarResampler, ForwardFiller, Resampler},
         schema::{bar_schema, calc_schema, encode_bar, encode_calc_row, with_symbol_column},
         session::Session,
-        stat::stat_file,
+        stat::{stat_file, stat_file_adjusted},
         summary::{SummaryCollector, SummaryColumn},
     },
     config::{Config, StockContractConfig},
@@ -652,6 +652,8 @@ struct StatArgs {
     /// Override the session timezone (IANA name). Default America/New_York.
     #[arg(long)]
     tz: Option<String>,
+    #[command(flatten)]
+    adjust: AdjustArgs,
     /// Optional CONFIG.toml, then files/dirs/symbols and tokens (see below).
     #[arg(value_name = "ITEM", num_args = 0..)]
     items: Vec<String>,
@@ -678,6 +680,8 @@ impl StatArgs {
         let end = self.end.clone().or(range_end);
         let (start, end) = parse_bounds(start.as_deref(), end.as_deref(), &session.time_zone())?;
         let files = resolve_files(&paths, &acfg)?;
+        let (adjust_mode, actions) = self.adjust.resolve(config_path.as_deref())?;
+        let tz = session.time_zone();
         let query = TickQuery {
             start,
             end,
@@ -687,7 +691,18 @@ impl StatArgs {
         let mut rows = Vec::new();
         let mut failures = 0u32;
         for path in &files {
-            match stat_file(path, &query) {
+            // Adjustment is per symbol, so each file gets its own cursor over its own actions.
+            let mut adj = match file_symbol(path)
+                .and_then(|symbol| AdjustArgs::adjuster(adjust_mode, &actions, &symbol, &tz))
+            {
+                Ok(adj) => adj,
+                Err(error) => {
+                    failures += 1;
+                    tracing::error!(path = %path.display(), error = %format!("{error:#}"), "failed to read");
+                    continue;
+                }
+            };
+            match stat_file_adjusted(path, &query, &mut adj) {
                 Ok(row) => rows.push(row),
                 Err(error) => {
                     failures += 1;

@@ -2,9 +2,10 @@
 
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use fwob::{FormatVersion, detect_format};
 
+use crate::analysis::adjust::Adjuster;
 use crate::analysis::model::{Bar, Tick};
 use crate::analysis::read::{
     InputKind, TickQuery, input_kind, open_tick_reader, stream_bars_file, stream_ticks,
@@ -146,22 +147,60 @@ pub fn format_label(path: &Path) -> Result<String> {
 /// [`StatRow`]. Validates the file is a canonical Tick/Bar file via [`input_kind`], then streams
 /// every frame through a [`StatAccumulator`]. Shared by the `stat` command and `verify`'s `[data]`.
 pub fn stat_file(path: &Path, query: &TickQuery) -> Result<StatRow> {
+    stat_file_adjusted(path, query, &mut Adjuster::default())
+}
+
+/// One local day, the coarsest bar an ex-date can never fall inside.
+const ONE_DAY: u32 = 86_400;
+
+/// Like [`stat_file`], but scales each observation through `adjuster` first.
+///
+/// Every field survives the transformation: `min`/`max` take adjusted prices, and because a split
+/// divides price exactly as it multiplies size, the price mass a VWAP is built from is unchanged —
+/// only its share-count denominator moves. So an adjusted summary of a tick file still matches an
+/// adjusted summary of the bars it resamples into.
+///
+/// **Bars coarser than a day are refused when adjusting.** An ex-date falls on a session boundary,
+/// so it can land *inside* a weekly or monthly bar, whose high, low, and VWAP would then mix
+/// pre- and post-split prices. No single factor can correct that, and silently applying one would
+/// be worse than declining.
+pub fn stat_file_adjusted(
+    path: &Path,
+    query: &TickQuery,
+    adjuster: &mut Adjuster,
+) -> Result<StatRow> {
     let format = format_label(path)?;
     let mut acc = StatAccumulator::new();
     match input_kind(path)? {
         InputKind::Tick => {
             let (mut reader, symbol) = open_tick_reader(path)?;
-            stream_ticks(&mut reader, query, |tick| {
+            stream_ticks(&mut reader, query, |mut tick| {
+                adjuster.apply_tick(&mut tick);
                 acc.push_tick(&tick);
                 Ok(())
             })?;
             Ok(acc.finish(symbol, "tick", format))
         }
         InputKind::Bar => {
-            let symbol = stream_bars_file(path, query, |bar| {
+            // Narrowest observed spacing is the file's granularity; weekend and holiday gaps only
+            // ever widen a delta, so the minimum is the honest estimate.
+            let mut spacing = u32::MAX;
+            let mut previous: Option<u32> = None;
+            let symbol = stream_bars_file(path, query, |mut bar| {
+                if let Some(prev) = previous.replace(bar.time) {
+                    spacing = spacing.min(bar.time.saturating_sub(prev));
+                }
+                adjuster.apply(&mut bar);
                 acc.push_bar(&bar);
                 Ok(())
             })?;
+            if !adjuster.is_identity() && spacing != u32::MAX && spacing > ONE_DAY {
+                bail!(
+                    "{symbol}: bars are ~{spacing}s apart, coarser than a day, so an ex-date can \
+                     fall inside one and its high/low/vwap would mix pre- and post-split prices; \
+                     summarize a daily-or-finer file, or drop the adjustment"
+                );
+            }
             Ok(acc.finish(symbol, "bar", format))
         }
     }

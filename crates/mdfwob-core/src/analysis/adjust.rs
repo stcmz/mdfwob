@@ -35,7 +35,7 @@ use jiff::civil;
 use jiff::tz::TimeZone;
 use serde::Deserialize;
 
-use crate::analysis::model::Bar;
+use crate::analysis::model::{Bar, Tick};
 use crate::normalize_symbol;
 
 /// What happened to the share class.
@@ -304,15 +304,24 @@ impl Adjuster {
         self.bounds.is_empty()
     }
 
-    /// Scales one bar. Bars must be supplied in ascending time order.
-    pub fn apply(&mut self, bar: &mut Bar) {
-        // Advance past every ex-date this bar is at or after; those no longer apply to it.
-        while self.cursor < self.bounds.len() && self.bounds[self.cursor].0 <= bar.time {
+    /// The `(price, volume)` factors for an observation at `time`.
+    ///
+    /// Times must arrive in ascending order: the cursor only moves forward, which is what keeps
+    /// this O(1) per observation regardless of how many actions there are.
+    pub fn factors(&mut self, time: u32) -> (f64, f64) {
+        // Advance past every ex-date this observation is at or after; those no longer apply to it.
+        while self.cursor < self.bounds.len() && self.bounds[self.cursor].0 <= time {
             self.cursor += 1;
         }
-        let Some(&(_, price, volume)) = self.bounds.get(self.cursor) else {
-            return; // at or after the last ex-date: already in current terms
-        };
+        match self.bounds.get(self.cursor) {
+            Some(&(_, price, volume)) => (price, volume),
+            None => (1.0, 1.0), // at or after the last ex-date: already in current terms
+        }
+    }
+
+    /// Scales one bar. Bars must be supplied in ascending time order.
+    pub fn apply(&mut self, bar: &mut Bar) {
+        let (price, volume) = self.factors(bar.time);
         if price != 1.0 {
             bar.open *= price;
             bar.high *= price;
@@ -324,6 +333,21 @@ impl Adjuster {
         }
         if volume != 1.0 {
             bar.volume = (bar.volume as f64 * volume).round() as i64;
+        }
+    }
+
+    /// Scales one tick. Ticks must be supplied in ascending time order.
+    ///
+    /// Price and size move in opposite directions, so their product — the price mass a VWAP is
+    /// built from — is unchanged. Only the share count, and therefore the VWAP's denominator,
+    /// actually moves.
+    pub fn apply_tick(&mut self, tick: &mut Tick) {
+        let (price, volume) = self.factors(tick.time);
+        if price != 1.0 {
+            tick.price *= price;
+        }
+        if volume != 1.0 {
+            tick.size = (tick.size as f64 * volume).round() as i32;
         }
     }
 }
@@ -638,6 +662,42 @@ mod tests {
         );
         // Total-return needs the pre-ex close, which a forward pass cannot have.
         assert!(Adjuster::streaming(&actions, AdjustmentMode::TotalReturn).is_err());
+    }
+
+    /// A split divides price exactly as it multiplies size, so the price mass a VWAP is built from
+    /// is untouched. That is what lets a summary be adjusted without revisiting any trade: only
+    /// the share-count denominator moves.
+    #[test]
+    fn adjusting_a_tick_preserves_its_price_mass() {
+        let actions = [CorporateAction {
+            time: 2 * DAY,
+            kind: ActionKind::Split { ratio: 4.0 },
+        }];
+        let mut adj = Adjuster::streaming(&actions, AdjustmentMode::SplitOnly).unwrap();
+
+        let mut before = Tick {
+            time: DAY,
+            price: 100.0,
+            size: 40,
+        };
+        let mass = before.price * f64::from(before.size);
+        adj.apply_tick(&mut before);
+        assert!((before.price - 25.0).abs() < 1e-9);
+        assert_eq!(before.size, 160);
+        assert!(
+            (before.price * f64::from(before.size) - mass).abs() < 1e-9,
+            "price mass must survive the split"
+        );
+
+        // On and after the ex-date nothing moves: those prints are already in current terms.
+        let mut on_ex = Tick {
+            time: 2 * DAY,
+            price: 25.0,
+            size: 160,
+        };
+        adj.apply_tick(&mut on_ex);
+        assert!((on_ex.price - 25.0).abs() < 1e-9);
+        assert_eq!(on_ex.size, 160);
     }
 
     #[test]

@@ -338,8 +338,8 @@ MSFT  = [{ date = "2024-02-15", dividend = 0.75 }]
 (4 is a 4-for-1, `0.1` a 1-for-10 reverse); `dividend` is cash per share. Set
 exactly one per row.
 
-`bars`, `calc`, and `plot` take `--adjust` and `--actions`; no config file is
-required:
+`bars`, `calc`, `plot`, and `stat` take `--adjust` and `--actions`; no config
+file is required:
 
 ```text
 mdfwob bars AAPL.fwob 1d rth 2020-08-28..2020-08-31
@@ -365,9 +365,26 @@ rides along in the same streaming pass at constant memory, even for a whole-hist
 series): its factor is `(C − D) / C`, where `C` is the close immediately *before*
 the ex-date — a price no forward pass has yet seen.
 
-Two commands refuse to adjust, on purpose: `sync` and `bars --format fwob` both
-write durable artifacts, and baking today's table into one means a split recorded
-tomorrow silently invalidates it.
+`stat` adjusts too, and every field survives it. A split divides price exactly as
+it multiplies size, so the price mass a VWAP is built from is unchanged and only
+its share-count denominator moves:
+
+```text
+mdfwob stat AAPL.1d.rth.bars.fwob
+#   min 89.4700   max 515.1600   vwap 178.8921   volume 117,752,366,770
+mdfwob stat AAPL.1d.rth.bars.fwob --adjust split-only --actions actions.toml
+#   min 22.3675   max 344.5700   vwap  99.3030   volume 212,128,322,692
+```
+
+One case `stat` refuses: **bars coarser than a day, when adjusting.** An ex-date
+falls on a session boundary, so it can land *inside* a weekly or monthly bar,
+whose high, low, and VWAP would then mix pre- and post-split prices. No single
+factor corrects that, so a weekly file errors rather than returning a plausible
+wrong number. Raw summaries of the same file are fine.
+
+Two commands refuse to adjust entirely, on purpose: `sync` and
+`bars --format fwob` both write durable artifacts, and baking today's table into
+one means a split recorded tomorrow silently invalidates it.
 
 Adjusting on read rather than rewriting files keeps the actual traded prices
 recoverable, avoids rewriting gigabytes when a split lands, avoids compounding
