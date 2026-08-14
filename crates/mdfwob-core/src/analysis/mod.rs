@@ -23,7 +23,7 @@ pub mod stat;
 pub mod summary;
 
 pub use adjust::{
-    ActionKind, ActionSpec, ActionTable, AdjustmentMode, CorporateAction, adjust_bars,
+    ActionKind, ActionSpec, ActionTable, Adjuster, AdjustmentMode, CorporateAction, adjust_bars,
     detect_splits, load_actions,
 };
 pub use calc::{

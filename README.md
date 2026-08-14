@@ -336,8 +336,38 @@ MSFT  = [{ date = "2024-02-15", dividend = 0.75 }]
 
 `date` is the ex-date in the exchange timezone; `split` is new shares per old
 (4 is a 4-for-1, `0.1` a 1-for-10 reverse); `dividend` is cash per share. Set
-exactly one per row. Modes are `raw`, `split-only` (the default), and
-`total-return` (splits plus reinvested dividends).
+exactly one per row.
+
+`bars`, `calc`, and `plot` take `--adjust` and `--actions`; no config file is
+required:
+
+```text
+mdfwob bars AAPL.fwob 1d rth 2020-08-28..2020-08-31
+#   498.9000    then    128.9100      <- the raw 4-for-1 discontinuity
+mdfwob bars AAPL.fwob 1d rth 2020-08-28..2020-08-31 \
+      --adjust split-only --actions actions.toml
+#   124.7250    then    128.9100      <- continuous
+
+mdfwob calc AAPL.fwob 1d rth ret:simple --adjust split-only --actions actions.toml
+#   -0.74161155 becomes 0.03355382
+```
+
+The default is **`raw`**: this is the data layer, so what you see is what is
+stored, and no command silently rewrites prices because a config happened to be
+present. `--actions` takes any TOML carrying an `[actions]` table — a file of its
+own or a shared config. Asking to adjust with no table available is an error
+rather than a silent no-op, since that is indistinguishable from a typo'd path.
+
+Splits need no market data: a bar's factor is the product of `1/ratio` over every
+split dated after it, which the action table alone determines. So adjustment
+rides along in the same streaming pass at constant memory, even for a whole-history
+`1s` series. `total-return` is library-only (`adjust_bars` over a materialized
+series): its factor is `(C − D) / C`, where `C` is the close immediately *before*
+the ex-date — a price no forward pass has yet seen.
+
+Two commands refuse to adjust, on purpose: `sync` and `bars --format fwob` both
+write durable artifacts, and baking today's table into one means a split recorded
+tomorrow silently invalidates it.
 
 Adjusting on read rather than rewriting files keeps the actual traded prices
 recoverable, avoids rewriting gigabytes when a split lands, avoids compounding

@@ -506,12 +506,15 @@ impl McpServer {
             // always wants the recent end of it, and this keeps memory flat regardless of range.
             let mut window: VecDeque<BarRow> = VecDeque::with_capacity(limit);
             let mut total = 0usize;
+            // Read-only inspection surface: prices are served exactly as stored.
+            let mut adj = mdfwob_core::analysis::Adjuster::default();
             stream_bars(
                 paths,
                 pipeline.interval,
                 &pipeline.clock,
                 &pipeline.query,
                 fill,
+                &mut adj,
                 |bar| {
                     total += 1;
                     if window.len() == limit {
@@ -553,12 +556,15 @@ impl McpServer {
             }
             let mut window: VecDeque<CalcRow> = VecDeque::with_capacity(limit);
             let mut total = 0usize;
+            // Read-only inspection surface: prices are served exactly as stored.
+            let mut adj = mdfwob_core::analysis::Adjuster::default();
             stream_bars(
                 paths,
                 pipeline.interval,
                 &pipeline.clock,
                 &pipeline.query,
                 fill,
+                &mut adj,
                 |bar| {
                     total += 1;
                     // Every bar updates every indicator, even ones that get dropped from the
@@ -605,12 +611,15 @@ impl McpServer {
             .context("no symbol selected")?;
 
         let mut bars: Vec<Bar> = Vec::new();
+        // Read-only inspection surface: prices are served exactly as stored.
+        let mut adj = mdfwob_core::analysis::Adjuster::default();
         stream_bars(
             paths,
             pipeline.interval,
             &pipeline.clock,
             &pipeline.query,
             params.fill.unwrap_or(false),
+            &mut adj,
             |bar| {
                 if bars.len() >= MAX_PLOT_BARS {
                     bail!(

@@ -246,6 +246,88 @@ pub fn adjust_bars(bars: &mut [Bar], actions: &[CorporateAction], mode: Adjustme
     }
 }
 
+/// Adjusts bars as they stream, in one forward pass.
+///
+/// A split needs no market data at all: the factor for a bar is the product of `1/ratio` over every
+/// split with a *later* ex-date, which the action table alone determines. Since an action table
+/// holds a handful of rows and bars arrive in ascending time, a cursor over those rows gives each
+/// bar its factor with no buffering and no extra I/O — so even a whole-history conversion at `1s`
+/// can be adjusted at constant memory.
+///
+/// Dividends are the exception, and the reason [`Adjuster::streaming`] refuses
+/// [`AdjustmentMode::TotalReturn`]: their factor is `(C - D) / C`, where `C` is the close
+/// immediately *before* the ex-date. That price is not in the table, and the bars needing it are
+/// emitted before a forward pass ever reaches it. Use [`adjust_bars`] over a materialized series
+/// for total-return.
+#[derive(Debug, Clone, Default)]
+pub struct Adjuster {
+    /// Ascending by ex-date: `(ex_time, price_factor, volume_factor)`. A bar strictly before
+    /// `ex_time` — and at or after the previous entry's — takes these factors.
+    bounds: Vec<(u32, f64, f64)>,
+    cursor: usize,
+}
+
+impl Adjuster {
+    /// Builds an adjuster usable in a streaming pass.
+    ///
+    /// Errors for [`AdjustmentMode::TotalReturn`], which cannot be done forward-only.
+    pub fn streaming(actions: &[CorporateAction], mode: AdjustmentMode) -> Result<Self> {
+        match mode {
+            AdjustmentMode::Raw => Ok(Self::default()),
+            AdjustmentMode::SplitOnly => Ok(Self::splits(actions)),
+            AdjustmentMode::TotalReturn => bail!(
+                "total-return adjustment needs the close before each ex-date, which a forward \
+                 streaming pass cannot see; use split-only here, or adjust a materialized series"
+            ),
+        }
+    }
+
+    /// Split-only adjustment. `actions` must be sorted ascending by time; non-splits are ignored.
+    pub fn splits(actions: &[CorporateAction]) -> Self {
+        let mut bounds = Vec::new();
+        let (mut price, mut volume) = (1.0f64, 1.0f64);
+        // Walk backwards: a bar before this ex-date carries this action's factor and every later
+        // one's, so the cumulative product falls out in a single reverse pass.
+        for action in actions.iter().rev() {
+            if let ActionKind::Split { ratio } = action.kind {
+                price /= ratio;
+                volume *= ratio;
+            }
+            bounds.push((action.time, price, volume));
+        }
+        bounds.reverse();
+        Self { bounds, cursor: 0 }
+    }
+
+    /// True when this adjuster would leave every bar untouched.
+    pub fn is_identity(&self) -> bool {
+        self.bounds.is_empty()
+    }
+
+    /// Scales one bar. Bars must be supplied in ascending time order.
+    pub fn apply(&mut self, bar: &mut Bar) {
+        // Advance past every ex-date this bar is at or after; those no longer apply to it.
+        while self.cursor < self.bounds.len() && self.bounds[self.cursor].0 <= bar.time {
+            self.cursor += 1;
+        }
+        let Some(&(_, price, volume)) = self.bounds.get(self.cursor) else {
+            return; // at or after the last ex-date: already in current terms
+        };
+        if price != 1.0 {
+            bar.open *= price;
+            bar.high *= price;
+            bar.low *= price;
+            bar.close *= price;
+            if bar.vwap.is_finite() {
+                bar.vwap *= price;
+            }
+        }
+        if volume != 1.0 {
+            bar.volume = (bar.volume as f64 * volume).round() as i64;
+        }
+    }
+}
+
 /// Infers splits from overnight price gaps near a clean integer ratio.
 ///
 /// A **bootstrap and audit aid, not the live path**: it cannot see dividends, and a genuine
@@ -485,6 +567,77 @@ mod tests {
 
         let bad_ratio = table("[actions]\nX = [{ date = \"2020-01-02\", split = 0 }]");
         assert!(bad_ratio.resolve("X", &TimeZone::UTC).is_err());
+    }
+
+    /// The streaming adjuster must agree with the buffered one bar for bar; otherwise the CLI and
+    /// a materialized-series consumer would quietly disagree about the same data.
+    #[test]
+    fn streaming_matches_the_buffered_adjustment() {
+        let actions = [
+            CorporateAction {
+                time: 3 * DAY,
+                kind: ActionKind::Split { ratio: 4.0 },
+            },
+            CorporateAction {
+                time: 6 * DAY,
+                kind: ActionKind::Split { ratio: 5.0 },
+            },
+        ];
+        let series: Vec<Bar> = (1..=8)
+            .map(|i| bar(i * DAY, 100.0 + i as f64, 100 * i as i64))
+            .collect();
+
+        let mut buffered = series.clone();
+        adjust_bars(&mut buffered, &actions, AdjustmentMode::SplitOnly);
+
+        let mut streamed = series;
+        let mut adj = Adjuster::streaming(&actions, AdjustmentMode::SplitOnly).unwrap();
+        for b in &mut streamed {
+            adj.apply(b);
+        }
+
+        for (a, b) in buffered.iter().zip(&streamed) {
+            assert_eq!(a.time, b.time);
+            assert_eq!(a.open.to_bits(), b.open.to_bits(), "open at {}", a.time);
+            assert_eq!(a.close.to_bits(), b.close.to_bits(), "close at {}", a.time);
+            assert_eq!(a.volume, b.volume, "volume at {}", a.time);
+        }
+        // Sanity: the first bar really is divided by 20.
+        assert!((streamed[0].close - 101.0 / 20.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_streaming_adjuster_needs_no_market_data_for_splits() {
+        let actions = [CorporateAction {
+            time: 2 * DAY,
+            kind: ActionKind::Split { ratio: 4.0 },
+        }];
+        let mut adj = Adjuster::streaming(&actions, AdjustmentMode::SplitOnly).unwrap();
+        assert!(!adj.is_identity());
+
+        let mut before = bar(DAY, 100.0, 100);
+        let mut on_ex = bar(2 * DAY, 25.0, 400);
+        adj.apply(&mut before);
+        adj.apply(&mut on_ex);
+        assert!((before.close - 25.0).abs() < 1e-9, "pre-split scaled down");
+        assert_eq!(before.volume, 400);
+        assert!((on_ex.close - 25.0).abs() < 1e-9, "ex-date bar untouched");
+        assert_eq!(on_ex.volume, 400);
+    }
+
+    #[test]
+    fn raw_streams_as_the_identity_and_total_return_is_refused() {
+        let actions = [CorporateAction {
+            time: DAY,
+            kind: ActionKind::CashDividend { amount: 1.0 },
+        }];
+        assert!(
+            Adjuster::streaming(&actions, AdjustmentMode::Raw)
+                .unwrap()
+                .is_identity()
+        );
+        // Total-return needs the pre-ex close, which a forward pass cannot have.
+        assert!(Adjuster::streaming(&actions, AdjustmentMode::TotalReturn).is_err());
     }
 
     #[test]

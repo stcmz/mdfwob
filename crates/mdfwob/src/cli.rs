@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 
 use crate::{
     analysis::{
+        adjust::{ActionTable, Adjuster, AdjustmentMode, load_actions},
         calc::{StreamingIndicator, parse_spec, parse_streaming_spec},
         config::{AnalysisConfig, DEFAULT_EXTENDED_HOURS, DEFAULT_RTH_HOURS},
         inspect::{field_semantic_label, field_type_label, inspect_file},
@@ -333,6 +334,61 @@ pub(crate) fn kind_label(kind: InputKind) -> &'static str {
 
 /// Frames sampled per end by `inspect` for granularity/hours detection and the head/tail preview.
 pub(crate) const INSPECT_SAMPLE: u64 = 1_024;
+
+/// Corporate-action options shared by the price-producing commands.
+///
+/// The default is `raw`: this is the data layer, so what you see is what is stored, and a command
+/// never silently rewrites prices because a config happened to be present.
+#[derive(Debug, Clone, Args)]
+struct AdjustArgs {
+    /// Corporate-action handling: raw (default) | split-only.
+    #[arg(long, default_value = "raw")]
+    adjust: String,
+    /// TOML file holding an `[actions]` table. Other sections are ignored, so a shared config
+    /// file works too.
+    #[arg(long)]
+    actions: Option<PathBuf>,
+}
+
+impl AdjustArgs {
+    /// Resolves the mode and the action table, preferring `--actions` over the loaded config.
+    fn resolve(&self, config: Option<&Path>) -> Result<(AdjustmentMode, ActionTable)> {
+        let mode = AdjustmentMode::from_token(&self.adjust).with_context(|| {
+            format!(
+                "unknown --adjust {:?}; expected raw or split-only",
+                self.adjust
+            )
+        })?;
+        if mode == AdjustmentMode::Raw {
+            return Ok((mode, ActionTable::default()));
+        }
+        let table = match (&self.actions, config) {
+            (Some(path), _) => load_actions(path)?,
+            (None, Some(path)) => load_actions(path)?,
+            (None, None) => bail!(
+                "--adjust {} needs an action table; pass --actions FILE.toml (or a CONFIG.toml \
+                 carrying an [actions] section)",
+                self.adjust
+            ),
+        };
+        if table.is_empty() {
+            // Adjusting against an empty table is indistinguishable from not adjusting, which is
+            // the kind of silence that hides a typo'd path.
+            bail!("no [actions] entries found; nothing would be adjusted");
+        }
+        Ok((mode, table))
+    }
+
+    /// A streaming adjuster for one symbol.
+    fn adjuster(
+        mode: AdjustmentMode,
+        table: &ActionTable,
+        symbol: &str,
+        tz: &jiff::tz::TimeZone,
+    ) -> Result<Adjuster> {
+        Adjuster::streaming(&table.resolve(symbol, tz)?, mode)
+    }
+}
 
 #[derive(Debug, Args)]
 #[command(
@@ -664,6 +720,8 @@ impl StatArgs {
   time range: START..END (either side optional), e.g. 2024-01-01..2026-01-01 or ..2026-01-01
               bare dates/times use the exchange tz; add Z or +/-HH for an absolute instant")]
 struct BarsArgs {
+    #[command(flatten)]
+    adjust: AdjustArgs,
     /// Window start. Bare dates/times use the exchange tz; add Z or +/-HH for an absolute
     /// instant. Overrides the start side of a START..END token.
     #[arg(long)]
@@ -735,12 +793,25 @@ struct SyncArgs {
     /// Rebuild from scratch instead of appending the missing tail.
     #[arg(long)]
     force: bool,
+    /// Accepted only as `raw`. Sidecars store raw bars by design; see below.
+    #[arg(long, default_value = "raw")]
+    adjust: String,
     #[arg(value_name = "ITEM", num_args = 0..)]
     items: Vec<String>,
 }
 
 impl SyncArgs {
     fn run(self) -> Result<()> {
+        // Adjustment is deliberately not available here. A sidecar is a durable artifact, so
+        // baking today's action table into it means a split recorded tomorrow silently invalidates
+        // every file on disk — the exact failure the raw-sidecar rule exists to prevent.
+        if AdjustmentMode::from_token(&self.adjust) != Some(AdjustmentMode::Raw) {
+            bail!(
+                "sidecars store raw bars, so --adjust {} does not apply here; adjust when reading \
+                 them (`bars --adjust`, or the engine's own flag)",
+                self.adjust
+            );
+        }
         let (config_path, tokens) = split_config_target(self.items)?;
         let acfg = load_analysis_config(config_path.as_deref())?;
         let BarsTokens {
@@ -923,6 +994,8 @@ impl BarsArgs {
             }
         }
 
+        let (adjust_mode, actions) = self.adjust.resolve(config_path.as_deref())?;
+        let tz = session.time_zone();
         let out_dir = self.output.clone().or_else(|| acfg.output_dir.clone());
         let stdout = std::io::stdout();
         let mut out = std::io::BufWriter::new(stdout.lock());
@@ -937,10 +1010,19 @@ impl BarsArgs {
                 // Stream each bucket straight into the bar file so a fine-interval conversion of a
                 // whole tick history (e.g. 1s over billions of ticks) keeps bounded memory instead
                 // of buffering the entire bar series first.
+                if adjust_mode != AdjustmentMode::Raw {
+                    // A written file is a durable artifact; baking today's action table into it
+                    // means a split recorded tomorrow silently invalidates it. Adjust on read.
+                    bail!(
+                        "--format fwob writes raw bars, so --adjust does not apply; the file is \
+                         adjusted when it is read"
+                    );
+                }
                 for (symbol, paths) in &by_symbol {
                     let path = dir.join(format!("{symbol}.fwob"));
                     let mut writer = FrameWriter::create(&path, bar_schema(), symbol)?;
-                    stream_bars(paths, interval, &clock, &query, fill, |bar| {
+                    let mut adj = Adjuster::default();
+                    stream_bars(paths, interval, &clock, &query, fill, &mut adj, |bar| {
                         writer.push(|buf| encode_bar(&bar, buf))
                     })?;
                     writer.finish()?;
@@ -963,8 +1045,9 @@ impl BarsArgs {
                 // when redirected, stay buffered for throughput.
                 let autoflush = std::io::stdout().is_terminal();
                 let mut stream = FrameStream::new(&schema, strings, frame, autoflush, &mut out)?;
-                for (index, (_symbol, paths)) in by_symbol.iter().enumerate() {
-                    stream_bars(paths, interval, &clock, &query, fill, |bar| {
+                for (index, (symbol, paths)) in by_symbol.iter().enumerate() {
+                    let mut adj = AdjustArgs::adjuster(adjust_mode, &actions, symbol, &tz)?;
+                    stream_bars(paths, interval, &clock, &query, fill, &mut adj, |bar| {
                         stream.emit(index, |buf| encode_bar(&bar, buf))
                     })?;
                 }
@@ -993,6 +1076,8 @@ impl BarsArgs {
 to the console as a Sixel image (renders inline in Windows Terminal, WezTerm, xterm, iTerm2, ...).
 Pass --output to write a file instead: a .png (default) or a .six/.sixel raw Sixel dump."))]
 struct PlotArgs {
+    #[command(flatten)]
+    adjust: AdjustArgs,
     /// Window start. Bare dates/times use the exchange tz; add Z or +/-HH for an absolute
     /// instant. Overrides the start side of a START..END token.
     #[arg(long)]
@@ -1070,6 +1155,8 @@ impl PlotArgs {
         let (start, end) = parse_bounds(start.as_deref(), end.as_deref(), &session.time_zone())?;
         let files = resolve_files(&paths, &acfg)?;
         let filter = use_rth.then(|| session.clone());
+        let (adjust_mode, actions) = self.adjust.resolve(config_path.as_deref())?;
+        let tz = session.time_zone();
 
         // Accept both tick files and pre-aggregated bar files: both stream through the resampler at
         // the requested interval, so a bar file honors the interval (e.g. plotting a 1s bar file at
@@ -1085,12 +1172,14 @@ impl PlotArgs {
             let result = (|| -> Result<(String, Vec<Bar>)> {
                 let symbol = file_symbol(path)?;
                 let mut bars = Vec::new();
+                let mut adj = AdjustArgs::adjuster(adjust_mode, &actions, &symbol, &tz)?;
                 stream_bars(
                     std::slice::from_ref(path),
                     interval,
                     &clock,
                     &query,
                     fill,
+                    &mut adj,
                     |bar| {
                         bars.push(bar);
                         Ok(())
@@ -1186,8 +1275,16 @@ pub(crate) fn stream_bars(
     clock: &BarClock,
     query: &TickQuery,
     fill: bool,
+    adjuster: &mut Adjuster,
     sink: impl FnMut(Bar) -> Result<()>,
 ) -> Result<()> {
+    // Splits scale a bar from actions dated after it, which the action table alone determines, so
+    // adjustment rides along in the same forward pass at constant memory.
+    let mut sink = sink;
+    let sink = |mut bar: Bar| {
+        adjuster.apply(&mut bar);
+        sink(bar)
+    };
     let mut kind: Option<InputKind> = None;
     for path in paths {
         let this = input_kind(path)?;
@@ -1274,6 +1371,8 @@ fn fmt_session_len(seconds: u32) -> String {
               bare dates/times use the exchange tz; add Z or +/-HH for an absolute instant",
     indicator_guide!()))]
 struct CalcArgs {
+    #[command(flatten)]
+    adjust: AdjustArgs,
     /// Window start. Bare dates/times use the exchange tz; add Z or +/-HH for an absolute
     /// instant. Overrides the start side of a START..END token.
     #[arg(long)]
@@ -1364,6 +1463,8 @@ impl CalcArgs {
         let decimals: Vec<u8> = meta.iter().map(|i| i.decimals()).collect();
         drop(meta);
 
+        let (adjust_mode, actions) = self.adjust.resolve(config_path.as_deref())?;
+        let tz = session.time_zone();
         let out_dir = self.output.clone().or_else(|| acfg.output_dir.clone());
         match format {
             AnalysisFormat::Fwob => {
@@ -1377,7 +1478,8 @@ impl CalcArgs {
                     let path = dir.join(format!("{symbol}.fwob"));
                     let mut writer =
                         FrameWriter::create(&path, calc_schema(&names, &decimals)?, symbol)?;
-                    stream_bars(paths, interval, &clock, &query, fill, |bar| {
+                    let mut adj = Adjuster::default();
+                    stream_bars(paths, interval, &clock, &query, fill, &mut adj, |bar| {
                         let values: Vec<Option<f64>> =
                             indicators.iter_mut().map(|i| i.update(&bar)).collect();
                         writer.push(|buf| {
@@ -1425,7 +1527,8 @@ impl CalcArgs {
                         let mut indicators = build_streaming_indicators(&spec_tokens)?;
                         let mut collector =
                             show_summary.then(|| SummaryCollector::new(&summary_columns));
-                        stream_bars(paths, interval, &clock, &query, fill, |bar| {
+                        let mut adj = AdjustArgs::adjuster(adjust_mode, &actions, symbol, &tz)?;
+                        stream_bars(paths, interval, &clock, &query, fill, &mut adj, |bar| {
                             let values: Vec<Option<f64>> =
                                 indicators.iter_mut().map(|i| i.update(&bar)).collect();
                             stream.emit(index, |buf| {
