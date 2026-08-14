@@ -79,7 +79,6 @@ enum Command {
     /// Resample ticks (or re-resample bars) into OHLCV bars (table/csv/md/jsonl/raw/hex/fwob).
     Bars(BarsArgs),
     /// Build or incrementally update `<SYMBOL>.<INTERVAL>.<rth|ext>.bars.fwob` sidecars.
-    #[command(alias = "refresh")]
     Sync(SyncArgs),
     /// Compute per-bar indicator series (sma/ema/rsi/ret/vol) over bars or ticks.
     Calc(CalcArgs),
@@ -336,11 +335,18 @@ pub(crate) fn kind_label(kind: InputKind) -> &'static str {
 pub(crate) const INSPECT_SAMPLE: u64 = 1_024;
 
 #[derive(Debug, Args)]
-#[command(override_usage = "mdfwob ls [CONFIG.toml] [PATHS_OR_SYMBOLS...] [FORMAT] [OPTIONS]")]
+#[command(
+    override_usage = "mdfwob ls [CONFIG.toml] [PATHS_OR_SYMBOLS...] [KIND] [FORMAT] [OPTIONS]"
+)]
 #[command(
     after_help = "Tokens (any order): tick/bar FILE.fwob, a DIR (its immediate *.fwob), or a \
-bare SYMBOL (resolved under output_dir); and one output format: table (default), md, csv, jsonl. \
-With no path, lists the current directory's *.fwob files."
+bare SYMBOL (resolved under output_dir); one output format: table (default), md, csv, jsonl; and \
+optionally a kind filter, `tick` or `bar`. With no path, lists the current directory's *.fwob \
+files.
+
+  mdfwob ls           # everything
+  mdfwob ls tick      # only tick files -- the download sources
+  mdfwob ls bar       # only bar files, including materialized sidecars"
 )]
 struct LsArgs {
     /// Override the session window (HH:MM-HH:MM) used to classify regular vs extended hours.
@@ -360,11 +366,16 @@ impl LsArgs {
         let (config_path, tokens) = split_config_target(self.items)?;
         let acfg = load_analysis_config(config_path.as_deref())?;
         let mut format = None;
+        let mut kind: Option<InputKind> = None;
         let mut paths = Vec::new();
         for token in &tokens {
             if let Some(parsed) = LsFormat::parse(token) {
                 if format.replace(parsed).is_some() {
                     bail!("multiple output format tokens given");
+                }
+            } else if let Some(parsed) = InputKind::from_token(token) {
+                if kind.replace(parsed).is_some() {
+                    bail!("multiple kind tokens given");
                 }
             } else {
                 paths.push(token.clone());
@@ -386,7 +397,10 @@ impl LsArgs {
         let mut failures = 0u32;
         for path in &files {
             match ls_file(path.display().to_string(), path, &rth, INSPECT_SAMPLE) {
-                Ok(row) => rows.push(row),
+                // A kind token filters the listing rather than erroring on the others, so
+                // `ls tick` over a mixed directory reads as a narrowed `ls`.
+                Ok(row) if kind.is_none_or(|want| row.kind == want.label()) => rows.push(row),
+                Ok(_) => {}
                 Err(error) => {
                     failures += 1;
                     tracing::error!(path = %path.display(), error = %format!("{error:#}"), "failed to read");
@@ -681,8 +695,9 @@ struct BarsArgs {
     after_help = "Materializes `<SYMBOL>.<INTERVAL>.<rth|ext>.bars.fwob` next to each source file,
 so a research run seeks pre-built bars instead of re-resampling the tick history every time.
 
-With no path given, every `*.fwob` in the current directory is synced; paths, directories, and bare
-symbols all work, exactly as for `ls` and `bars`. Existing sidecars are never treated as sources.
+With no path given, every tick file in the current directory is synced; paths, directories, and bare
+symbols all work, exactly as for `ls` and `bars`. Only TICK files are sources -- bar files, sidecars
+included, are skipped, and the check is on the file's actual kind rather than its name.
 
 Only the missing tail is appended, and the stored final bucket is re-derived rather than trusted --
 a sidecar written while a session was still open holds a partial bar, so a half day that later
@@ -692,8 +707,8 @@ backfilled after the fact, use --force to rebuild that symbol from scratch.
 Sidecars store RAW bars: corporate-action adjustment is applied when they are read, so a newly
 recorded split never silently invalidates a materialized file.
 
-  mdfwob sync                        # every *.fwob here, at the configured interval
-  mdfwob sync 1d rth                 # every *.fwob here, daily, regular hours
+  mdfwob sync                        # every tick file here, at the configured interval
+  mdfwob sync 1d rth                 # every tick file here, daily, regular hours
   mdfwob sync MSFT.fwob AAPL 1d rth  # a path and a bare symbol
   mdfwob sync config.toml 1d rth     # every symbol in [analysis].symbols
   mdfwob sync . 1d rth --output bars/"
@@ -754,13 +769,25 @@ impl SyncArgs {
 
         // A sidecar is itself a bar file, so discovery would otherwise feed last run's output back
         // in as a source and refresh it against itself.
-        // Every sidecar is excluded, not just this interval's: a directory holding both a `1h` and
-        // a `1d` sidecar would otherwise feed one back in as a source and build a sidecar of a
-        // sidecar. Re-deriving one interval from another is `bars --output`'s job.
-        let files: Vec<PathBuf> = resolve_files(&paths, &acfg)?
-            .into_iter()
-            .filter(|path| !crate::analysis::sidecar::is_sidecar(path))
-            .collect();
+        // Sidecars are derived from ticks, so only tick files are sources. Filtering on the
+        // file's actual kind rather than its name is what makes that reliable: a sidecar is a bar
+        // file, but so is any hand-made `SYMBOL.fwob` holding bars, and a name-based rule would
+        // wave the latter through and build a sidecar from a sidecar-shaped input.
+        let mut files = Vec::new();
+        for path in resolve_files(&paths, &acfg)? {
+            match input_kind(&path) {
+                Ok(InputKind::Tick) => files.push(path),
+                Ok(InputKind::Bar) => {
+                    // Explicitly naming a bar file is worth a word; sweeping a directory is not.
+                    if !paths.is_empty() {
+                        tracing::warn!(path = %path.display(), "skipping: sync builds sidecars from tick files");
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(path = %path.display(), error = %format!("{error:#}"), "failed to read")
+                }
+            }
+        }
 
         let mut by_symbol: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
         for path in &files {

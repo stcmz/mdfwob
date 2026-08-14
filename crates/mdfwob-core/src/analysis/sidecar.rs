@@ -27,7 +27,7 @@ use crate::analysis::resample::{BarResampler, ForwardFiller, Resampler};
 use crate::analysis::schema::{bar_schema, encode_bar};
 use crate::analysis::{BarClock, Interval, TickQuery};
 
-/// Filename for a symbol's materialized bars at one interval and session.
+/// File for a symbol's materialized bars at one interval and session.
 ///
 /// The session is part of the name because it is part of the contents: regular hours and extended
 /// hours produce different opens, highs, lows, and closes for the same day. A name that omitted it
@@ -44,16 +44,6 @@ pub fn sidecar_name(symbol: &str, interval: Interval, use_rth: bool) -> String {
 /// Path to a symbol's sidecar inside `dir`.
 pub fn sidecar_path(dir: &Path, symbol: &str, interval: Interval, use_rth: bool) -> PathBuf {
     dir.join(sidecar_name(symbol, interval, use_rth))
-}
-
-/// Whether `path` names a materialized sidecar, at any interval or session.
-///
-/// Used to keep sidecars out of source discovery: a directory holding both a `1h` and a `1d`
-/// sidecar would otherwise feed one back in as a source and build a sidecar of a sidecar.
-pub fn is_sidecar(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.ends_with(".bars.fwob"))
 }
 
 /// What a refresh did.
@@ -340,20 +330,18 @@ mod tests {
         assert_eq!(ext, "MSFT.1h.ext.bars.fwob");
     }
 
-    /// Sidecars must never be mistaken for sources, at any interval or session — otherwise a
-    /// directory holding a `1h` sidecar would grow a `1d` sidecar built from it.
+    /// A materialized sidecar is a bar file, so a kind check keeps it out of source discovery —
+    /// and, unlike a name rule, also catches a hand-made `SYMBOL.fwob` that happens to hold bars.
     #[test]
-    fn every_sidecar_is_recognized_regardless_of_interval_or_session() {
-        for name in [
-            "MSFT.1d.rth.bars.fwob",
-            "MSFT.1h.ext.bars.fwob",
-            "BRK B.5m.rth.bars.fwob",
-        ] {
-            assert!(is_sidecar(Path::new(name)), "{name}");
-        }
-        for name in ["MSFT.fwob", "MSFT_20260717_C_450.fwob", "notes.txt"] {
-            assert!(!is_sidecar(Path::new(name)), "{name}");
-        }
+    fn a_sidecar_reads_back_as_a_bar_file() {
+        let dir = temp_dir("kind");
+        let source = write_ticks(&dir, "TEST", 0, 60, 600);
+        let q = TickQuery::default();
+        let out = refresh_sidecar(&source, &dir, "TEST", &spec(&q)).unwrap();
+
+        assert_eq!(input_kind(&source).unwrap(), InputKind::Tick);
+        assert_eq!(input_kind(&out.path).unwrap(), InputKind::Bar);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Documents a real limitation: only the trailing bucket is revisited, so a day backfilled

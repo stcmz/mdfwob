@@ -19,6 +19,26 @@ pub enum InputKind {
     Bar,
 }
 
+impl InputKind {
+    /// The label used in listings and diagnostics.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Tick => "tick",
+            Self::Bar => "bar",
+        }
+    }
+
+    /// Parses a positional `tick` / `bar` token. Returns `None` for anything else so a CLI token
+    /// classifier can fall through to paths and symbols.
+    pub fn from_token(value: &str) -> Option<Self> {
+        match value {
+            "tick" | "ticks" => Some(Self::Tick),
+            "bar" | "bars" => Some(Self::Bar),
+            _ => None,
+        }
+    }
+}
+
 /// Extracts the `time` epoch second from a boundary [`Key`]. Tick and bar files both key on a
 /// `u32` second; the `I64` arm tolerates a file written with a wider key type.
 pub fn key_epoch(key: Key) -> Option<u32> {

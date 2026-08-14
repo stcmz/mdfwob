@@ -188,6 +188,8 @@ files; no path uses the current directory. `--start`/`--end` accept a date
 ```text
 mdfwob ls data/                       # one tz-aware row per tick/bar file
 mdfwob ls data/ csv                   # ...as CSV (also md, jsonl)
+mdfwob ls tick                        # only tick files (the download sources)
+mdfwob ls bar                         # only bar files, sidecars included
 mdfwob stat data/ md rth
 mdfwob bars AAPL.fwob                  # 1d bars (the default period)
 mdfwob bars AAPL.fwob 5m
@@ -294,15 +296,16 @@ directly:
 ```text
 mdfwob sync MSFT.fwob 1d rth       # 38 s: builds 2600 bars from 837M ticks
 mdfwob sync MSFT.fwob 1d rth       # 0.1 s: appends only what is missing
-mdfwob sync 1d rth                 # every *.fwob in the current directory
+mdfwob sync 1d rth                 # every tick file in the current directory
 mdfwob sync MSFT AAPL 1d rth       # bare symbols, as for `ls` and `bars`
 mdfwob sync config.toml 1d rth     # every symbol in [analysis].symbols
 mdfwob bars MSFT.1d.rth.bars.fwob  # reads the sidecar, byte-identical output
 ```
 
-With no path given it syncs the whole directory. Existing sidecars are never
-treated as sources, at any interval — otherwise a directory holding a `1h`
-sidecar would grow a `1d` sidecar built from it.
+With no path given it syncs the whole directory. **Only tick files are sources**;
+bar files are skipped, with a word only when one was named explicitly. The test
+is the file's actual kind, not its name — a name rule would exclude sidecars but
+wave through a hand-made `SYMBOL.fwob` that happens to hold bars.
 
 Only the missing tail is appended, and the stored **final** bucket is re-derived
 rather than trusted: a sidecar written while a session was still open holds a
