@@ -334,9 +334,18 @@ GOOGL = [{ date = "2022-07-18", split = 20 }]
 MSFT  = [{ date = "2024-02-15", dividend = 0.75 }]
 ```
 
-`date` is the ex-date in the exchange timezone; `split` is new shares per old
-(4 is a 4-for-1, `0.1` a 1-for-10 reverse); `dividend` is cash per share. Set
-exactly one per row.
+`date` is the ex-date in the exchange timezone. Set exactly one action per row:
+
+| field | meaning | example |
+| --- | --- | --- |
+| `split` | forward split, new shares per old | `4` = 4-for-1 |
+| `reverse_split` | reverse split, shares merged into one | `10` = 1-for-10 |
+| `dividend` | cash per share | `0.75` |
+
+A reverse is also expressible as `split = 0.1`, but only that way it is far too
+easy to write `10` and silently get a 10-for-1 forward instead — the exact
+inverse, prices off by 100x, with nothing to signal it. `reverse_split` says
+which direction is meant and rejects a value below 1.
 
 `bars`, `calc`, `plot`, and `stat` take `--actions`; no config file is
 required. Supplying a table is itself the request to adjust -- a separate mode

@@ -23,8 +23,8 @@
 //! ```
 //!
 //! `date` is the **ex-date** in exchange-local time: the first session that trades at the new
-//! price. `split` is the ratio of new shares to old (4 means 4-for-1; 0.1 means a 1-for-10
-//! reverse). `dividend` is cash per share.
+//! price. Set exactly one action per row: `split` (forward, new shares per old -- 4 is a 4-for-1),
+//! `reverse_split` (shares merged into one -- 10 is a 1-for-10), or `dividend` (cash per share).
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -86,9 +86,16 @@ impl AdjustmentMode {
 pub struct ActionSpec {
     /// Ex-date as `YYYY-MM-DD`, in the exchange timezone.
     pub date: String,
-    /// New shares per old share.
+    /// Forward split, as new shares per old share: `4` is a 4-for-1.
     #[serde(default)]
     pub split: Option<f64>,
+    /// Reverse split, as old shares per new share: `10` is a 1-for-10.
+    ///
+    /// Expressible as `split = 0.1`, but only that way it would be far too easy to write `10` and
+    /// silently get a 10-for-1 forward split — the exact inverse, with prices off by 100x and
+    /// nothing to signal it.
+    #[serde(default)]
+    pub reverse_split: Option<f64>,
     /// Cash per share.
     #[serde(default)]
     pub dividend: Option<f64>,
@@ -132,16 +139,22 @@ impl ActionTable {
 
         let mut out = Vec::with_capacity(specs.len());
         for spec in specs {
-            let kind = match (spec.split, spec.dividend) {
-                (Some(_), Some(_)) => bail!(
-                    "{symbol} action on {}: set exactly one of `split` or `dividend`",
+            let given = [spec.split, spec.reverse_split, spec.dividend]
+                .iter()
+                .filter(|field| field.is_some())
+                .count();
+            if given != 1 {
+                bail!(
+                    "{symbol} action on {}: set exactly one of `split`, `reverse_split`, or \
+                     `dividend` (found {given})",
                     spec.date
-                ),
-                (None, None) => bail!(
-                    "{symbol} action on {}: needs a `split` or a `dividend`",
-                    spec.date
-                ),
-                (Some(ratio), None) => {
+                );
+            }
+
+            // A split's ratio is always new shares per old: a 4-for-1 is 4, a 1-for-10 is 0.1.
+            // `reverse_split = 10` is the readable spelling of the latter.
+            let kind = match (spec.split, spec.reverse_split, spec.dividend) {
+                (Some(ratio), _, _) => {
                     if !(ratio.is_finite() && ratio > 0.0) || (ratio - 1.0).abs() < f64::EPSILON {
                         bail!(
                             "{symbol} split on {}: ratio must be positive and != 1, got {ratio}",
@@ -150,7 +163,17 @@ impl ActionTable {
                     }
                     ActionKind::Split { ratio }
                 }
-                (None, Some(amount)) => {
+                (_, Some(n), _) => {
+                    if !(n.is_finite() && n > 1.0) {
+                        bail!(
+                            "{symbol} reverse_split on {}: expected shares merged into one, \
+                             greater than 1 (a 1-for-10 is 10), got {n}",
+                            spec.date
+                        );
+                    }
+                    ActionKind::Split { ratio: 1.0 / n }
+                }
+                (_, _, Some(amount)) => {
                     if !(amount.is_finite() && amount > 0.0) {
                         bail!(
                             "{symbol} dividend on {}: amount must be positive, got {amount}",
@@ -159,6 +182,7 @@ impl ActionTable {
                     }
                     ActionKind::CashDividend { amount }
                 }
+                _ => unreachable!("exactly one field is set"),
             };
 
             let date: civil::Date = spec.date.parse().with_context(|| {
@@ -576,6 +600,29 @@ mod tests {
         );
         let actions = t.resolve("X", &TimeZone::UTC).unwrap();
         assert!(actions[0].time < actions[1].time);
+    }
+
+    /// `reverse_split = 10` and `split = 0.1` must mean the same 1-for-10 merge. The readable
+    /// spelling exists because writing `10` for a reverse is the natural mistake, and it would
+    /// otherwise silently apply a 10-for-1 forward — prices off by 100x, with nothing to signal it.
+    #[test]
+    fn a_reverse_split_can_be_written_the_readable_way() {
+        let explicit = table("[actions]\nX = [{ date = \"2020-01-02\", reverse_split = 10 }]");
+        let fractional = table("[actions]\nX = [{ date = \"2020-01-02\", split = 0.1 }]");
+        let a = explicit.resolve("X", &TimeZone::UTC).unwrap();
+        let b = fractional.resolve("X", &TimeZone::UTC).unwrap();
+        assert_eq!(a.len(), 1);
+        match (a[0].kind, b[0].kind) {
+            (ActionKind::Split { ratio: x }, ActionKind::Split { ratio: y }) => {
+                assert!((x - 0.1).abs() < 1e-12, "{x}");
+                assert!((x - y).abs() < 1e-12, "{x} vs {y}");
+            }
+            other => panic!("expected two splits, got {other:?}"),
+        }
+
+        // The direction of the mistake is caught: a reverse is a merge, never a multiplication.
+        let backwards = table("[actions]\nX = [{ date = \"2020-01-02\", reverse_split = 0.1 }]");
+        assert!(backwards.resolve("X", &TimeZone::UTC).is_err());
     }
 
     #[test]
