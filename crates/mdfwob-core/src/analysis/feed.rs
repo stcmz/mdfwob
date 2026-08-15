@@ -29,7 +29,7 @@ use crate::analysis::read::{
 };
 use crate::analysis::resample::{BarResampler, ForwardFiller, Resampler};
 use crate::analysis::sidecar::sidecar_path;
-use crate::analysis::{BarClock, Interval, TickQuery};
+use crate::analysis::{BarClock, Interval, Session, TickQuery};
 
 /// What to read, and how to bucket it.
 #[derive(Clone, Copy)]
@@ -68,6 +68,25 @@ impl<'a> BarStream<'a> {
     }
 }
 
+/// The kind every source of one symbol shares, or `None` when there are no sources.
+///
+/// Mixing is refused rather than resolved: a symbol backed by both ticks and bars would have two
+/// different notions of what a timestamp means, and no single query can be right for both.
+fn sources_kind(paths: &[PathBuf]) -> Result<Option<InputKind>> {
+    let mut kind: Option<InputKind> = None;
+    for path in paths {
+        let this = input_kind(path)?;
+        match kind {
+            Some(existing) if existing != this => bail!(
+                "cannot mix tick and bar files for one symbol ({})",
+                path.display()
+            ),
+            _ => kind = Some(this),
+        }
+    }
+    Ok(kind)
+}
+
 /// Streams a symbol's bars to `sink` as each bucket closes.
 ///
 /// Every path feeds **one** resampler, so several files of a symbol form a single ascending stream
@@ -86,17 +105,7 @@ pub fn stream_symbol_bars(spec: BarStream<'_>, sink: impl FnMut(Bar) -> Result<(
         fill,
     } = spec;
 
-    let mut kind: Option<InputKind> = None;
-    for path in paths {
-        let this = input_kind(path)?;
-        match kind {
-            Some(existing) if existing != this => bail!(
-                "cannot mix tick and bar files for one symbol ({})",
-                path.display()
-            ),
-            _ => kind = Some(this),
-        }
-    }
+    let kind = sources_kind(paths)?;
 
     let Some(interval) = interval else {
         // No target width: a bar source keeps its stored resolution and passes straight through.
@@ -261,10 +270,106 @@ pub fn symbol_bars(
     stream_symbol_bars(stream, sink)
 }
 
+/// What bars a consumer wants, stated without reference to how the archive stores them.
+///
+/// This is the entry point research code should reach for. Whether a symbol is backed by raw
+/// ticks, by 1-minute bars, or by a materialized daily sidecar is the archive's business, and the
+/// answer must be identical either way — so the caller says "1d, regular hours, this window" and
+/// nothing about files.
+///
+/// The part that cannot be left to callers is the session. Against ticks it is a **row filter**,
+/// because a tick carries an instant and out-of-hours prints have to be dropped. Against bars it
+/// must not be: a bar carries its bucket-start timestamp, which for a daily bar is local midnight
+/// — outside every intraday window — so the same filter silently discards the whole file. A
+/// consumer building its own [`TickQuery`] had to know which case it was in, and that knowledge
+/// went stale the moment a sidecar was substituted underneath it.
+pub struct BarRequest<'a> {
+    /// One symbol's source files, ascending. All must be the same kind.
+    pub paths: &'a [PathBuf],
+    /// Target bar width. `None` keeps a bar source at its stored resolution, and is an error for a
+    /// tick source, which has no resolution of its own.
+    pub interval: Option<Interval>,
+    /// The trading session, which anchors bucket boundaries and — for ticks — filters rows.
+    pub session: &'a Session,
+    /// Keep only in-session activity. When false the session still anchors buckets.
+    pub use_rth: bool,
+    /// Emit flat bars for empty buckets inside a session.
+    pub fill: bool,
+    /// Inclusive scan bounds, in epoch seconds.
+    pub start: Option<u32>,
+    pub end: Option<u32>,
+    /// Read a current sidecar instead of re-resampling. Pure optimization; identical result.
+    pub prefer_sidecar: bool,
+}
+
+impl<'a> BarRequest<'a> {
+    /// Regular hours, no fill, whole file, sidecars preferred.
+    pub fn new(
+        paths: &'a [PathBuf],
+        interval: impl Into<Option<Interval>>,
+        session: &'a Session,
+    ) -> Self {
+        Self {
+            paths,
+            interval: interval.into(),
+            session,
+            use_rth: true,
+            fill: false,
+            start: None,
+            end: None,
+            prefer_sidecar: true,
+        }
+    }
+    pub fn use_rth(mut self, use_rth: bool) -> Self {
+        self.use_rth = use_rth;
+        self
+    }
+    pub fn fill(mut self, fill: bool) -> Self {
+        self.fill = fill;
+        self
+    }
+    pub fn window(mut self, start: Option<u32>, end: Option<u32>) -> Self {
+        self.start = start;
+        self.end = end;
+        self
+    }
+    pub fn prefer_sidecar(mut self, prefer: bool) -> Self {
+        self.prefer_sidecar = prefer;
+        self
+    }
+}
+
+/// Streams the bars a [`BarRequest`] describes, choosing the source and the query internally.
+pub fn request_bars(
+    symbol: &str,
+    req: BarRequest<'_>,
+    sink: impl FnMut(Bar) -> Result<()>,
+) -> Result<()> {
+    let clock = BarClock::Session(req.session.clone());
+    let query = TickQuery {
+        start: req.start,
+        end: req.end,
+        // The whole reason this function exists: the row filter belongs to ticks alone.
+        session: match sources_kind(req.paths)? {
+            Some(InputKind::Tick) if req.use_rth => Some(req.session.clone()),
+            _ => None,
+        },
+    };
+    symbol_bars(
+        SymbolBars {
+            stream: BarStream::new(req.paths, req.interval, &clock, &query).fill(req.fill),
+            use_rth: req.use_rth,
+            prefer_sidecar: req.prefer_sidecar,
+        },
+        symbol,
+        &req.session.time_zone(),
+        sink,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analysis::Session;
     use crate::analysis::sidecar::{RefreshSpec, refresh_sidecar};
     use crate::tick::{Tick as RawTick, tick_schema};
     use fwob::Writer;
@@ -551,6 +656,112 @@ mod tests {
         .unwrap();
         assert_eq!(windowed.len(), 2, "start/end must still apply");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The property `request_bars` exists to guarantee: asking for 1d regular-hours bars gives the
+    /// same answer whether the symbol is stored as ticks, as finer bars, or as a daily sidecar. A
+    /// caller that had to build the session filter itself got this wrong for the bar cases.
+    #[test]
+    fn the_same_request_gives_the_same_bars_from_ticks_bars_or_a_sidecar() {
+        let dir = temp_dir("agnostic");
+        let session = Session::new("America/New_York", "09:30-16:00").unwrap();
+        let daily = Interval::parse("1d").unwrap().unwrap();
+        let minute = Interval::parse("1m").unwrap().unwrap();
+
+        let open = |d: i8| {
+            jiff::civil::date(2024, 3, d)
+                .at(9, 30, 0, 0)
+                .in_tz("America/New_York")
+                .unwrap()
+                .timestamp()
+                .as_second() as u32
+        };
+        // Three trading days of half-hourly in-session ticks.
+        let mut times = Vec::new();
+        for d in [4i8, 5, 6] {
+            times.extend((0..12).map(|i| open(d) + i * 1_800));
+        }
+        let ticks = dir.join("T.fwob");
+        let mut writer = Writer::create_v2(&ticks, tick_schema(), WriterOptions::new("T")).unwrap();
+        let mut buf = Vec::new();
+        for (i, &time) in times.iter().enumerate() {
+            buf.clear();
+            RawTick::new(time, 100.0 + i as f64, 10)
+                .unwrap()
+                .encode(&mut buf);
+            writer.append_frame(&buf).unwrap();
+        }
+        writer.finish().unwrap();
+
+        let ask = |paths: &[PathBuf], prefer_sidecar: bool| {
+            let mut out = Vec::new();
+            request_bars(
+                "T",
+                BarRequest::new(paths, daily, &session)
+                    .window(Some(open(4) - 34_200), Some(open(7)))
+                    .prefer_sidecar(prefer_sidecar),
+                |bar| {
+                    out.push(bar);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            out
+        };
+
+        let tick_sources = vec![ticks.clone()];
+        let from_ticks = ask(&tick_sources, false);
+        assert_eq!(from_ticks.len(), 3, "three trading days");
+
+        // 1) A finer bar file as the source: same daily answer, re-resampled.
+        refresh_sidecar(
+            &ticks,
+            &dir,
+            "T",
+            &RefreshSpec {
+                interval: minute,
+                use_rth: true,
+                clock: &BarClock::Session(session.clone()),
+                query: &TickQuery {
+                    session: Some(session.clone()),
+                    ..Default::default()
+                },
+                fill: false,
+            },
+        )
+        .unwrap();
+        let minute_bars = vec![sidecar_path(&dir, "T", minute, true)];
+        let from_minutes = ask(&minute_bars, false);
+
+        // 2) A daily sidecar beside the ticks, chosen transparently.
+        refresh_sidecar(
+            &ticks,
+            &dir,
+            "T",
+            &RefreshSpec {
+                interval: daily,
+                use_rth: true,
+                clock: &BarClock::Session(session.clone()),
+                query: &TickQuery {
+                    session: Some(session.clone()),
+                    ..Default::default()
+                },
+                fill: false,
+            },
+        )
+        .unwrap();
+        let from_sidecar = ask(&tick_sources, true);
+
+        for (label, got) in [("1m bars", &from_minutes), ("sidecar", &from_sidecar)] {
+            assert_eq!(got.len(), from_ticks.len(), "{label} row count");
+            for (a, b) in from_ticks.iter().zip(got.iter()) {
+                assert_eq!(a.time, b.time, "{label} time");
+                assert_eq!(a.open.to_bits(), b.open.to_bits(), "{label} open");
+                assert_eq!(a.close.to_bits(), b.close.to_bits(), "{label} close");
+                assert_eq!(a.volume, b.volume, "{label} volume");
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
