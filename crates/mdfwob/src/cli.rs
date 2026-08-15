@@ -20,14 +20,15 @@ use crate::{
         ls::{LsFormat, ls_file, write_ls},
         model::Bar,
         output::{
-            AnalysisFormat, FrameStream, FrameWriter, format_epoch_tz, guard_symbol_count,
-            write_stat,
+            AnalysisFormat, FrameStream, FrameWriter, comma_u64, format_epoch_tz,
+            guard_symbol_count, write_stat,
         },
         plot::{Canvas, PlotOptions, layout_series, render},
         read::{InputKind, TickQuery, detect_kind, discover_inputs, file_symbol, input_kind},
         resample::BarClock,
         schema::{bar_schema, calc_schema, encode_bar, encode_calc_row, with_symbol_column},
         session::Session,
+        sidecar::sidecar_path,
         stat::{stat_file, stat_file_adjusted},
         summary::{SummaryCollector, SummaryColumn},
     },
@@ -55,6 +56,7 @@ impl Cli {
             Command::Stat(args) => args.run(),
             Command::Bars(args) => args.run(),
             Command::Sync(args) => args.run(),
+            Command::Unsync(args) => args.run(),
             Command::Calc(args) => args.run(),
             Command::Plot(args) => args.run(),
             #[cfg(feature = "mcp")]
@@ -79,6 +81,8 @@ enum Command {
     Bars(BarsArgs),
     /// Build or incrementally update `<SYMBOL>.<INTERVAL>.<rth|ext>.bars.fwob` sidecars.
     Sync(SyncArgs),
+    /// Remove the bar sidecars `sync` builds.
+    Unsync(UnsyncArgs),
     /// Compute per-bar indicator series (sma/ema/rsi/ret/vol) over bars or ticks.
     Calc(CalcArgs),
     /// Render OHLC bars as a candlestick chart (Sixel to the console, or a PNG file).
@@ -801,6 +805,145 @@ struct SyncArgs {
     items: Vec<String>,
 }
 
+/// Resolves inputs to each symbol's tick sources, the way `sync` and `unsync` both need.
+///
+/// Only tick files qualify. Sidecars are derived from ticks, so a sidecar is never a source — and
+/// filtering on the file's actual **kind** rather than its name is what makes that reliable: a
+/// sidecar is a bar file, but so is any hand-made `SYMBOL.fwob` holding bars, and a name rule would
+/// wave the latter through.
+///
+/// `unsync` sharing this is what stops it deleting an orphan: a file named like a sidecar whose
+/// symbol has no tick source here never appears in this map, so nothing ever derives its path.
+fn tick_sources(
+    paths: &[String],
+    acfg: &AnalysisConfig,
+    verb: &str,
+) -> Result<BTreeMap<String, Vec<PathBuf>>> {
+    let mut files = Vec::new();
+    for path in resolve_files(paths, acfg)? {
+        match input_kind(&path) {
+            Ok(InputKind::Tick) => files.push(path),
+            Ok(InputKind::Bar) => {
+                // Explicitly naming a bar file is worth a word; sweeping a directory is not.
+                if !paths.is_empty() {
+                    tracing::warn!(path = %path.display(), "skipping: {verb} works from tick files");
+                }
+            }
+            Err(error) => {
+                tracing::error!(path = %path.display(), error = %format!("{error:#}"), "failed to read")
+            }
+        }
+    }
+
+    let mut by_symbol: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+    for path in &files {
+        match file_symbol(path) {
+            Ok(symbol) => by_symbol.entry(symbol).or_default().push(path.clone()),
+            Err(error) => {
+                tracing::error!(path = %path.display(), error = %format!("{error:#}"), "failed to read")
+            }
+        }
+    }
+    if by_symbol.is_empty() {
+        bail!("no input files matched");
+    }
+    Ok(by_symbol)
+}
+
+#[derive(Debug, Args)]
+#[command(
+    override_usage = "mdfwob unsync [CONFIG.toml] [PATHS_OR_SYMBOLS...] [INTERVAL] [rth] [OPTIONS]"
+)]
+#[command(
+    after_help = "Removes the bar sidecars `sync` builds, for the same symbols `sync` would find.
+
+Discovery and naming are shared with `sync`, which is what makes this safe: a sidecar is only ever
+deleted when its symbol still has a tick source here. A leftover `OLD.1h.ext.bars.fwob` whose
+`OLD.fwob` is gone is never derived, so it is never removed -- delete an orphan yourself.
+
+Prints what would be removed and asks before doing it.
+
+  mdfwob unsync 1d rth          # every daily RTH sidecar here
+  mdfwob unsync MSFT 1d rth     # just this symbol's
+  mdfwob unsync 1d rth --yes    # no prompt"
+)]
+struct UnsyncArgs {
+    /// Where sidecars live. Defaults to each source file's own directory.
+    #[arg(long)]
+    output: Option<PathBuf>,
+    /// Delete without prompting.
+    #[arg(long, short = 'y')]
+    yes: bool,
+    #[arg(value_name = "ITEM", num_args = 0..)]
+    items: Vec<String>,
+}
+
+impl UnsyncArgs {
+    fn run(self) -> Result<()> {
+        let (config_path, tokens) = split_config_target(self.items)?;
+        let acfg = load_analysis_config(config_path.as_deref())?;
+        let BarsTokens {
+            paths,
+            interval: interval_token,
+            use_rth,
+            ..
+        } = classify_with_interval(&tokens)?;
+        let interval = resolve_interval(interval_token, acfg.bars.interval.as_deref())?;
+        let by_symbol = tick_sources(&paths, &acfg, "unsync")?;
+
+        // Every candidate is derived from a live source, never from what happens to be on disk.
+        let mut doomed: Vec<(String, PathBuf, u64)> = Vec::new();
+        for (symbol, sources) in &by_symbol {
+            let dir = self
+                .output
+                .clone()
+                .or_else(|| sources[0].parent().map(Path::to_path_buf))
+                .unwrap_or_else(|| PathBuf::from("."));
+            let path = sidecar_path(&dir, symbol, interval, use_rth);
+            if let Ok(meta) = std::fs::metadata(&path) {
+                doomed.push((symbol.clone(), path, meta.len()));
+            }
+        }
+
+        let session = if use_rth { "rth" } else { "ext" };
+        if doomed.is_empty() {
+            println!("no {} {session} sidecars to remove", interval.label());
+            return Ok(());
+        }
+
+        let total: u64 = doomed.iter().map(|(_, _, bytes)| bytes).sum();
+        println!("{:<12}{:>16}  file", "symbol", "bytes");
+        for (symbol, path, bytes) in &doomed {
+            println!("{symbol:<12}{:>16}  {}", comma_u64(*bytes), path.display());
+        }
+        println!("\n{} file(s), {} bytes", doomed.len(), comma_u64(total));
+
+        if !self.yes {
+            print!("Remove them? [y/N] ");
+            std::io::stdout().flush()?;
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer)?;
+            if !matches!(answer.trim(), "y" | "Y" | "yes" | "Yes") {
+                println!("cancelled");
+                return Ok(());
+            }
+        }
+
+        let mut failed = 0usize;
+        for (_, path, _) in &doomed {
+            if let Err(error) = std::fs::remove_file(path) {
+                failed += 1;
+                tracing::error!(path = %path.display(), error = %error, "failed to remove");
+            }
+        }
+        println!("removed {} file(s)", doomed.len() - failed);
+        if failed > 0 {
+            bail!("{failed} file(s) could not be removed");
+        }
+        Ok(())
+    }
+}
+
 impl SyncArgs {
     fn run(self) -> Result<()> {
         // Adjustment is deliberately not available here. A sidecar is a durable artifact, so
@@ -838,40 +981,7 @@ impl SyncArgs {
             session: use_rth.then(|| session.clone()),
         };
 
-        // A sidecar is itself a bar file, so discovery would otherwise feed last run's output back
-        // in as a source and refresh it against itself.
-        // Sidecars are derived from ticks, so only tick files are sources. Filtering on the
-        // file's actual kind rather than its name is what makes that reliable: a sidecar is a bar
-        // file, but so is any hand-made `SYMBOL.fwob` holding bars, and a name-based rule would
-        // wave the latter through and build a sidecar from a sidecar-shaped input.
-        let mut files = Vec::new();
-        for path in resolve_files(&paths, &acfg)? {
-            match input_kind(&path) {
-                Ok(InputKind::Tick) => files.push(path),
-                Ok(InputKind::Bar) => {
-                    // Explicitly naming a bar file is worth a word; sweeping a directory is not.
-                    if !paths.is_empty() {
-                        tracing::warn!(path = %path.display(), "skipping: sync builds sidecars from tick files");
-                    }
-                }
-                Err(error) => {
-                    tracing::error!(path = %path.display(), error = %format!("{error:#}"), "failed to read")
-                }
-            }
-        }
-
-        let mut by_symbol: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
-        for path in &files {
-            match file_symbol(path) {
-                Ok(symbol) => by_symbol.entry(symbol).or_default().push(path.clone()),
-                Err(error) => {
-                    tracing::error!(path = %path.display(), error = %format!("{error:#}"), "failed to read")
-                }
-            }
-        }
-        if by_symbol.is_empty() {
-            bail!("no input files matched");
-        }
+        let by_symbol = tick_sources(&paths, &acfg, "sync")?;
 
         let stdout = std::io::stdout();
         let mut out = std::io::BufWriter::new(stdout.lock());
@@ -882,8 +992,9 @@ impl SyncArgs {
         )?;
 
         let tz = session.time_zone();
+        let total_symbols = by_symbol.len();
         let mut failed = 0usize;
-        for (symbol, sources) in &by_symbol {
+        for (index, (symbol, sources)) in by_symbol.iter().enumerate() {
             if sources.len() > 1 {
                 tracing::error!(
                     symbol,
@@ -894,6 +1005,14 @@ impl SyncArgs {
                 continue;
             }
             let source = &sources[0];
+            // Progress on stderr, so a long multi-symbol sweep shows which file it is on while
+            // stdout stays a clean summary table that can be piped.
+            eprintln!(
+                "[{}/{}] {symbol} <- {}",
+                index + 1,
+                total_symbols,
+                source.display()
+            );
             let dir = self
                 .output
                 .clone()

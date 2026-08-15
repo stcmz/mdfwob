@@ -433,7 +433,7 @@ pub(crate) fn comma_i64(value: i64) -> String {
     }
 }
 
-pub(crate) fn comma_u64(value: u64) -> String {
+pub fn comma_u64(value: u64) -> String {
     comma_group(&value.to_string())
 }
 

@@ -460,3 +460,68 @@ fn cli_ls_lists_tick_and_bar_files() {
 
     let _ = fs::remove_dir_all(dir);
 }
+
+/// `unsync` derives what to delete from live tick sources, so a file that merely *looks* like a
+/// sidecar is never touched. Deleting by filename pattern would remove a leftover whose symbol no
+/// longer exists — data the user never asked to lose.
+#[test]
+fn cli_unsync_removes_only_sidecars_backed_by_a_live_source() {
+    let dir = temp_dir("unsync");
+    let path = write_tick_file(&dir);
+    let exe = env!("CARGO_BIN_EXE_mdfwob");
+    let dir_str = dir.to_str().unwrap();
+
+    let out = Command::new(exe)
+        .args(["sync", dir_str, "5m", "rth"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "sync failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Progress goes to stderr so stdout stays a pipeable summary.
+    let progress = String::from_utf8_lossy(&out.stderr);
+    assert!(progress.contains("AAPL"), "no progress line: {progress}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("symbol"),
+        "summary should be on stdout"
+    );
+
+    let sidecar = dir.join("AAPL.5m.rth.bars.fwob");
+    assert!(sidecar.exists(), "sync should have built it");
+
+    // A leftover from a symbol whose tick file is gone.
+    let orphan = dir.join("GONE.5m.rth.bars.fwob");
+    fs::copy(&sidecar, &orphan).unwrap();
+
+    let out = Command::new(exe)
+        .args(["unsync", dir_str, "5m", "rth", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "unsync failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("AAPL"), "should list what it removes");
+    assert!(
+        !stdout.contains("GONE"),
+        "an orphan must not even be listed: {stdout}"
+    );
+
+    assert!(!sidecar.exists(), "the backed sidecar should be gone");
+    assert!(orphan.exists(), "the orphan must survive");
+    assert!(path.exists(), "the tick source is never touched");
+
+    // Nothing left to do is a clean no-op, not an error.
+    let out = Command::new(exe)
+        .args(["unsync", dir_str, "5m", "rth", "--yes"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("no 5m rth sidecars"));
+
+    let _ = fs::remove_dir_all(dir);
+}

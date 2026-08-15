@@ -302,6 +302,22 @@ mdfwob sync config.toml 1d rth     # every symbol in [analysis].symbols
 mdfwob bars MSFT.1d.rth.bars.fwob  # reads the sidecar, byte-identical output
 ```
 
+Progress goes to stderr (one line per file) while the summary table goes to
+stdout, so a long sweep stays readable and still pipes cleanly.
+
+Remove sidecars with `unsync`, which shares `sync`'s discovery and naming:
+
+```text
+mdfwob unsync 1d rth          # every daily RTH sidecar here
+mdfwob unsync MSFT 1d rth     # just this symbol's
+mdfwob unsync 1d rth --yes    # no prompt
+```
+
+It lists what it will delete and asks first. Sharing discovery is what makes it
+safe: a sidecar is only removed when its symbol still has a tick source, so a
+leftover `OLD.1h.ext.bars.fwob` whose `OLD.fwob` is gone is never derived and
+never deleted -- remove an orphan yourself.
+
 With no path given it syncs the whole directory. **Only tick files are sources**;
 bar files are skipped, with a word only when one was named explicitly. The test
 is the file's actual kind, not its name — a name rule would exclude sidecars but
