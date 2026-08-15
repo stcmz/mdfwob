@@ -1549,7 +1549,7 @@ dependencies = [
 
 [[package]]
 name = "mdfwob"
-version = "1.13.1"
+version = "1.13.2"
 dependencies = [
  "anyhow",
  "base64",
@@ -1578,7 +1578,7 @@ dependencies = [
 
 [[package]]
 name = "mdfwob-core"
-version = "1.13.1"
+version = "1.13.2"
 dependencies = [
  "anyhow",
  "font8x8",
