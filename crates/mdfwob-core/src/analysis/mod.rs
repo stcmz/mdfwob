@@ -8,6 +8,7 @@
 pub mod adjust;
 pub mod calc;
 pub mod config;
+pub mod feed;
 pub mod inspect;
 pub mod interval;
 pub mod ls;
@@ -32,6 +33,7 @@ pub use calc::{
     parse_streaming_spec, summarize,
 };
 pub use config::{AnalysisConfig, ReturnMethod};
+pub use feed::{BarStream, SymbolBars, resolve_sidecar, stream_symbol_bars, symbol_bars};
 pub use interval::Interval;
 pub use ls::{LsFormat, LsRow, ls_file, write_ls};
 pub use model::{Bar, Tick};

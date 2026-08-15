@@ -14,6 +14,7 @@ use crate::{
         adjust::{ActionTable, Adjuster, AdjustmentMode, load_actions},
         calc::{StreamingIndicator, parse_spec, parse_streaming_spec},
         config::{AnalysisConfig, DEFAULT_EXTENDED_HOURS, DEFAULT_RTH_HOURS},
+        feed::{BarStream, stream_symbol_bars},
         inspect::{field_semantic_label, field_type_label, inspect_file},
         interval::{Granularity, Interval},
         ls::{LsFormat, ls_file, write_ls},
@@ -23,11 +24,8 @@ use crate::{
             write_stat,
         },
         plot::{Canvas, PlotOptions, layout_series, render},
-        read::{
-            InputKind, TickQuery, detect_kind, discover_inputs, file_symbol, input_kind,
-            open_tick_reader, stream_bars_file, stream_ticks,
-        },
-        resample::{BarClock, BarResampler, ForwardFiller, Resampler},
+        read::{InputKind, TickQuery, detect_kind, discover_inputs, file_symbol, input_kind},
+        resample::BarClock,
         schema::{bar_schema, calc_schema, encode_bar, encode_calc_row, with_symbol_column},
         session::Session,
         stat::{stat_file, stat_file_adjusted},
@@ -1264,14 +1262,10 @@ fn write_chart_file(canvas: &Canvas, path: &Path) -> Result<()> {
     }
 }
 
-/// Streams a symbol's bars to `sink` as each bucket closes, feeding all of `paths` through one
-/// resampler (so multiple files of the same symbol form a single ascending stream) and applying
-/// forward-fill when requested.
+/// Streams a symbol's bars through [`stream_symbol_bars`], scaling each one on the way out.
 ///
-/// Accepts both tick files (resampled from ticks) and pre-aggregated bar files (re-resampled from
-/// bars to the requested `interval`, e.g. 1s→1m), so every downstream command honors the interval
-/// regardless of input format. A symbol's files must all be the same kind. Ticks are read in bulk
-/// chunks and never fully materialized; bar files honor the `query` window by bar time.
+/// The assembly itself lives in `mdfwob-core` so every consumer shares it; only the adjustment is
+/// this crate's, since a consumer that materializes the series adjusts afterwards instead.
 pub(crate) fn stream_bars(
     paths: &[PathBuf],
     interval: Interval,
@@ -1279,53 +1273,15 @@ pub(crate) fn stream_bars(
     query: &TickQuery,
     fill: bool,
     adjuster: &mut Adjuster,
-    sink: impl FnMut(Bar) -> Result<()>,
+    mut sink: impl FnMut(Bar) -> Result<()>,
 ) -> Result<()> {
-    // Splits scale a bar from actions dated after it, which the action table alone determines, so
-    // adjustment rides along in the same forward pass at constant memory.
-    let mut sink = sink;
-    let sink = |mut bar: Bar| {
-        adjuster.apply(&mut bar);
-        sink(bar)
-    };
-    let mut kind: Option<InputKind> = None;
-    for path in paths {
-        let this = input_kind(path)?;
-        match kind {
-            Some(existing) if existing != this => {
-                bail!(
-                    "cannot mix tick and bar files for one symbol ({})",
-                    path.display()
-                )
-            }
-            _ => kind = Some(this),
-        }
-    }
-
-    let mut filler = ForwardFiller::new(interval, clock.clone(), fill, sink);
-    match kind {
-        Some(InputKind::Bar) => {
-            let mut resampler = BarResampler::new(interval, clock.clone());
-            for path in paths {
-                // Seek to the window instead of reading the whole bar file, so a narrow time range
-                // is proportionally fast.
-                stream_bars_file(path, query, |bar| {
-                    resampler.push(&bar, &mut |bar| filler.push(bar))
-                })?;
-            }
-            resampler.finish(&mut |bar| filler.push(bar))
-        }
-        _ => {
-            let mut resampler = Resampler::new(interval, clock.clone());
-            for path in paths {
-                let (mut reader, _) = open_tick_reader(path)?;
-                stream_ticks(&mut reader, query, |tick| {
-                    resampler.push(&tick, &mut |bar| filler.push(bar))
-                })?;
-            }
-            resampler.finish(&mut |bar| filler.push(bar))
-        }
-    }
+    stream_symbol_bars(
+        BarStream::new(paths, interval, clock, query).fill(fill),
+        |mut bar| {
+            adjuster.apply(&mut bar);
+            sink(bar)
+        },
+    )
 }
 
 /// Warns when a sub-day interval does not evenly divide the active trading session (RTH or
