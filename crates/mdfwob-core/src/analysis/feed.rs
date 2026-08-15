@@ -237,9 +237,20 @@ pub fn symbol_bars(
             resolve_sidecar(stream.paths, symbol, interval, use_rth, stream.clock, tz)?
     {
         let paths = [side];
+        // The caller's session filter was written for a *tick* source, where it selects in-session
+        // prints. A sidecar holds bars already bucketed under that session, and a bar carries its
+        // bucket-start timestamp -- local midnight for a daily bar, outside every intraday window
+        // -- so re-applying the filter here silently discards the whole file. The `rth` in the
+        // sidecar's name IS that filter, already applied.
+        let query = TickQuery {
+            session: None,
+            start: stream.query.start,
+            end: stream.query.end,
+        };
         return stream_symbol_bars(
             BarStream {
                 paths: &paths,
+                query: &query,
                 // The sidecar is already at this interval; re-resampling it to the same width is a
                 // no-op scan, but re-resampling to a *different* one would be wrong.
                 ..stream
@@ -253,6 +264,7 @@ pub fn symbol_bars(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::Session;
     use crate::analysis::sidecar::{RefreshSpec, refresh_sidecar};
     use crate::tick::{Tick as RawTick, tick_schema};
     use fwob::Writer;
@@ -421,6 +433,124 @@ mod tests {
             assert_eq!(a.volume, b.volume, "at {}", a.time);
             assert_eq!(a.trades, b.trades, "at {}", a.time);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A caller reading a tick file installs the session as a *row* filter, because that is how
+    /// out-of-hours prints get dropped. Once a sidecar is substituted the input is bars, and a
+    /// daily bar's timestamp is local midnight -- outside every intraday window -- so carrying that
+    /// filter over would drop every row and report an empty archive. Regression for exactly that:
+    /// the sidecar and the ticks must still agree.
+    #[test]
+    fn a_session_row_filter_does_not_follow_the_query_onto_a_daily_sidecar() {
+        let dir = temp_dir("session-sidecar");
+        let session = Session::new("America/New_York", "09:30-16:00").unwrap();
+        let clock = BarClock::Session(session.clone());
+        let daily = Interval::parse("1d").unwrap().unwrap();
+
+        // 09:30 ET on 2024-03-04, then a tick every 30 minutes for three trading days.
+        let open = |y: i16, m: i8, d: i8| {
+            jiff::civil::date(y, m, d)
+                .at(9, 30, 0, 0)
+                .in_tz("America/New_York")
+                .unwrap()
+                .timestamp()
+                .as_second() as u32
+        };
+        let mut times = Vec::new();
+        for (y, m, d) in [(2024, 3, 4), (2024, 3, 5), (2024, 3, 6)] {
+            let start = open(y, m, d);
+            times.extend((0..12).map(|i| start + i * 1_800));
+        }
+        let path = dir.join("T.fwob");
+        let mut writer = Writer::create_v2(&path, tick_schema(), WriterOptions::new("T")).unwrap();
+        let mut buf = Vec::new();
+        for (i, &time) in times.iter().enumerate() {
+            buf.clear();
+            RawTick::new(time, 100.0 + i as f64, 10)
+                .unwrap()
+                .encode(&mut buf);
+            writer.append_frame(&buf).unwrap();
+        }
+        writer.finish().unwrap();
+
+        // The window a research run would ask for, with the session installed as a row filter.
+        let query = TickQuery {
+            start: Some(open(2024, 3, 4) - 34_200),
+            end: Some(open(2024, 3, 7)),
+            session: Some(session.clone()),
+        };
+        let spec = |prefer| SymbolBars {
+            stream: BarStream::new(std::slice::from_ref(&path), daily, &clock, &query),
+            use_rth: true,
+            prefer_sidecar: prefer,
+        };
+        let collect = |prefer| {
+            let mut out = Vec::new();
+            symbol_bars(spec(prefer), "T", &session.time_zone(), |bar| {
+                out.push(bar);
+                Ok(())
+            })
+            .unwrap();
+            out
+        };
+
+        let from_ticks = collect(false);
+        assert_eq!(from_ticks.len(), 3, "three trading days");
+
+        refresh_sidecar(
+            &path,
+            &dir,
+            "T",
+            &RefreshSpec {
+                interval: daily,
+                use_rth: true,
+                clock: &clock,
+                query: &TickQuery {
+                    session: Some(session.clone()),
+                    ..Default::default()
+                },
+                fill: false,
+            },
+        )
+        .unwrap();
+
+        let via_sidecar = collect(true);
+        assert_eq!(
+            via_sidecar.len(),
+            from_ticks.len(),
+            "the sidecar must serve the same days, not an empty file"
+        );
+        for (a, b) in from_ticks.iter().zip(&via_sidecar) {
+            assert_eq!(a.time, b.time);
+            assert_eq!(a.open.to_bits(), b.open.to_bits(), "at {}", a.time);
+            assert_eq!(a.close.to_bits(), b.close.to_bits(), "at {}", a.time);
+            assert_eq!(a.volume, b.volume, "at {}", a.time);
+        }
+
+        // The window still has to be honoured through the sidecar path.
+        let narrowed = TickQuery {
+            start: Some(open(2024, 3, 5) - 34_200),
+            end: Some(open(2024, 3, 6)),
+            session: Some(session.clone()),
+        };
+        let mut windowed = Vec::new();
+        symbol_bars(
+            SymbolBars {
+                stream: BarStream::new(std::slice::from_ref(&path), daily, &clock, &narrowed),
+                use_rth: true,
+                prefer_sidecar: true,
+            },
+            "T",
+            &session.time_zone(),
+            |bar| {
+                windowed.push(bar);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(windowed.len(), 2, "start/end must still apply");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
