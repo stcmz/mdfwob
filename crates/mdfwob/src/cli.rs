@@ -14,7 +14,7 @@ use crate::{
         adjust::{ActionTable, Adjuster, AdjustmentMode, load_actions},
         calc::{StreamingIndicator, parse_spec, parse_streaming_spec},
         config::{AnalysisConfig, DEFAULT_EXTENDED_HOURS, DEFAULT_RTH_HOURS},
-        feed::{BarStream, stream_symbol_bars},
+        feed::{BarStream, session_row_filter, stream_symbol_bars},
         inspect::{field_semantic_label, field_type_label, inspect_file},
         interval::{Granularity, Interval},
         ls::{LsFormat, ls_file, write_ls},
@@ -336,6 +336,14 @@ pub(crate) fn kind_label(kind: InputKind) -> &'static str {
 
 /// Frames sampled per end by `inspect` for granularity/hours detection and the head/tail preview.
 pub(crate) const INSPECT_SAMPLE: u64 = 1_024;
+
+/// Bar width for the commands that *display* data, where a day is the readable unit.
+const DEFAULT_INTERVAL: &str = "1d";
+/// Bar width for `sync` / `unsync`, which *materialize* data rather than display it.
+///
+/// A minute is the finest width worth storing for research and the coarsest that still answers a
+/// question about intraday behaviour, so it is the sensible thing to keep on disk by default.
+const DEFAULT_SIDECAR_INTERVAL: &str = "1m";
 
 /// Corporate-action options shared by the price-producing commands.
 ///
@@ -672,11 +680,6 @@ impl StatArgs {
         let files = resolve_files(&paths, &acfg)?;
         let (adjust_mode, actions) = self.actions.resolve()?;
         let tz = session.time_zone();
-        let query = TickQuery {
-            start,
-            end,
-            session: use_rth.then(|| session.clone()),
-        };
 
         let mut rows = Vec::new();
         let mut failures = 0u32;
@@ -686,6 +689,16 @@ impl StatArgs {
                 .and_then(|symbol| ActionArgs::adjuster(adjust_mode, &actions, &symbol, &tz))
             {
                 Ok(adj) => adj,
+                Err(error) => {
+                    failures += 1;
+                    tracing::error!(path = %path.display(), error = %format!("{error:#}"), "failed to read");
+                    continue;
+                }
+            };
+            // Per file: a `stat` over a directory routinely mixes tick files and sidecars.
+            let query = match scan_query(std::slice::from_ref(path), start, end, use_rth, &session)
+            {
+                Ok(query) => query,
                 Err(error) => {
                     failures += 1;
                     tracing::error!(path = %path.display(), error = %format!("{error:#}"), "failed to read");
@@ -762,6 +775,10 @@ With no path given, every tick file in the current directory is synced; paths, d
 symbols all work, exactly as for `ls` and `bars`. Only TICK files are sources -- bar files, sidecars
 included, are skipped, and the check is on the file's actual kind rather than its name.
 
+The interval defaults to 1m, not the 1d the display commands use: this writes a file to keep, and a
+minute is the finest width worth storing. A sidecar answers the interval in its NAME, so sync the
+widths you actually read -- a 1m file does not serve a 1d request.
+
 Only the missing tail is appended, and the stored final bucket is re-derived rather than trusted --
 a sidecar written while a session was still open holds a partial bar, so a half day that later
 completes is rebuilt correctly. Note that ONLY the final bucket is revisited: if an earlier day is
@@ -770,7 +787,7 @@ backfilled after the fact, use --force to rebuild that symbol from scratch.
 Sidecars store RAW bars: corporate-action adjustment is applied when they are read, so a newly
 recorded split never silently invalidates a materialized file.
 
-  mdfwob sync                        # every tick file here, at the configured interval
+  mdfwob sync                        # every tick file here, 1m extended (the default)
   mdfwob sync 1d rth                 # every tick file here, daily, regular hours
   mdfwob sync MSFT.fwob AAPL 1d rth  # a path and a bare symbol
   mdfwob sync config.toml 1d rth     # every symbol in [analysis].symbols
@@ -863,7 +880,8 @@ deleted when its symbol still has a tick source here. A leftover `OLD.1h.ext.bar
 
 Prints what would be removed and asks before doing it.
 
-  mdfwob unsync 1d rth          # every daily RTH sidecar here
+  mdfwob unsync                 # every 1m extended sidecar here (the default)
+  mdfwob unsync 1d rth          # every daily RTH sidecar instead
   mdfwob unsync MSFT 1d rth     # just this symbol's
   mdfwob unsync 1d rth --yes    # no prompt"
 )]
@@ -888,7 +906,11 @@ impl UnsyncArgs {
             use_rth,
             ..
         } = classify_with_interval(&tokens)?;
-        let interval = resolve_interval(interval_token, acfg.bars.interval.as_deref())?;
+        let interval = resolve_interval_or(
+            interval_token,
+            acfg.bars.interval.as_deref(),
+            DEFAULT_SIDECAR_INTERVAL,
+        )?;
         let by_symbol = tick_sources(&paths, &acfg, "unsync")?;
 
         // Every candidate is derived from a live source, never from what happens to be on disk.
@@ -967,7 +989,11 @@ impl SyncArgs {
             ..
         } = classify_with_interval(&tokens)?;
         let use_rth = self.use_rth || use_rth;
-        let interval = resolve_interval(interval_token, acfg.bars.interval.as_deref())?;
+        let interval = resolve_interval_or(
+            interval_token,
+            acfg.bars.interval.as_deref(),
+            DEFAULT_SIDECAR_INTERVAL,
+        )?;
         let fill = fill || acfg.bars.fill;
         let session = resolve_session(&acfg, use_rth, self.session.as_deref(), self.tz.as_deref())?;
         warn_uneven_interval(interval, &session, use_rth);
@@ -975,11 +1001,6 @@ impl SyncArgs {
         let start = self.start.clone().or(range_start);
         let end = self.end.clone().or(range_end);
         let (start, end) = parse_bounds(start.as_deref(), end.as_deref(), &session.time_zone())?;
-        let query = TickQuery {
-            start,
-            end,
-            session: use_rth.then(|| session.clone()),
-        };
 
         let by_symbol = tick_sources(&paths, &acfg, "sync")?;
 
@@ -1029,6 +1050,10 @@ impl SyncArgs {
                 }
             }
 
+            // `tick_sources` already guarantees these are ticks, so the session always filters
+            // rows here — but deriving it keeps the one rule in one place rather than relying on
+            // that guarantee holding forever.
+            let query = scan_query(std::slice::from_ref(source), start, end, use_rth, &session)?;
             match crate::analysis::sidecar::refresh_sidecar(
                 source,
                 &dir,
@@ -1094,11 +1119,6 @@ impl BarsArgs {
         let end = self.end.clone().or(range_end);
         let (start, end) = parse_bounds(start.as_deref(), end.as_deref(), &session.time_zone())?;
         let files = resolve_files(&paths, &acfg)?;
-        let query = TickQuery {
-            start,
-            end,
-            session: use_rth.then(|| session.clone()),
-        };
 
         // Group input files (tick or bar) by the symbol they report, preserving discovery order so
         // a symbol's files feed one resampler as a single ascending stream. Only the header of each
@@ -1141,6 +1161,7 @@ impl BarsArgs {
                 for (symbol, paths) in &by_symbol {
                     let path = dir.join(format!("{symbol}.fwob"));
                     let mut writer = FrameWriter::create(&path, bar_schema(), symbol)?;
+                    let query = scan_query(paths, start, end, use_rth, &session)?;
                     let mut adj = ActionArgs::adjuster(adjust_mode, &actions, symbol, &tz)?;
                     stream_bars(paths, interval, &clock, &query, fill, &mut adj, |bar| {
                         writer.push(|buf| encode_bar(&bar, buf))
@@ -1166,6 +1187,7 @@ impl BarsArgs {
                 let autoflush = std::io::stdout().is_terminal();
                 let mut stream = FrameStream::new(&schema, strings, frame, autoflush, &mut out)?;
                 for (index, (symbol, paths)) in by_symbol.iter().enumerate() {
+                    let query = scan_query(paths, start, end, use_rth, &session)?;
                     let mut adj = ActionArgs::adjuster(adjust_mode, &actions, symbol, &tz)?;
                     stream_bars(paths, interval, &clock, &query, fill, &mut adj, |bar| {
                         stream.emit(index, |buf| encode_bar(&bar, buf))
@@ -1274,7 +1296,6 @@ impl PlotArgs {
         let end = self.end.clone().or(range_end);
         let (start, end) = parse_bounds(start.as_deref(), end.as_deref(), &session.time_zone())?;
         let files = resolve_files(&paths, &acfg)?;
-        let filter = use_rth.then(|| session.clone());
         let (adjust_mode, actions) = self.actions.resolve()?;
         let tz = session.time_zone();
 
@@ -1282,17 +1303,13 @@ impl PlotArgs {
         // the requested interval, so a bar file honors the interval (e.g. plotting a 1s bar file at
         // 1m aggregates it into 1m candles instead of drawing degenerate one-second dots). Group the
         // resulting bars by symbol.
-        let query = TickQuery {
-            start,
-            end,
-            session: filter.clone(),
-        };
         let mut groups: BTreeMap<String, Vec<Bar>> = BTreeMap::new();
         for path in &files {
             let result = (|| -> Result<(String, Vec<Bar>)> {
                 let symbol = file_symbol(path)?;
                 let mut bars = Vec::new();
                 let mut adj = ActionArgs::adjuster(adjust_mode, &actions, &symbol, &tz)?;
+                let query = scan_query(std::slice::from_ref(path), start, end, use_rth, &session)?;
                 stream_bars(
                     std::slice::from_ref(path),
                     interval,
@@ -1379,6 +1396,25 @@ fn write_chart_file(canvas: &Canvas, path: &Path) -> Result<()> {
             .with_context(|| format!("failed to write {}", path.display())),
         _ => canvas.write_png(path),
     }
+}
+
+/// Builds the scan query for one symbol's sources.
+///
+/// Built **per symbol** rather than once per invocation, because one command can span both kinds:
+/// the session filters rows for ticks and must not for bars, whose timestamps are bucket starts.
+/// Sharing a single query across a mixed batch silently empties the bar half of it.
+fn scan_query(
+    paths: &[PathBuf],
+    start: Option<u32>,
+    end: Option<u32>,
+    use_rth: bool,
+    session: &Session,
+) -> Result<TickQuery> {
+    Ok(TickQuery {
+        start,
+        end,
+        session: session_row_filter(paths, use_rth, session)?,
+    })
 }
 
 /// Streams a symbol's bars through [`stream_symbol_bars`], scaling each one on the way out.
@@ -1509,16 +1545,10 @@ impl CalcArgs {
         let session = resolve_session(&acfg, use_rth, self.session.as_deref(), self.tz.as_deref())?;
         warn_uneven_interval(interval, &session, use_rth);
         let clock = BarClock::Session(session.clone());
-        let filter = use_rth.then(|| session.clone());
         let start = self.start.clone().or(range_start);
         let end = self.end.clone().or(range_end);
         let (start, end) = parse_bounds(start.as_deref(), end.as_deref(), &session.time_zone())?;
         let files = resolve_files(&paths, &acfg)?;
-        let query = TickQuery {
-            start,
-            end,
-            session: filter.clone(),
-        };
 
         // Group input files by the symbol they report (header only), preserving discovery order so a
         // symbol's files feed one resampler as a single ascending stream (mirrors `bars`). Each
@@ -1557,6 +1587,7 @@ impl CalcArgs {
                     let mut writer =
                         FrameWriter::create(&path, calc_schema(&names, &decimals)?, symbol)?;
                     let mut adj = Adjuster::default();
+                    let query = scan_query(paths, start, end, use_rth, &session)?;
                     stream_bars(paths, interval, &clock, &query, fill, &mut adj, |bar| {
                         let values: Vec<Option<f64>> =
                             indicators.iter_mut().map(|i| i.update(&bar)).collect();
@@ -1605,6 +1636,7 @@ impl CalcArgs {
                         let mut indicators = build_streaming_indicators(&spec_tokens)?;
                         let mut collector =
                             show_summary.then(|| SummaryCollector::new(&summary_columns));
+                        let query = scan_query(paths, start, end, use_rth, &session)?;
                         let mut adj = ActionArgs::adjuster(adjust_mode, &actions, symbol, &tz)?;
                         stream_bars(paths, interval, &clock, &query, fill, &mut adj, |bar| {
                             let values: Vec<Option<f64>> =
@@ -1813,6 +1845,15 @@ fn classify_calc(tokens: &[String]) -> Result<CalcTokens> {
 }
 
 fn resolve_interval(token: Option<Interval>, config: Option<&str>) -> Result<Interval> {
+    resolve_interval_or(token, config, DEFAULT_INTERVAL)
+}
+
+/// Interval a command reads at, falling back to `default` when neither a token nor config says.
+fn resolve_interval_or(
+    token: Option<Interval>,
+    config: Option<&str>,
+    default: &str,
+) -> Result<Interval> {
     if let Some(interval) = token {
         return Ok(interval);
     }
@@ -1821,10 +1862,9 @@ fn resolve_interval(token: Option<Interval>, config: Option<&str>) -> Result<Int
             .with_context(|| format!("invalid interval in config: {text:?}"))?
             .with_context(|| format!("invalid interval in config: {text:?}"));
     }
-    // Default period when neither a token nor a config value is given.
-    Ok(Interval::parse("1d")
-        .expect("\"1d\" is interval-shaped")
-        .expect("\"1d\" is a valid interval"))
+    Interval::parse(default)
+        .with_context(|| format!("{default:?} is interval-shaped"))?
+        .with_context(|| format!("{default:?} is a valid interval"))
 }
 
 pub(crate) fn resolve_session(
@@ -2048,6 +2088,21 @@ mod tests {
     #[test]
     fn interval_defaults_to_one_day() {
         assert_eq!(resolve_interval(None, None).unwrap().label(), "1d");
+        // `sync`/`unsync` materialize rather than display, so they keep the finer default.
+        assert_eq!(
+            resolve_interval_or(None, None, DEFAULT_SIDECAR_INTERVAL)
+                .unwrap()
+                .label(),
+            "1m"
+        );
+        // An explicit token still wins over either default.
+        let token = Interval::parse("1h").unwrap().unwrap();
+        assert_eq!(
+            resolve_interval_or(Some(token), None, DEFAULT_SIDECAR_INTERVAL)
+                .unwrap()
+                .label(),
+            "1h"
+        );
         // A config value still wins over the default.
         assert_eq!(resolve_interval(None, Some("5m")).unwrap().label(), "5m");
     }

@@ -26,6 +26,7 @@ use serde::Deserialize;
 
 use crate::analysis::calc::parse_streaming_spec;
 use crate::analysis::config::AnalysisConfig;
+use crate::analysis::feed::session_row_filter;
 use crate::analysis::inspect::inspect_file;
 use crate::analysis::interval::Interval;
 use crate::analysis::ls::ls_file;
@@ -231,11 +232,10 @@ impl McpServer {
             by_symbol: self.group(&sel.symbols)?,
             interval,
             clock: BarClock::Session(session.clone()),
-            query: TickQuery {
-                start,
-                end,
-                session: use_rth.then(|| session.clone()),
-            },
+            session,
+            use_rth,
+            start,
+            end,
             tz,
         })
     }
@@ -246,8 +246,25 @@ struct Pipeline {
     by_symbol: BTreeMap<String, Vec<PathBuf>>,
     interval: Interval,
     clock: BarClock,
-    query: TickQuery,
+    session: Session,
+    use_rth: bool,
+    start: Option<u32>,
+    end: Option<u32>,
     tz: TimeZone,
+}
+
+impl Pipeline {
+    /// The scan query for one symbol's sources.
+    ///
+    /// Derived per symbol rather than once per request: the session filters *rows* for ticks and
+    /// must not for bars, whose timestamps are bucket starts, and one request can name both.
+    fn query(&self, paths: &[PathBuf]) -> Result<TickQuery> {
+        Ok(TickQuery {
+            start: self.start,
+            end: self.end,
+            session: session_row_filter(paths, self.use_rth, &self.session)?,
+        })
+    }
 }
 
 /// Clamps a caller-supplied `limit` into the allowed range.
@@ -477,17 +494,19 @@ impl McpServer {
         let session = self.session_for(use_rth, sel.session.as_deref(), sel.tz.as_deref())?;
         let tz = session.time_zone();
         let (start, end) = parse_bounds(sel.start.as_deref(), sel.end.as_deref(), &tz)?;
-        let query = TickQuery {
-            start,
-            end,
-            session: use_rth.then(|| session.clone()),
-        };
         let files = self.root.resolve_all(&sel.symbols)?;
         if files.is_empty() {
             bail!("no .fwob files found under the server root");
         }
         let mut rows = Vec::new();
         for path in &files {
+            // Per file: an archive routinely holds both tick files and materialized bar sidecars,
+            // and a session row filter is right for the first and empties the second.
+            let query = TickQuery {
+                start,
+                end,
+                session: session_row_filter(std::slice::from_ref(path), use_rth, &session)?,
+            };
             let row = stat_file(path, &query)
                 .with_context(|| format!("failed to read {}", self.root.display(path)))?;
             rows.push(StatEntry::new(row, &tz));
@@ -508,11 +527,12 @@ impl McpServer {
             let mut total = 0usize;
             // Read-only inspection surface: prices are served exactly as stored.
             let mut adj = mdfwob_core::analysis::Adjuster::default();
+            let query = pipeline.query(paths)?;
             stream_bars(
                 paths,
                 pipeline.interval,
                 &pipeline.clock,
-                &pipeline.query,
+                &query,
                 fill,
                 &mut adj,
                 |bar| {
@@ -558,11 +578,12 @@ impl McpServer {
             let mut total = 0usize;
             // Read-only inspection surface: prices are served exactly as stored.
             let mut adj = mdfwob_core::analysis::Adjuster::default();
+            let query = pipeline.query(paths)?;
             stream_bars(
                 paths,
                 pipeline.interval,
                 &pipeline.clock,
-                &pipeline.query,
+                &query,
                 fill,
                 &mut adj,
                 |bar| {
@@ -613,11 +634,12 @@ impl McpServer {
         let mut bars: Vec<Bar> = Vec::new();
         // Read-only inspection surface: prices are served exactly as stored.
         let mut adj = mdfwob_core::analysis::Adjuster::default();
+        let query = pipeline.query(paths)?;
         stream_bars(
             paths,
             pipeline.interval,
             &pipeline.clock,
-            &pipeline.query,
+            &query,
             params.fill.unwrap_or(false),
             &mut adj,
             |bar| {

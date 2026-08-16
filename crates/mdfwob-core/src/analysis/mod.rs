@@ -34,8 +34,8 @@ pub use calc::{
 };
 pub use config::{AnalysisConfig, ReturnMethod};
 pub use feed::{
-    BarRequest, BarStream, SymbolBars, request_bars, resolve_sidecar, stream_symbol_bars,
-    symbol_bars,
+    BarRequest, BarStream, SymbolBars, request_bars, resolve_sidecar, session_row_filter,
+    stream_symbol_bars, symbol_bars,
 };
 pub use interval::Interval;
 pub use ls::{LsFormat, LsRow, ls_file, write_ls};

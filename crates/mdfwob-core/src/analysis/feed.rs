@@ -87,6 +87,30 @@ fn sources_kind(paths: &[PathBuf]) -> Result<Option<InputKind>> {
     Ok(kind)
 }
 
+/// The session as a tick **row filter**, which is `Some` only when the sources are ticks.
+///
+/// A tick carries an instant, so an out-of-hours print has to be dropped. A bar carries its
+/// *bucket-start* timestamp — local midnight for a daily bar, outside every intraday window — so
+/// applying the same filter to it discards the entire file and reports an empty archive. Worse, it
+/// discards it *selectively*: a 1-minute bar file survives, because those timestamps do fall inside
+/// the session, so the mistake looks correct until someone reads a daily file.
+///
+/// Any caller assembling a [`TickQuery`] by hand should get the `session` field from here rather
+/// than from `use_rth` alone. [`request_bars`] does this internally.
+pub fn session_row_filter(
+    paths: &[PathBuf],
+    use_rth: bool,
+    session: &Session,
+) -> Result<Option<Session>> {
+    if !use_rth {
+        return Ok(None);
+    }
+    Ok(match sources_kind(paths)? {
+        Some(InputKind::Tick) => Some(session.clone()),
+        _ => None,
+    })
+}
+
 /// Streams a symbol's bars to `sink` as each bucket closes.
 ///
 /// Every path feeds **one** resampler, so several files of a symbol form a single ascending stream
@@ -350,10 +374,7 @@ pub fn request_bars(
         start: req.start,
         end: req.end,
         // The whole reason this function exists: the row filter belongs to ticks alone.
-        session: match sources_kind(req.paths)? {
-            Some(InputKind::Tick) if req.use_rth => Some(req.session.clone()),
-            _ => None,
-        },
+        session: session_row_filter(req.paths, req.use_rth, req.session)?,
     };
     symbol_bars(
         SymbolBars {

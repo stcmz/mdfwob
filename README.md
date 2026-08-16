@@ -294,13 +294,18 @@ source as `<SYMBOL>.<INTERVAL>.<rth|ext>.bars.fwob`, which later commands read
 directly:
 
 ```text
+mdfwob sync                        # every tick file here, 1m extended (the default)
 mdfwob sync MSFT.fwob 1d rth       # 38 s: builds 2600 bars from 837M ticks
 mdfwob sync MSFT.fwob 1d rth       # 0.1 s: appends only what is missing
-mdfwob sync 1d rth                 # every tick file in the current directory
 mdfwob sync MSFT AAPL 1d rth       # bare symbols, as for `ls` and `bars`
 mdfwob sync config.toml 1d rth     # every symbol in [analysis].symbols
 mdfwob bars MSFT.1d.rth.bars.fwob  # reads the sidecar, byte-identical output
 ```
+
+`sync` and `unsync` default to **1m**, not the 1d the display commands use: they
+write a file to keep, and a minute is the finest width worth storing. Note that a
+sidecar answers the interval in its **name** — a 1m file does not serve a 1d
+request — so sync the widths you actually read.
 
 Progress goes to stderr (one line per file) while the summary table goes to
 stdout, so a long sweep stays readable and still pipes cleanly.
@@ -308,7 +313,8 @@ stdout, so a long sweep stays readable and still pipes cleanly.
 Remove sidecars with `unsync`, which shares `sync`'s discovery and naming:
 
 ```text
-mdfwob unsync 1d rth          # every daily RTH sidecar here
+mdfwob unsync                 # every 1m extended sidecar here (the default)
+mdfwob unsync 1d rth          # every daily RTH sidecar instead
 mdfwob unsync MSFT 1d rth     # just this symbol's
 mdfwob unsync 1d rth --yes    # no prompt
 ```

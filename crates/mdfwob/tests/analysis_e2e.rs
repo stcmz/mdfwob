@@ -525,3 +525,80 @@ fn cli_unsync_removes_only_sidecars_backed_by_a_live_source() {
 
     let _ = fs::remove_dir_all(dir);
 }
+
+/// The `rth` token must survive a round trip through `sync`.
+///
+/// A daily sidecar carries its bucket-start timestamp — local midnight — which sits outside every
+/// intraday session window. Applying the session as a *row* filter to it therefore discards the
+/// whole file, and the commands returned an empty table rather than an error. The trap is that it
+/// fails selectively: a 1m sidecar survives, because those timestamps do fall inside the session.
+///
+/// So: build both sidecars from the same ticks, then read each back with `rth` and require the
+/// rows to appear — while the tick source still filters, which is what the filter is for.
+#[test]
+fn cli_reads_a_synced_sidecar_back_with_the_rth_token() {
+    let dir = temp_dir("cli-rth-bars");
+    write_tick_file(&dir); // AAPL.fwob, 14:30..14:49Z = 09:30..09:49 ET, all in RTH
+    let exe = env!("CARGO_BIN_EXE_mdfwob");
+    let dir_str = dir.to_str().unwrap();
+
+    for interval in ["1d", "1m"] {
+        let out = Command::new(exe)
+            .args(["sync", dir_str, interval, "rth"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "sync {interval} failed");
+
+        let sidecar = dir.join(format!("AAPL.{interval}.rth.bars.fwob"));
+        assert!(sidecar.exists(), "sync did not write {}", sidecar.display());
+        let sidecar_str = sidecar.to_str().unwrap();
+
+        // Reading that file back, with the very token it was built under, must return its rows.
+        for args in [
+            vec!["bars", sidecar_str, interval, "rth"],
+            vec!["calc", sidecar_str, interval, "rth", "sma:2"],
+        ] {
+            let out = Command::new(exe).args(&args).output().unwrap();
+            assert!(out.status.success(), "{args:?} failed");
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                text.lines().count() > 1,
+                "{args:?} returned only a header:\n{text}"
+            );
+        }
+
+        let out = Command::new(exe)
+            .args(["stat", sidecar_str, "rth"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !text.contains(" 0 "),
+            "stat {interval} rth reported nothing:\n{text}"
+        );
+    }
+
+    // The filter still has to do its job on the source it was written for. These ticks are all
+    // inside regular hours, so an out-of-hours window must come back empty from the tick file.
+    let ticks = dir.join("AAPL.fwob");
+    let out = Command::new(exe)
+        .args([
+            "bars",
+            ticks.to_str().unwrap(),
+            "1d",
+            "rth",
+            "--session",
+            "20:00-23:00",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).lines().count(),
+        1,
+        "a session filter must still exclude ticks outside it"
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
