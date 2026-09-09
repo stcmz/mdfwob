@@ -34,7 +34,7 @@ fwob = "1.14"
 fwob-core = "1.14"
 fwob-v1 = "1.14"
 fwob-v2 = "1.14"
-ibapi = { version = "3.1.0", default-features = false, features = ["sync"] }
+ibapi = { version = "4.0", default-features = false, features = ["sync"] }
 jiff = "0.2"
 # rmcp's MSRV sits exactly on this workspace's floor (1.88 as of 3.2), so a release that
 # raises it breaks us immediately. Despite the wording this once carried, `"3.1"` is `^3.1` --

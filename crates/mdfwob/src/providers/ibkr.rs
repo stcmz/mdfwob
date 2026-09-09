@@ -2,7 +2,7 @@ use std::{
     error::Error as StdError,
     fmt,
     sync::{
-        Arc, Mutex, RwLock,
+        Arc, Mutex, Once, RwLock,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -25,6 +25,48 @@ type Client = ibapi::client::blocking::Client;
 /// cancellation and the connectivity epoch. Short enough that Ctrl+C is honored promptly; the
 /// wait is asleep the whole time (no busy polling) and returns immediately when data arrives.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Guards for the two lossy cases in [`tick_size`], so a download of a billion ticks logs each
+/// condition once instead of once per trade.
+static FRACTIONAL_SIZE_WARNED: Once = Once::new();
+static ABSENT_SIZE_WARNED: Once = Once::new();
+
+/// Narrows a TWS trade size to the `i32` the tick schema stores.
+///
+/// IBKR models sizes as decimals on the wire and ibapi 4 surfaces that faithfully as
+/// `Option<f64>`, where `None` means the field was absent and `Some(0.0)` is a real zero. The
+/// FWOB tick frame stores a whole `size: i32`, so neither a fractional nor an absent size can
+/// round-trip. Whole-share equities — everything this archive holds — are unaffected, but crypto
+/// and some non-equity instruments do trade fractional quantities, and ibapi 3 silently truncated
+/// those to zero. Rounding rather than truncating keeps a 0.5 lot from vanishing, and each lossy
+/// case warns once so the loss is visible without flooding the log.
+fn tick_size(symbol: &str, size: Option<f64>) -> i32 {
+    match size {
+        // The overwhelmingly common path: a whole number of shares.
+        Some(value) if value.fract() == 0.0 => value as i32,
+        Some(value) => {
+            FRACTIONAL_SIZE_WARNED.call_once(|| {
+                warn!(
+                    symbol,
+                    size = value,
+                    "TWS reported a fractional trade size; the tick schema stores whole units, so \
+                     sizes are rounded to the nearest integer. Further occurrences are not logged."
+                );
+            });
+            value.round() as i32
+        }
+        None => {
+            ABSENT_SIZE_WARNED.call_once(|| {
+                warn!(
+                    symbol,
+                    "TWS reported a trade with no size; recording it as 0. Further occurrences \
+                     are not logged."
+                );
+            });
+            0
+        }
+    }
+}
 
 /// True for IBKR "connectivity restored" system codes (1101 = restored, data lost; 1102 =
 /// restored, data maintained). A request in flight across one of these was orphaned by TWS.
@@ -321,7 +363,7 @@ impl MarketDataProvider for IbkrProvider {
                     out.push(ProviderTick {
                         timestamp: tick.timestamp,
                         price: tick.price,
-                        size: tick.size,
+                        size: tick_size(&contract.symbol, tick.size),
                     });
                 }
                 Some(Ok(SubscriptionItem::Notice(notice))) => {
@@ -482,11 +524,37 @@ mod tests {
         assert_eq!(classify_recovery(&anyhow::anyhow!("nope")), None);
     }
 
+    /// The tick schema stores whole units, so every TWS size has to narrow to `i32`. Whole values
+    /// pass through untouched; the two lossy cases are pinned here because they are the only place
+    /// a downloaded trade can differ from what TWS sent.
+    #[test]
+    fn tick_size_narrows_tws_sizes_to_the_stored_schema() {
+        // The equities path: whole share counts survive exactly, including a real zero.
+        assert_eq!(tick_size("AAPL", Some(100.0)), 100);
+        assert_eq!(tick_size("AAPL", Some(0.0)), 0);
+        assert_eq!(tick_size("AAPL", Some(1.0)), 1);
+
+        // Fractional sizes round to nearest rather than truncating toward zero, so a half lot
+        // records as 1 instead of vanishing the way ibapi 3 truncated it.
+        assert_eq!(tick_size("BTC", Some(0.5)), 1);
+        assert_eq!(tick_size("BTC", Some(0.4)), 0);
+        assert_eq!(tick_size("BTC", Some(2.5)), 3);
+        assert_eq!(tick_size("BTC", Some(-0.5)), -1);
+
+        // An absent size is not a zero-size trade, but the schema has no way to say so.
+        assert_eq!(tick_size("AAPL", None), 0);
+
+        // Float-to-int casts saturate in Rust, so an absurd size clamps instead of wrapping into
+        // a negative volume.
+        assert_eq!(tick_size("AAPL", Some(f64::MAX)), i32::MAX);
+        assert_eq!(tick_size("AAPL", Some(f64::MIN)), i32::MIN);
+    }
     /// Builds a minimal TWS notice for classification tests (no wire timestamp or reject JSON).
     fn notice(code: i32, message: &str) -> ibapi::Notice {
         ibapi::Notice {
             code,
             message: message.to_owned(),
+            request_id: None,
             error_time: None,
             advanced_order_reject_json: String::new(),
         }
