@@ -8,3 +8,11 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    ignore:
+      # dtolnay/rust-toolchain's refs are Rust versions, not action releases, so
+      # "newer" is meaningless here: the `@1.88` in the msrv job is deliberately this
+      # workspace's rust-version floor and must only move when that floor moves.
+      # The action also publishes branches for unreleased Rust versions (1.120 is a
+      # real branch; the toolchain itself 404s), so dependabot proposes bumps that
+      # cannot install. Update this pin by hand alongside rust-version.
+      - dependency-name: "dtolnay/rust-toolchain"
