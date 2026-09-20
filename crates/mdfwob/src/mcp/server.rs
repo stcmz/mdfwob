@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use jiff::tz::TimeZone;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
 use rmcp::{Json, ServerHandler, schemars, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -694,12 +694,12 @@ impl McpServer {
 
 #[tool_handler]
 impl ServerHandler for McpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             // Set explicitly: `Implementation::from_build_env()` — what rmcp defaults to — reads
-            // *rmcp's* build environment, so the server would otherwise announce itself as
-            // "rmcp 3.1.0" and be indistinguishable from every other rmcp server a user has
-            // installed.
+            // *rmcp's* build environment, so the server would otherwise announce itself under
+            // rmcp's own name and version, indistinguishable from every other rmcp server a user
+            // has installed.
             .with_server_info(
                 Implementation::new("mdfwob", env!("CARGO_PKG_VERSION"))
                     .with_title("mdfwob market data")

@@ -36,7 +36,7 @@ fwob-v1 = "1.14"
 fwob-v2 = "1.14"
 ibapi = { version = "4.0", default-features = false, features = ["sync"] }
 jiff = "0.2"
-# rmcp's MSRV sits exactly on this workspace's floor (1.88 as of 3.2), so a release that
+# rmcp's MSRV sits exactly on this workspace's floor (1.88 as of 3.4), so a release that
 # raises it breaks us immediately. Despite the wording this once carried, `"3.1"` is `^3.1` --
 # any 3.x -- not a pin. The real guard is the `Rust 1.88` CI job, which checks the locked
 # graph at the floor and fails before such a bump can ship.
