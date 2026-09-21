@@ -22,12 +22,15 @@ use fwob::Reader;
 use fwob_core::Key;
 use jiff::tz::TimeZone;
 
+use crate::analysis::inspect::detect_bar_granularity;
+use crate::analysis::interval::Granularity;
 use crate::analysis::model::Bar;
 use crate::analysis::output::format_epoch_tz;
 use crate::analysis::read::{
     InputKind, input_kind, open_tick_reader, stream_bars_file, stream_ticks,
 };
 use crate::analysis::resample::{BarResampler, ForwardFiller, Resampler};
+use crate::analysis::schema::decode_bar;
 use crate::analysis::sidecar::sidecar_path;
 use crate::analysis::{BarClock, Interval, Session, TickQuery};
 
@@ -68,32 +71,118 @@ impl<'a> BarStream<'a> {
     }
 }
 
-/// The kind every source of one symbol shares, or `None` when there are no sources.
+/// What a source file holds, finely enough to decide how it may be filtered and resampled.
+///
+/// The distinction that matters is not tick-vs-bar but *whether a row's timestamp is an instant
+/// inside the trading day*. A tick's is. A sub-daily bar's bucket start is too. A daily bar's is
+/// local midnight, which sits outside every intraday window — so the same session filter that is
+/// correct for the first two empties the third.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceShape {
+    /// Trade prints. Every row carries an instant.
+    Ticks,
+    /// Bars whose buckets are shorter than a day, so their starts are intraday instants.
+    SubDayBars(u32),
+    /// Bars at daily granularity or coarser, stamped at the bucket start.
+    CoarseBars,
+    /// Bars whose granularity could not be determined (fewer than two rows).
+    UnknownBars,
+}
+
+impl SourceShape {
+    /// Whether a session may be applied to this source as a row filter.
+    ///
+    /// Ticks and sub-daily bars, yes: their timestamps are instants within the day, so keeping
+    /// only in-session rows yields exactly the in-session subset. Daily bars, no: the filter
+    /// would discard every row. Unknown, no — a guess that silently drops the filter is better
+    /// than one that silently empties the file, and the caller still gets bars.
+    pub fn accepts_session_filter(self) -> bool {
+        matches!(self, Self::Ticks | Self::SubDayBars(_))
+    }
+
+    /// Bucket width in seconds, for a sub-daily bar source.
+    pub fn seconds(self) -> Option<u32> {
+        match self {
+            Self::SubDayBars(seconds) => Some(seconds),
+            _ => None,
+        }
+    }
+}
+
+/// Reads a file's shape from its header plus a small leading sample.
+pub fn source_shape(path: &Path) -> Result<SourceShape> {
+    if input_kind(path)? == InputKind::Tick {
+        return Ok(SourceShape::Ticks);
+    }
+    let times = leading_bar_times(path, GRANULARITY_SAMPLE)?;
+    let Some(label) = detect_bar_granularity(&times) else {
+        return Ok(SourceShape::UnknownBars);
+    };
+    let Some(Ok(interval)) = Interval::parse(&label) else {
+        return Ok(SourceShape::UnknownBars);
+    };
+    Ok(match interval.granularity() {
+        Granularity::SubDay(seconds) => SourceShape::SubDayBars(seconds),
+        _ => SourceShape::CoarseBars,
+    })
+}
+
+/// Bars sampled from the front of a file are enough to see the minimum gap between buckets.
+const GRANULARITY_SAMPLE: u64 = 64;
+
+/// Reads the first `sample` bar timestamps without decoding the whole file.
+fn leading_bar_times(path: &Path, sample: u64) -> Result<Vec<u32>> {
+    let mut reader =
+        Reader::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let count = reader.frame_count().min(sample);
+    let mut times = Vec::with_capacity(count as usize);
+    for frame in reader.frames(0..count)? {
+        times.push(decode_bar(frame?.bytes())?.time);
+    }
+    Ok(times)
+}
+
+/// The shape every source of one symbol shares, or `None` when there are no sources.
 ///
 /// Mixing is refused rather than resolved: a symbol backed by both ticks and bars would have two
 /// different notions of what a timestamp means, and no single query can be right for both.
-fn sources_kind(paths: &[PathBuf]) -> Result<Option<InputKind>> {
-    let mut kind: Option<InputKind> = None;
+fn sources_shape(paths: &[PathBuf]) -> Result<Option<SourceShape>> {
+    let mut shape: Option<SourceShape> = None;
     for path in paths {
-        let this = input_kind(path)?;
-        match kind {
-            Some(existing) if existing != this => bail!(
-                "cannot mix tick and bar files for one symbol ({})",
-                path.display()
-            ),
-            _ => kind = Some(this),
+        let this = source_shape(path)?;
+        match shape {
+            Some(existing)
+                if existing.accepts_session_filter() != this.accepts_session_filter() =>
+            {
+                bail!(
+                    "cannot mix tick and bar files for one symbol ({})",
+                    path.display()
+                )
+            }
+            // Several bar files of one symbol: the coarsest decides, since a session filter that
+            // is wrong for any one of them is wrong for the set.
+            Some(SourceShape::SubDayBars(a)) => {
+                shape = Some(match this {
+                    SourceShape::SubDayBars(b) => SourceShape::SubDayBars(a.max(b)),
+                    other => other,
+                })
+            }
+            _ => shape = Some(this),
         }
     }
-    Ok(kind)
+    Ok(shape)
 }
 
-/// The session as a tick **row filter**, which is `Some` only when the sources are ticks.
+/// The session as a **row filter**, which is `Some` only when the sources can be filtered by one.
 ///
-/// A tick carries an instant, so an out-of-hours print has to be dropped. A bar carries its
-/// *bucket-start* timestamp — local midnight for a daily bar, outside every intraday window — so
-/// applying the same filter to it discards the entire file and reports an empty archive. Worse, it
-/// discards it *selectively*: a 1-minute bar file survives, because those timestamps do fall inside
-/// the session, so the mistake looks correct until someone reads a daily file.
+/// A tick carries an instant, so an out-of-hours print has to be dropped. A *sub-daily* bar's
+/// bucket start is an instant inside the day too, so the same filter is correct there — keeping
+/// only in-session rows yields exactly the in-session subset. A daily bar is stamped at local
+/// midnight, outside every intraday window, so filtering it discards the whole file.
+///
+/// Keying this on tick-vs-bar alone was wrong in the other direction: it dropped the filter for
+/// every bar source, so asking a 1-minute file for regular hours silently returned extended-hours
+/// numbers — no error, just a different answer than the one requested.
 ///
 /// Any caller assembling a [`TickQuery`] by hand should get the `session` field from here rather
 /// than from `use_rth` alone. [`request_bars`] does this internally.
@@ -105,8 +194,8 @@ pub fn session_row_filter(
     if !use_rth {
         return Ok(None);
     }
-    Ok(match sources_kind(paths)? {
-        Some(InputKind::Tick) => Some(session.clone()),
+    Ok(match sources_shape(paths)? {
+        Some(shape) if shape.accepts_session_filter() => Some(session.clone()),
         _ => None,
     })
 }
@@ -129,7 +218,11 @@ pub fn stream_symbol_bars(spec: BarStream<'_>, sink: impl FnMut(Bar) -> Result<(
         fill,
     } = spec;
 
-    let kind = sources_kind(paths)?;
+    let shape = sources_shape(paths)?;
+    let kind = shape.map(|s| match s {
+        SourceShape::Ticks => InputKind::Tick,
+        _ => InputKind::Bar,
+    });
 
     let Some(interval) = interval else {
         // No target width: a bar source keeps its stored resolution and passes straight through.
@@ -192,6 +285,73 @@ fn last_key(path: &Path) -> Result<Option<u32>> {
 /// Staleness is refused rather than tolerated: an archive grows, and a file materialized last week
 /// silently truncates every run that reads it. Both checks are O(1) header reads, free against the
 /// tens of seconds a sidecar saves.
+/// Whether a sidecar stored at `(have_interval, have_rth)` can answer a request for
+/// `(want_interval, want_rth)`.
+///
+/// Two independent questions, and both must be yes.
+///
+/// **Interval.** A finer bucket aggregates into a coarser one; the reverse is lost information, so
+/// a 1h sidecar can never answer 1m. Sub-daily into sub-daily needs the target to be a whole
+/// multiple of the source. Sub-daily into daily-or-coarser additionally needs the source to divide
+/// a day evenly, or a bucket would straddle the boundary and land in two sessions at once — which
+/// is why 1m, 5m and 1h qualify and 7m does not.
+///
+/// **Session.** Extended hours are a superset of regular ones, so an `ext` sidecar can answer an
+/// `rth` request by dropping the out-of-session rows — but only while its rows are sub-daily, since
+/// a daily bar has already aggregated the extended prints into its OHLC and cannot un-mix them. An
+/// `rth` sidecar can never answer an `ext` request: the pre- and post-market prints are simply not
+/// in the file.
+fn sidecar_serves(
+    have_interval: Interval,
+    have_rth: bool,
+    want_interval: Interval,
+    want_rth: bool,
+) -> bool {
+    let intervals_ok = match (have_interval.granularity(), want_interval.granularity()) {
+        (Granularity::SubDay(have), Granularity::SubDay(want)) => {
+            have <= want && want.is_multiple_of(have)
+        }
+        (Granularity::SubDay(have), _) => DAY_SECONDS.is_multiple_of(have),
+        (Granularity::Day(have), Granularity::Day(want)) => {
+            have <= want && want.is_multiple_of(have)
+        }
+        (Granularity::Day(have), Granularity::Week(_)) => have == 1,
+        (Granularity::Week(have), Granularity::Week(want)) => {
+            have <= want && want.is_multiple_of(have)
+        }
+        _ => false,
+    };
+    if !intervals_ok {
+        return false;
+    }
+    match (have_rth, want_rth) {
+        // Same session: nothing to do.
+        (true, true) | (false, false) => true,
+        // Extended answering regular: filterable only while the rows are intraday instants.
+        (false, true) => matches!(have_interval.granularity(), Granularity::SubDay(_)),
+        // Regular answering extended: the prints are not there.
+        (true, false) => false,
+    }
+}
+
+const DAY_SECONDS: u32 = 86_400;
+
+/// Sidecar intervals worth probing, coarsest first.
+///
+/// Coarsest-compatible wins: a 1h sidecar answers a daily request with a twelfth of the rows a 1m
+/// one would. Probing is a handful of `exists` calls, so the list stays explicit rather than
+/// scanning the directory — a scan would also have to guess which files are this symbol's.
+const SIDECAR_CANDIDATES: [&str; 6] = ["1d", "1h", "30m", "15m", "5m", "1m"];
+
+/// A sidecar that can answer this request, with the source it stands in for.
+pub struct SidecarMatch {
+    pub path: PathBuf,
+    /// The sidecar's own interval, which may be finer than the one requested.
+    pub interval: Interval,
+    /// Whether the sidecar stores regular hours only.
+    pub use_rth: bool,
+}
+
 pub fn resolve_sidecar(
     paths: &[PathBuf],
     symbol: &str,
@@ -200,6 +360,21 @@ pub fn resolve_sidecar(
     clock: &BarClock,
     tz: &TimeZone,
 ) -> Result<Option<PathBuf>> {
+    Ok(resolve_sidecar_match(paths, symbol, interval, use_rth, clock, tz)?.map(|m| m.path))
+}
+
+/// Picks the cheapest sidecar that can answer `(interval, use_rth)`, or `None` to use the source.
+///
+/// Exact match first, then any coarser-but-compatible store, then finer ones. Freshness is checked
+/// against the *sidecar's own* interval, since that is the bucket it would have to complete.
+pub fn resolve_sidecar_match(
+    paths: &[PathBuf],
+    symbol: &str,
+    interval: Interval,
+    use_rth: bool,
+    clock: &BarClock,
+    tz: &TimeZone,
+) -> Result<Option<SidecarMatch>> {
     // A sidecar stands in for exactly one tick file; several sources have no single sidecar.
     let [source] = paths else { return Ok(None) };
     if input_kind(source)? != InputKind::Tick {
@@ -208,29 +383,58 @@ pub fn resolve_sidecar(
     let Some(dir) = source.parent() else {
         return Ok(None);
     };
-    let side = sidecar_path(dir, symbol, interval, use_rth);
-    if !side.exists() {
+    let Some(tick_last) = last_key(source)? else {
         return Ok(None);
-    }
-    let (Some(bars_last), Some(tick_last)) = (last_key(&side)?, last_key(source)?) else {
-        return Ok(None); // an empty file either side: fall back to the source
     };
 
-    // Stale only when a whole bucket beyond the last stored one could be formed. Extra ticks inside
-    // the final bucket make it partial, which `mdfwob sync` re-derives anyway.
-    if tick_last >= clock.next_bucket_start(interval, bars_last) {
-        bail!(
-            "{} is stale.\n  sidecar ends {}\n  source has ticks through {}\nRefresh it with: \
-             mdfwob sync {} {}{}",
-            side.display(),
-            format_epoch_tz(bars_last, tz),
-            format_epoch_tz(tick_last, tz),
-            source.display(),
-            interval.label(),
-            if use_rth { " rth" } else { "" },
-        );
+    let mut stale: Option<anyhow::Error> = None;
+    for label in SIDECAR_CANDIDATES {
+        let Some(Ok(have)) = Interval::parse(label) else {
+            continue;
+        };
+        // Prefer a store in the requested session; fall back to extended, which can be filtered.
+        for have_rth in [use_rth, false] {
+            if !sidecar_serves(have, have_rth, interval, use_rth) {
+                continue;
+            }
+            let side = sidecar_path(dir, symbol, have, have_rth);
+            if !side.exists() {
+                continue;
+            }
+            let Some(bars_last) = last_key(&side)? else {
+                continue; // an empty sidecar: fall back to the source
+            };
+            // Stale only when a whole bucket beyond the last stored one could be formed. Extra
+            // ticks inside the final bucket make it partial, which `mdfwob sync` re-derives anyway.
+            if tick_last >= clock.next_bucket_start(have, bars_last) {
+                // Remember, but keep looking: another sidecar may still be current.
+                stale.get_or_insert_with(|| {
+                    anyhow::anyhow!(
+                        "{} is stale.\n  sidecar ends {}\n  source has ticks through {}\nRefresh \
+                         it with: mdfwob sync {} {}{}",
+                        side.display(),
+                        format_epoch_tz(bars_last, tz),
+                        format_epoch_tz(tick_last, tz),
+                        source.display(),
+                        have.label(),
+                        if have_rth { " rth" } else { "" },
+                    )
+                });
+                continue;
+            }
+            return Ok(Some(SidecarMatch {
+                path: side,
+                interval: have,
+                use_rth: have_rth,
+            }));
+        }
     }
-    Ok(Some(side))
+    // Nothing usable. A stale sidecar is worth saying so about rather than silently re-resampling
+    // the ticks it was built to avoid.
+    match stale {
+        Some(error) => Err(error),
+        None => Ok(None),
+    }
 }
 
 /// How a symbol's bars should be sourced.
@@ -266,17 +470,25 @@ pub fn symbol_bars(
     if prefer_sidecar
         && !stream.fill
         && let Some(interval) = stream.interval
-        && let Some(side) =
-            resolve_sidecar(stream.paths, symbol, interval, use_rth, stream.clock, tz)?
+        && let Some(found) =
+            resolve_sidecar_match(stream.paths, symbol, interval, use_rth, stream.clock, tz)?
     {
-        let paths = [side];
-        // The caller's session filter was written for a *tick* source, where it selects in-session
-        // prints. A sidecar holds bars already bucketed under that session, and a bar carries its
-        // bucket-start timestamp -- local midnight for a daily bar, outside every intraday window
-        // -- so re-applying the filter here silently discards the whole file. The `rth` in the
-        // sidecar's name IS that filter, already applied.
+        let paths = [found.path];
+        // Two things the sidecar's name already settles, and one it does not.
+        //
+        // Its `rth` or `ext` says which prints went into its buckets, so re-applying the caller's
+        // session filter is wrong whenever the store already matches — and catastrophic for a
+        // daily store, whose bucket-start timestamps sit outside every intraday window.
+        //
+        // What it does *not* settle is an extended store answering a regular-hours request. There
+        // the filter is exactly what makes the answer correct, and it is safe to apply because
+        // such a store is always sub-daily: its rows are intraday instants.
+        let filtering = !found.use_rth && use_rth;
         let query = TickQuery {
-            session: None,
+            session: match (filtering, stream.clock) {
+                (true, BarClock::Session(session)) => Some(session.clone()),
+                _ => None,
+            },
             start: stream.query.start,
             end: stream.query.end,
         };
@@ -284,8 +496,9 @@ pub fn symbol_bars(
             BarStream {
                 paths: &paths,
                 query: &query,
-                // The sidecar is already at this interval; re-resampling it to the same width is a
-                // no-op scan, but re-resampling to a *different* one would be wrong.
+                // Keep the caller's target width. When the store is already at it this is a no-op
+                // scan; when the store is finer, this is the aggregation that lets one sidecar
+                // serve every coarser interval.
                 ..stream
             },
             sink,
@@ -421,6 +634,23 @@ mod tests {
             // across two files carry the same prices as one file holding all of them — otherwise
             // the seam comparison below would differ for a reason that is not the seam.
             RawTick::new(time, 100.0 + f64::from(time / step), 10)
+                .unwrap()
+                .encode(&mut buf);
+            writer.append_frame(&buf).unwrap();
+        }
+        writer.finish().unwrap();
+        path
+    }
+
+    /// Ticks at real-world epochs, priced from their index so a 2024 timestamp cannot overflow the
+    /// scaled-price range the way `write_ticks`' time-derived price does.
+    fn write_dated_ticks(dir: &Path, name: &str, start: u32, count: u32, step: u32) -> PathBuf {
+        let path = dir.join(format!("{name}.fwob"));
+        let mut writer = Writer::create_v2(&path, tick_schema(), WriterOptions::new(name)).unwrap();
+        let mut buf = Vec::new();
+        for i in 0..count {
+            buf.clear();
+            RawTick::new(start + i * step, 100.0 + f64::from(i), 10)
                 .unwrap()
                 .encode(&mut buf);
             writer.append_frame(&buf).unwrap();
@@ -852,6 +1082,225 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- source shape and the session row filter ---------------------------------------
+
+    /// The rule that was wrong: keying the session filter on tick-vs-bar alone drops it for every
+    /// bar source, so a 1-minute file asked for regular hours silently returns extended-hours
+    /// numbers. A sub-daily bar's bucket start *is* an intraday instant and must be filtered.
+    #[test]
+    fn a_sub_daily_bar_source_accepts_the_session_filter() {
+        assert!(SourceShape::Ticks.accepts_session_filter());
+        assert!(SourceShape::SubDayBars(60).accepts_session_filter());
+        assert!(SourceShape::SubDayBars(3_600).accepts_session_filter());
+        assert!(
+            !SourceShape::CoarseBars.accepts_session_filter(),
+            "a daily bar is stamped at local midnight; filtering empties the file"
+        );
+        assert!(
+            !SourceShape::UnknownBars.accepts_session_filter(),
+            "an unreadable granularity drops the filter rather than risk emptying the file"
+        );
+    }
+
+    // ---- sidecar compatibility ---------------------------------------------------------
+
+    fn iv(label: &str) -> Interval {
+        Interval::parse(label).unwrap().unwrap()
+    }
+
+    /// A finer store aggregates into a coarser request; the reverse loses information.
+    #[test]
+    fn a_finer_sidecar_serves_a_coarser_request_and_never_the_reverse() {
+        assert!(sidecar_serves(iv("1m"), false, iv("5m"), false));
+        assert!(sidecar_serves(iv("1m"), false, iv("1h"), false));
+        assert!(sidecar_serves(iv("1m"), false, iv("1d"), false));
+        assert!(sidecar_serves(iv("5m"), false, iv("1h"), false));
+        assert!(sidecar_serves(iv("1h"), false, iv("1d"), false));
+        assert!(sidecar_serves(iv("1d"), false, iv("1d"), false), "exact");
+
+        assert!(
+            !sidecar_serves(iv("1h"), false, iv("1m"), false),
+            "coarser cannot serve finer"
+        );
+        assert!(!sidecar_serves(iv("1d"), false, iv("1h"), false));
+        assert!(!sidecar_serves(iv("5m"), false, iv("1m"), false));
+    }
+
+    /// Buckets must tile the target, or one would straddle a boundary and land in two sessions.
+    #[test]
+    fn an_interval_that_does_not_divide_the_target_is_refused() {
+        assert!(
+            !sidecar_serves(iv("2m"), false, iv("5m"), false),
+            "5 is not a multiple of 2"
+        );
+        assert!(sidecar_serves(iv("2m"), false, iv("4m"), false));
+        // 7 minutes does not divide a day, so a daily bucket would split one of its bars.
+        assert!(!sidecar_serves(iv("7m"), false, iv("1d"), false));
+        assert!(sidecar_serves(iv("30m"), false, iv("1d"), false));
+    }
+
+    /// Extended is a superset of regular, so it can be filtered down — but only while the rows are
+    /// intraday. A daily extended bar has already mixed the out-of-hours prints into its OHLC.
+    #[test]
+    fn extended_serves_regular_only_while_the_rows_are_sub_daily() {
+        assert!(
+            sidecar_serves(iv("1m"), false, iv("1d"), true),
+            "filter, then aggregate"
+        );
+        assert!(sidecar_serves(iv("1h"), false, iv("1h"), true));
+        assert!(
+            !sidecar_serves(iv("1d"), false, iv("1d"), true),
+            "a daily extended bar cannot be un-mixed into a regular-hours one"
+        );
+    }
+
+    /// The prints simply are not in a regular-hours file.
+    #[test]
+    fn regular_never_serves_extended() {
+        assert!(!sidecar_serves(iv("1m"), true, iv("1m"), false));
+        assert!(!sidecar_serves(iv("1m"), true, iv("1d"), false));
+        assert!(
+            sidecar_serves(iv("1m"), true, iv("1d"), true),
+            "same session is fine"
+        );
+    }
+
+    /// The whole point, end to end: one extended-hours 1-minute sidecar answers a regular-hours
+    /// *daily* request, and answers it with exactly the bars the ticks would have produced.
+    ///
+    /// Both halves are load-bearing. Serving a coarser request from a finer store is what makes a
+    /// single sidecar useful for every interval above it; filtering that store to the requested
+    /// session is what keeps the answer correct rather than merely fast. Before this, the filter
+    /// was dropped for any bar source and the same call returned extended-hours numbers.
+    #[test]
+    fn an_extended_minute_sidecar_answers_a_regular_hours_daily_request() {
+        let dir = temp_dir("coarser");
+        let session = Session::new("America/New_York", "09:30-16:00").unwrap();
+        let clock = BarClock::Session(session.clone());
+        let tz = session.time_zone();
+
+        // A day of ticks every ten minutes, from 04:00 to 20:00 New York — so some land inside
+        // regular hours and many do not. 2024-03-05 is a Tuesday well clear of a DST boundary.
+        let open = jiff::civil::date(2024, 3, 5)
+            .at(4, 0, 0, 0)
+            .in_tz("America/New_York")
+            .unwrap()
+            .timestamp()
+            .as_second() as u32;
+        let ticks = write_dated_ticks(&dir, "S", open, 16 * 6, 600);
+
+        // Ground truth: daily regular-hours bars straight from the ticks.
+        let query = TickQuery {
+            session: Some(session.clone()),
+            start: None,
+            end: None,
+        };
+        let mut from_ticks = Vec::new();
+        stream_symbol_bars(
+            BarStream::new(std::slice::from_ref(&ticks), iv("1d"), &clock, &query),
+            |bar| {
+                from_ticks.push(bar);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(!from_ticks.is_empty(), "the fixture must produce a bar");
+
+        // Materialize a 1-minute *extended* sidecar — the only store on disk.
+        let plain = TickQuery::default();
+        refresh_sidecar(
+            &ticks,
+            &dir,
+            "S",
+            &RefreshSpec {
+                interval: iv("1m"),
+                use_rth: false,
+                clock: &clock,
+                query: &plain,
+                fill: false,
+            },
+        )
+        .unwrap();
+
+        // Assert the mechanism, not just the answer: without this, the test would also pass by
+        // silently falling back to the ticks, which is exactly what the old code did.
+        let matched = resolve_sidecar_match(
+            std::slice::from_ref(&ticks),
+            "S",
+            iv("1d"),
+            true,
+            &clock,
+            &tz,
+        )
+        .unwrap()
+        .expect("the 1m extended sidecar must answer a 1d regular-hours request");
+        assert_eq!(
+            matched.interval.label(),
+            "1m",
+            "served from the minute store"
+        );
+        assert!(!matched.use_rth, "which is the extended one");
+
+        // Ask for daily regular hours again, now letting the sidecar answer.
+        let mut from_sidecar = Vec::new();
+        symbol_bars(
+            SymbolBars {
+                stream: BarStream::new(std::slice::from_ref(&ticks), iv("1d"), &clock, &query),
+                use_rth: true,
+                prefer_sidecar: true,
+            },
+            "S",
+            &tz,
+            |bar| {
+                from_sidecar.push(bar);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            from_sidecar.len(),
+            from_ticks.len(),
+            "same number of daily bars"
+        );
+        for (side, tick) in from_sidecar.iter().zip(&from_ticks) {
+            assert_eq!(side.time, tick.time);
+            assert_eq!(side.open.to_bits(), tick.open.to_bits(), "open");
+            assert_eq!(side.high.to_bits(), tick.high.to_bits(), "high");
+            assert_eq!(side.low.to_bits(), tick.low.to_bits(), "low");
+            assert_eq!(side.close.to_bits(), tick.close.to_bits(), "close");
+            assert_eq!(side.volume, tick.volume, "volume");
+            assert_eq!(side.trades, tick.trades, "trade count");
+        }
+
+        // And the filter genuinely did something: an unfiltered read of the same sidecar must
+        // differ, or this test would pass even with the session dropped.
+        let mut extended = Vec::new();
+        symbol_bars(
+            SymbolBars {
+                stream: BarStream::new(std::slice::from_ref(&ticks), iv("1d"), &clock, &plain),
+                use_rth: false,
+                prefer_sidecar: true,
+            },
+            "S",
+            &tz,
+            |bar| {
+                extended.push(bar);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(
+            extended
+                .iter()
+                .zip(&from_sidecar)
+                .any(|(e, r)| e.trades != r.trades || e.volume != r.volume),
+            "extended and regular hours must differ, or the filter is a no-op"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
