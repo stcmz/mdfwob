@@ -6,13 +6,14 @@
 //! [`inspect_file`] does the assembly once so every front end renders the *same* overview — the
 //! CLI as colored TOML, the MCP server as JSON — instead of each re-deriving it and drifting.
 
+use std::collections::BTreeSet;
 use std::ops::Range;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use fwob::{FormatVersion, Reader};
-use fwob_core::{FieldSemantic, FieldType, Schema, TimestampUnit};
-use jiff::{Timestamp, tz::TimeZone};
+use fwob_core::{FieldSemantic, FieldType, Key, Schema, TimestampUnit};
+use jiff::{Timestamp, civil::Date, tz::TimeZone};
 
 use crate::analysis::model::{Bar, Tick};
 use crate::analysis::output::{comma_i64, comma_u64, fmt_price, format_epoch_tz};
@@ -68,13 +69,13 @@ impl Inspection {
     }
 }
 
-/// Reads one tick or bar file's overview: header metadata, boundary keys, and — from up to
-/// `sample` frames at each end — the bar granularity, trading-hours classification, and a decoded
-/// preview rendered in `tz`.
+/// Reads one tick or bar file's overview: header metadata, boundary keys, the bar granularity and
+/// a decoded preview (rendered in `tz`) from up to `sample` frames at each end, and the
+/// trading-hours classification from a few days' opening frames (see [`classify_file_hours`]).
 ///
-/// Bounded by construction: only the header, the two boundary keys, and the sampled windows are
-/// read, never the whole file. `rth` supplies the regular-hours window used to classify `hours`.
-/// Fails if the file is not a canonical Tick/Bar file.
+/// Bounded by construction: only the header, the two boundary keys, the sampled windows, and a
+/// handful of seeks are read, never the whole file. `rth` supplies the regular-hours window used
+/// to classify `hours`. Fails if the file is not a canonical Tick/Bar file.
 pub fn inspect_file(path: &Path, rth: &Session, tz: &TimeZone, sample: u64) -> Result<Inspection> {
     let mut reader =
         Reader::open(path).with_context(|| format!("failed to open {}", path.display()))?;
@@ -132,6 +133,8 @@ pub fn inspect_file(path: &Path, rth: &Session, tz: &TimeZone, sample: u64) -> R
         }
     }
 
+    let hours = classify_file_hours(&mut reader, kind, first, last, &times, rth)?;
+
     let preview = match kind {
         InputKind::Tick => preview_ticks(&preview_rows(frame_count, &lead_ticks, &tail_ticks), tz),
         InputKind::Bar => preview_bars(&preview_rows(frame_count, &lead_bars, &tail_bars), tz),
@@ -150,7 +153,7 @@ pub fn inspect_file(path: &Path, rth: &Session, tz: &TimeZone, sample: u64) -> R
         granularity: (kind == InputKind::Bar)
             .then(|| detect_bar_granularity(&times))
             .flatten(),
-        hours: (!times.is_empty()).then(|| classify_hours(&times, rth)),
+        hours,
         preview,
     })
 }
@@ -173,14 +176,7 @@ pub fn sample_windows(frame_count: u64, per_end: u64) -> (Range<u64>, Option<Ran
 /// gaps are matched with tolerance (DST makes a "1 day" gap 23–25h, weekends leave the *minimum*
 /// gap at ~1 day). Returns `None` for fewer than two bars or no positive gap.
 pub fn detect_bar_granularity(times: &[u32]) -> Option<String> {
-    let mut min_delta = u32::MAX;
-    for pair in times.windows(2) {
-        let delta = pair[1].saturating_sub(pair[0]);
-        if delta > 0 && delta < min_delta {
-            min_delta = delta;
-        }
-    }
-    (min_delta != u32::MAX).then(|| granularity_label(min_delta))
+    min_positive_gap(times).map(granularity_label)
 }
 
 fn granularity_label(min_delta: u32) -> String {
@@ -215,6 +211,10 @@ fn minute_of_day(epoch: u32, tz: &TimeZone) -> Option<i32> {
 
 /// Classifies whether a sample's timestamps fall entirely inside regular trading hours.
 ///
+/// Sees only the frames it is handed, so on its own it judges a file by wherever those happen to
+/// sit. [`classify_file_hours`] uses it only as the fallback for a file with no second trading day
+/// to probe.
+///
 /// - `"rth"` — every sampled frame is within `rth`'s window and the sample spans more than one
 ///   time-of-day (so the window is actually observable).
 /// - `"extended"` — at least one sampled frame is outside the RTH window (pre/after-market).
@@ -244,6 +244,195 @@ pub fn classify_hours(times: &[u32], rth: &Session) -> &'static str {
     } else {
         "rth"
     }
+}
+
+/// Distinct trading days whose opening frames [`classify_file_hours`] reads at each end of a file.
+pub const HOURS_PROBE_DAYS: usize = 5;
+/// Frames read at each probed day's open.
+pub const HOURS_PROBE_FRAMES: u64 = 5;
+
+/// Classifies which trading hours a whole file covers: `"rth"`, `"extended"`, or `"n/a"`.
+///
+/// A day's *opening* prints are what tell the two recordings apart: extended-hours data opens in
+/// the pre-market (04:00 in New York), regular-hours data at the bell. Frames at fixed positions
+/// cannot see that — for a tick file, the first and last thousand frames span a few minutes either
+/// side of wherever the data happens to start and stop, which on an IPO day or a download that
+/// ended mid-session is squarely inside RTH. So this seeks to exchange-local midnight on up to
+/// [`HOURS_PROBE_DAYS`] trading days at each end and reads the first [`HOURS_PROBE_FRAMES`] frames
+/// after each; any of those outside `rth` makes the file `"extended"`.
+///
+/// The file's first day is never probed, since the data may begin partway through it. The last
+/// day is, because a download is truncated at its end, not its start. Each probe continues from
+/// the day it actually landed on, so weekends, holidays, and gaps cost no extra seeks and every
+/// probe is a day with data.
+///
+/// `sample_times` are frames from the contiguous head/tail windows. They decide `"n/a"` for bar
+/// files at daily or coarser granularity, whose times are bucket anchors rather than trade times,
+/// and are the fallback for a file too short to contain a second trading day. Returns `None` for
+/// an empty file.
+pub fn classify_file_hours(
+    reader: &mut Reader,
+    kind: InputKind,
+    first: Option<u32>,
+    last: Option<u32>,
+    sample_times: &[u32],
+    rth: &Session,
+) -> Result<Option<&'static str>> {
+    let (Some(first), Some(last)) = (first, last) else {
+        return Ok(None);
+    };
+    if sample_times.is_empty() {
+        return Ok(None);
+    }
+    if kind == InputKind::Bar && min_positive_gap(sample_times).is_none_or(|gap| gap >= DAY) {
+        return Ok(Some("n/a"));
+    }
+    let outside = |time: u32| !rth.contains(time);
+    // One open outside RTH settles `extended`, so the walk stops there: a typical extended-hours
+    // file costs a single probe, and only files that really are `rth` pay for every day.
+    let opens = day_open_times(
+        reader,
+        kind,
+        first,
+        last,
+        &rth.time_zone(),
+        HOURS_PROBE_DAYS,
+        HOURS_PROBE_FRAMES,
+        outside,
+    )?;
+    if opens.is_empty() {
+        return Ok(Some(classify_hours(sample_times, rth)));
+    }
+    Ok(Some(if opens.iter().any(|&time| outside(time)) {
+        "extended"
+    } else {
+        "rth"
+    }))
+}
+
+/// The times of the first `per_day` frames after exchange-local midnight, on up to `days` trading
+/// days at each end of a file whose keys run from `first` to `last`. The file's first day is
+/// skipped, and a short file whose head and tail walks meet samples each day once. The walk ends
+/// early, after the first day with a frame for which `stop` holds. See [`classify_file_hours`].
+#[allow(clippy::too_many_arguments)]
+pub fn day_open_times(
+    reader: &mut Reader,
+    kind: InputKind,
+    first: u32,
+    last: u32,
+    tz: &TimeZone,
+    days: usize,
+    per_day: u64,
+    stop: impl Fn(u32) -> bool,
+) -> Result<Vec<u32>> {
+    let count = reader.frame_count();
+    let mut probed = BTreeSet::new();
+    let mut opens = Vec::new();
+
+    // Head: forward from the day after the first.
+    let mut date = local_date(first, tz).and_then(|day| day.tomorrow().ok());
+    while probed.len() < days
+        && let Some(day) = date
+    {
+        let Some(midnight) = local_midnight(day, tz) else {
+            break;
+        };
+        if midnight > last {
+            break;
+        }
+        // `midnight <= last`, so a frame keyed at or after it exists.
+        let index = reader.lower_bound(Key::U32(midnight))?;
+        let times = frame_times(
+            reader,
+            kind,
+            index..count.min(index.saturating_add(per_day)),
+        )?;
+        let Some(&open) = times.first() else {
+            break;
+        };
+        probed.insert(index);
+        let decided = times.iter().any(|&time| stop(time));
+        opens.extend(times);
+        if decided {
+            return Ok(opens);
+        }
+        // Continue from the day actually landed on, which skips any weekend or gap in one step.
+        date = local_date(open, tz).and_then(|day| day.tomorrow().ok());
+    }
+
+    // Tail: backward from the last day, stopping before the file's first day.
+    let head_probes = probed.len();
+    let mut date = local_date(last, tz);
+    while probed.len() - head_probes < days
+        && let Some(day) = date
+    {
+        let Some(midnight) = local_midnight(day, tz) else {
+            break;
+        };
+        if midnight <= first {
+            break;
+        }
+        // `first < midnight <= last`, so `1 <= index < count`.
+        let index = reader.lower_bound(Key::U32(midnight))?;
+        if !probed.insert(index) {
+            // The head walk already sampled this day, and every day before it.
+            break;
+        }
+        // One read covers this day's opening frames and, just before them, the last frame of the
+        // previous day with data — which is where the walk goes next.
+        let times = frame_times(
+            reader,
+            kind,
+            index - 1..count.min(index.saturating_add(per_day)),
+        )?;
+        let Some((&previous, day_open)) = times.split_first() else {
+            break;
+        };
+        opens.extend_from_slice(day_open);
+        if day_open.iter().any(|&time| stop(time)) {
+            return Ok(opens);
+        }
+        date = local_date(previous, tz);
+    }
+    Ok(opens)
+}
+
+/// The `time` of each frame in `range`.
+fn frame_times(reader: &mut Reader, kind: InputKind, range: Range<u64>) -> Result<Vec<u32>> {
+    let mut times = Vec::new();
+    for frame in reader.frames(range)? {
+        let frame = frame?;
+        times.push(match kind {
+            InputKind::Tick => decode_tick(frame.bytes()).time,
+            InputKind::Bar => decode_bar(frame.bytes())?.time,
+        });
+    }
+    Ok(times)
+}
+
+/// The calendar date `epoch` falls on in `tz`.
+fn local_date(epoch: u32, tz: &TimeZone) -> Option<Date> {
+    Some(
+        Timestamp::from_second(i64::from(epoch))
+            .ok()?
+            .to_zoned(tz.clone())
+            .date(),
+    )
+}
+
+/// The instant `date` begins in `tz`. On the rare zone whose DST shift skips midnight, that is the
+/// first valid instant of the day.
+fn local_midnight(date: Date, tz: &TimeZone) -> Option<u32> {
+    u32::try_from(date.to_zoned(tz.clone()).ok()?.timestamp().as_second()).ok()
+}
+
+/// The smallest positive gap between consecutive times, if any.
+fn min_positive_gap(times: &[u32]) -> Option<u32> {
+    times
+        .windows(2)
+        .map(|pair| pair[1].saturating_sub(pair[0]))
+        .filter(|&delta| delta > 0)
+        .min()
 }
 
 /// The TOML label for a field's storage type (mirrors `fwob inspect`).
@@ -525,5 +714,256 @@ mod tests {
         ];
         let table = preview_ticks(&rows, &tz);
         assert!(table.contains("..."), "{table}");
+    }
+
+    // --- File-level hours classification -------------------------------------------------------
+
+    use crate::analysis::ls::ls_file;
+    use crate::analysis::output::write_bars_fwob;
+    use crate::tick::{Tick as RawTick, tick_schema};
+    use fwob::Writer;
+    use fwob_v2::WriterOptions;
+    use jiff::civil::{Weekday, date};
+    use std::path::PathBuf;
+
+    /// A throwaway directory, removed on drop.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "mdfwob-hours-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn new_york() -> Session {
+        Session::new("America/New_York", "09:30-16:00").unwrap()
+    }
+
+    /// The epoch of `day` at `hour:minute` New York time.
+    fn ny(day: Date, hour: i8, minute: i8) -> u32 {
+        let tz = TimeZone::get("America/New_York").unwrap();
+        let zoned = day.at(hour, minute, 0, 0).to_zoned(tz).unwrap();
+        u32::try_from(zoned.timestamp().as_second()).unwrap()
+    }
+
+    /// Monday through Friday from `from` to `to`, inclusive.
+    fn weekdays(from: Date, to: Date) -> Vec<Date> {
+        let mut days = Vec::new();
+        let mut day = from;
+        while day <= to {
+            if !matches!(day.weekday(), Weekday::Saturday | Weekday::Sunday) {
+                days.push(day);
+            }
+            day = day.tomorrow().unwrap();
+        }
+        days
+    }
+
+    fn write_tick_times(dir: &Path, name: &str, times: &[u32]) -> PathBuf {
+        let path = dir.join(format!("{name}.fwob"));
+        let mut writer = Writer::create_v2(&path, tick_schema(), WriterOptions::new(name)).unwrap();
+        let mut buf = Vec::new();
+        for &time in times {
+            buf.clear();
+            RawTick::new(time, 100.0, 10).unwrap().encode(&mut buf);
+            writer.append_frame(&buf).unwrap();
+        }
+        writer.finish().unwrap();
+        path
+    }
+
+    /// The hours `inspect` and `ls` report for `path`, asserting they agree.
+    fn reported_hours(path: &Path, sample: u64) -> String {
+        let rth = new_york();
+        let inspected = inspect_file(path, &rth, &rth.time_zone(), sample).unwrap();
+        let listed = ls_file(String::new(), path, &rth, sample).unwrap();
+        assert_eq!(
+            inspected.hours,
+            Some(listed.hours),
+            "inspect and ls disagree"
+        );
+        listed.hours.to_owned()
+    }
+
+    /// The regression this probe exists for, shaped like the BILI file that exposed it: extended
+    /// data whose first day begins mid-session (an IPO day) and whose last day ends mid-session (a
+    /// download that stopped at 10:16). Every frame the head/tail windows see sits inside RTH, so
+    /// the sample alone says `rth`; the opens of the days between say otherwise. The range also
+    /// crosses the 2024-03-10 DST change and a weekend.
+    #[test]
+    fn hours_come_from_day_opens_not_from_where_the_data_starts_and_stops() {
+        let scratch = Scratch::new("mid-session-ends");
+        let days = weekdays(date(2024, 3, 4), date(2024, 3, 15));
+        let (first_day, last_day) = (days[0], days[days.len() - 1]);
+        let mut times = vec![
+            ny(first_day, 11, 7),
+            ny(first_day, 11, 8),
+            ny(first_day, 11, 9),
+            ny(first_day, 15, 59),
+        ];
+        for &day in &days[1..days.len() - 1] {
+            for (hour, minute) in [(4, 0), (6, 30), (9, 30), (12, 0), (15, 59), (19, 59)] {
+                times.push(ny(day, hour, minute));
+            }
+        }
+        for (hour, minute) in [(4, 0), (9, 30), (10, 14), (10, 15), (10, 16)] {
+            times.push(ny(last_day, hour, minute));
+        }
+        let path = write_tick_times(&scratch.0, "BILI", &times);
+
+        let sample = 3;
+        let (lead, tail) = sample_windows(times.len() as u64, sample);
+        let windows: Vec<u32> = lead
+            .chain(tail.unwrap())
+            .map(|i| times[i as usize])
+            .collect();
+        assert_eq!(
+            classify_hours(&windows, &new_york()),
+            "rth",
+            "the sampled windows alone should reproduce the misclassification"
+        );
+
+        assert_eq!(reported_hours(&path, sample), "extended");
+    }
+
+    /// Regular-hours data opens at the bell every day, so every probed open shares one
+    /// time-of-day. That must read as `rth`, not the `n/a` a single observed minute means for daily
+    /// bars.
+    #[test]
+    fn regular_hours_data_opening_at_the_bell_every_day_is_rth() {
+        let scratch = Scratch::new("rth");
+        let days = weekdays(date(2024, 3, 4), date(2024, 3, 15));
+        let mut times = vec![ny(days[0], 13, 0), ny(days[0], 15, 59)];
+        for &day in &days[1..] {
+            for (hour, minute) in [(9, 30), (9, 30), (11, 0), (15, 59)] {
+                times.push(ny(day, hour, minute));
+            }
+        }
+        let path = write_tick_times(&scratch.0, "RTH", &times);
+        assert_eq!(reported_hours(&path, 3), "rth");
+    }
+
+    /// The walk skips the file's first day, lands on the first frame of each trading day, jumps a
+    /// weekend or a multi-day gap in one step, and takes `days` opens from each end.
+    #[test]
+    fn day_open_probe_walks_trading_days_from_each_end() {
+        let scratch = Scratch::new("walk");
+        // 2024-01-02, then nothing until 2024-01-16, then every weekday through 2024-01-31.
+        let mut days = vec![date(2024, 1, 2)];
+        days.extend(weekdays(date(2024, 1, 16), date(2024, 1, 31)));
+        let mut times = Vec::new();
+        for &day in &days {
+            times.extend([ny(day, 4, 0), ny(day, 12, 0)]);
+        }
+        let path = write_tick_times(&scratch.0, "GAP", &times);
+
+        let mut reader = Reader::open(&path).unwrap();
+        let tz = new_york().time_zone();
+        let (first, last) = (times[0], times[times.len() - 1]);
+        let mut opens =
+            day_open_times(&mut reader, InputKind::Tick, first, last, &tz, 5, 1, |_| {
+                false
+            })
+            .unwrap();
+        opens.sort_unstable();
+
+        let expected_days = [
+            date(2024, 1, 16),
+            date(2024, 1, 17),
+            date(2024, 1, 18),
+            date(2024, 1, 19),
+            date(2024, 1, 22),
+            date(2024, 1, 25),
+            date(2024, 1, 26),
+            date(2024, 1, 29),
+            date(2024, 1, 30),
+            date(2024, 1, 31),
+        ];
+        let expected: Vec<u32> = expected_days.iter().map(|&day| ny(day, 4, 0)).collect();
+        assert_eq!(opens, expected);
+
+        // A day that satisfies `stop` ends the walk: nothing is read after the first probe.
+        let opens = day_open_times(&mut reader, InputKind::Tick, first, last, &tz, 5, 1, |_| {
+            true
+        })
+        .unwrap();
+        assert_eq!(opens, [ny(date(2024, 1, 16), 4, 0)]);
+
+        // `per_day` frames from each open, and a file whose ends meet samples each day once.
+        let short = &times[..6]; // 2024-01-02, 01-16, 01-17
+        let short_path = write_tick_times(&scratch.0, "SHORT", short);
+        let mut reader = Reader::open(&short_path).unwrap();
+        let mut opens = day_open_times(
+            &mut reader,
+            InputKind::Tick,
+            short[0],
+            short[5],
+            &tz,
+            5,
+            2,
+            |_| false,
+        )
+        .unwrap();
+        opens.sort_unstable();
+        assert_eq!(opens, short[2..].to_vec());
+    }
+
+    /// With no second trading day there is nothing to probe, so the sample decides.
+    #[test]
+    fn a_single_day_file_falls_back_to_its_sample() {
+        let scratch = Scratch::new("one-day");
+        let day = date(2024, 3, 5);
+        let rth = write_tick_times(
+            &scratch.0,
+            "RTH",
+            &[ny(day, 10, 0), ny(day, 10, 30), ny(day, 11, 0)],
+        );
+        assert_eq!(reported_hours(&rth, 1_024), "rth");
+        let ext = write_tick_times(&scratch.0, "EXT", &[ny(day, 5, 0), ny(day, 10, 30)]);
+        assert_eq!(reported_hours(&ext, 1_024), "extended");
+    }
+
+    /// Intraday bars probe like ticks; daily bars are bucket anchors and stay `n/a`.
+    #[test]
+    fn bar_files_probe_intraday_and_leave_daily_as_not_applicable() {
+        let scratch = Scratch::new("bars");
+        let bar = |time| Bar {
+            time,
+            open: 1.0,
+            high: 1.0,
+            low: 1.0,
+            close: 1.0,
+            volume: 1,
+            vwap: 1.0,
+            trades: 1,
+        };
+        let days = weekdays(date(2024, 3, 4), date(2024, 3, 8));
+        let mut intraday = vec![bar(ny(days[0], 10, 0)), bar(ny(days[0], 10, 1))];
+        for &day in &days[1..] {
+            for (hour, minute) in [(4, 0), (4, 1), (9, 30), (9, 31)] {
+                intraday.push(bar(ny(day, hour, minute)));
+            }
+        }
+        write_bars_fwob("MIN", &intraday, &scratch.0).unwrap();
+        assert_eq!(reported_hours(&scratch.0.join("MIN.fwob"), 2), "extended");
+
+        let daily: Vec<Bar> = days.iter().map(|&day| bar(ny(day, 9, 30))).collect();
+        write_bars_fwob("DAY", &daily, &scratch.0).unwrap();
+        assert_eq!(reported_hours(&scratch.0.join("DAY.fwob"), 1_024), "n/a");
     }
 }

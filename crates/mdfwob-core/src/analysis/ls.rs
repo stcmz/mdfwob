@@ -1,7 +1,7 @@
 //! `ls`: a quick, multi-file listing of tick/bar files — one row per file with tick/bar-oriented,
-//! timezone-aware columns. The market-data analog of `fwob ls`. Cheap: header + boundary keys plus
-//! a small bounded leading sample per file (for bar granularity and the hours flag), never a full
-//! scan. Rendered as a table, Markdown, CSV, or JSON Lines.
+//! timezone-aware columns. The market-data analog of `fwob ls`. Cheap: header + boundary keys, a
+//! small bounded sample at each end (for bar granularity), and a few seeks to day opens (for the
+//! hours flag), never a full scan. Rendered as a table, Markdown, CSV, or JSON Lines.
 
 use std::io::{self, Write};
 use std::path::Path;
@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use fwob::Reader;
 use jiff::tz::TimeZone;
 
-use crate::analysis::inspect::{classify_hours, detect_bar_granularity, sample_windows};
+use crate::analysis::inspect::{classify_file_hours, detect_bar_granularity, sample_windows};
 use crate::analysis::output::{Table, comma_u64, format_epoch_tz};
 use crate::analysis::read::{InputKind, decode_tick, detect_kind, key_epoch};
 use crate::analysis::schema::decode_bar;
@@ -58,7 +58,8 @@ pub struct LsRow {
 }
 
 /// Reads one file's listing row: metadata (symbol/kind/format/frame_count/bytes), boundary time
-/// range, and — from up to `sample` leading frames — bar granularity and the trading-hours flag.
+/// range, bar granularity from up to `sample` frames at each end, and the trading-hours flag from a
+/// few days' opening frames (see [`classify_file_hours`]).
 /// `file` is the display path to record. Fails if the file is not a canonical Tick/Bar file.
 pub fn ls_file(file: String, path: &Path, rth: &Session, sample: u64) -> Result<LsRow> {
     let mut reader =
@@ -99,11 +100,7 @@ pub fn ls_file(file: String, path: &Path, rth: &Session, sample: u64) -> Result<
     let granularity = (kind == InputKind::Bar)
         .then(|| detect_bar_granularity(&times))
         .flatten();
-    let hours = if times.is_empty() {
-        "n/a"
-    } else {
-        classify_hours(&times, rth)
-    };
+    let hours = classify_file_hours(&mut reader, kind, first, last, &times, rth)?.unwrap_or("n/a");
 
     Ok(LsRow {
         file,
