@@ -28,7 +28,7 @@ anyhow = "1.0"
 base64 = { version = "0.23", optional = true }
 clap = { version = "4.5", features = ["derive"] }
 ctrlc = "3.5"
-databento = "0.55.0"
+databento = "0.63.0"
 fs2 = "0.4"
 fwob = "1.14"
 fwob-core = "1.14"
