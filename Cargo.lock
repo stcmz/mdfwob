@@ -385,8 +385,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cae36683101b2899f48bd31f8db9839437356188e3b1ff23096e73dab09ba8fe"
 dependencies = [
  "compression-core",
- "zstd 0.14.3",
- "zstd-safe 8.2.0",
+ "zstd",
+ "zstd-safe",
 ]
 
 [[package]]
@@ -620,7 +620,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "zstd 0.14.3",
+ "zstd",
 ]
 
 [[package]]
@@ -642,7 +642,7 @@ dependencies = [
  "thiserror 2.0.18",
  "time",
  "tokio",
- "zstd 0.14.3",
+ "zstd",
 ]
 
 [[package]]
@@ -762,7 +762,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -923,9 +923,9 @@ dependencies = [
 
 [[package]]
 name = "fwob"
-version = "1.14.1"
+version = "1.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c378a948489546a5ed1bfe67b58bd4f2014ecf975c0cfcbfa662865f3eb41761"
+checksum = "6e874c9e2a96092fa042b2bda12726dc43133df57db30ccd5f700354b1b3c277"
 dependencies = [
  "anyhow",
  "clap",
@@ -942,9 +942,9 @@ dependencies = [
 
 [[package]]
 name = "fwob-core"
-version = "1.14.1"
+version = "1.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f096cd8ca96182080d883e76c8594ae5a11cfff0084ec34486996cbebfcf65e"
+checksum = "c2bed578fc037d18697dbfa75aec22d9b3ec3aa1fd0ce0d2c2e860ca7bb12177"
 dependencies = [
  "fwob-derive",
  "rust_decimal",
@@ -953,20 +953,20 @@ dependencies = [
 
 [[package]]
 name = "fwob-derive"
-version = "1.14.1"
+version = "1.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c8e0f9e5ec5757c791be5da1871dd02942daf4cf2e7a400fe7414a5816c2f92"
+checksum = "5519a5436aaa247ed124e96f70e3643df99a88f8878cbacdd6257386ef8ecdd2"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.118",
+ "syn 3.0.3",
 ]
 
 [[package]]
 name = "fwob-v1"
-version = "1.14.1"
+version = "1.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e20021de6b2df7bba2e781ddfb20b609440275440653ad3583b83d23682a4629"
+checksum = "19a670ae90dc47c59803c54bb1b12962d377412229634ec6687cf32564a92e2a"
 dependencies = [
  "byteorder",
  "fwob-core",
@@ -975,16 +975,16 @@ dependencies = [
 
 [[package]]
 name = "fwob-v2"
-version = "1.14.1"
+version = "1.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "98eacd340835a2ae38946ff951dab54d2263531a90bcb74039be621a3d4cba10"
+checksum = "6f70b0be02fbe4fa7710fc70241f2f6bd57909578adc2f2a78a38584014d5e2f"
 dependencies = [
  "byteorder",
  "crc32fast",
  "fwob-core",
  "lz4_flex",
  "thiserror 2.0.18",
- "zstd 0.13.3",
+ "zstd",
 ]
 
 [[package]]
@@ -1932,7 +1932,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2223,7 +2223,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2280,7 +2280,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2628,7 +2628,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3237,7 +3237,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3544,29 +3544,11 @@ checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
 
 [[package]]
 name = "zstd"
-version = "0.13.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
-dependencies = [
- "zstd-safe 7.2.4",
-]
-
-[[package]]
-name = "zstd"
 version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db3ae9bf90af6e40197bef767eeefc46ad6397420fe873830bd85e5fbbfb3c70"
 dependencies = [
- "zstd-safe 8.2.0",
-]
-
-[[package]]
-name = "zstd-safe"
-version = "7.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f49c4d5f0abb602a93fb8736af2a4f4dd9512e36f7f570d66e65ff867ed3b9d"
-dependencies = [
- "zstd-sys",
+ "zstd-safe",
 ]
 
 [[package]]
