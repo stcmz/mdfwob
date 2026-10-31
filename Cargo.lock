@@ -602,9 +602,9 @@ dependencies = [
 
 [[package]]
 name = "databento"
-version = "0.63.0"
+version = "0.64.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "051a91d6950dd24d084f3374a94f295415bd30710836b7077813e01f16a26ff4"
+checksum = "639e4857c4c34713428e70f9e28d54c5b9b40150aa0dd5f99a7115eb83789a55"
 dependencies = [
  "async-compression",
  "bon",
@@ -625,9 +625,9 @@ dependencies = [
 
 [[package]]
 name = "dbn"
-version = "0.71.0"
+version = "0.73.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4cd13d45f15b0178b517293b48d62b059fbb2b44712f5943a9bd87063b63369a"
+checksum = "acd51dc2239e245d0d16e125c8bac8af940b88ca870334a42e95d9f53bcc08e2"
 dependencies = [
  "async-compression",
  "async-stream",
@@ -647,9 +647,9 @@ dependencies = [
 
 [[package]]
 name = "dbn-macros"
-version = "0.71.0"
+version = "0.73.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c5aef6f95f9623e8d8697a55a557d1238cc014927cbf93fb9320de09d26b8504"
+checksum = "b40db7e1c61598dac780cae4409f9866d7d4301bf1e045c1dadea62164c19788"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -762,7 +762,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1932,7 +1932,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2223,7 +2223,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2280,7 +2280,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2628,7 +2628,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3237,7 +3237,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
