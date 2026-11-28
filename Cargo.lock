@@ -90,9 +90,9 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "async-compression"
-version = "0.4.51"
+version = "0.4.54"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d5755640120b24961f8231e05892e4a4f7e0d04e8aeca161508c9c397946970"
+checksum = "0c31224bd2c09447484a1143f2fc1d871eb405789859c8e5470a3e7f95f40a18"
 dependencies = [
  "compression-codecs",
  "compression-core",
@@ -374,9 +374,9 @@ dependencies = [
 
 [[package]]
 name = "compression-codecs"
-version = "0.4.46"
+version = "0.4.49"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cae36683101b2899f48bd31f8db9839437356188e3b1ff23096e73dab09ba8fe"
+checksum = "f938fc0d88fbe2c8d6f0e1ba96ba1165d89ff698e98468cd019d92cff2ecd367"
 dependencies = [
  "compression-core",
  "zstd",
@@ -596,9 +596,9 @@ dependencies = [
 
 [[package]]
 name = "databento"
-version = "0.64.0"
+version = "0.65.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "639e4857c4c34713428e70f9e28d54c5b9b40150aa0dd5f99a7115eb83789a55"
+checksum = "b37d28459a1678c29db122f1175590605b92e346b2ddbdb05a1c317c97886458"
 dependencies = [
  "async-compression",
  "bon",
@@ -619,9 +619,9 @@ dependencies = [
 
 [[package]]
 name = "dbn"
-version = "0.73.0"
+version = "0.74.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "acd51dc2239e245d0d16e125c8bac8af940b88ca870334a42e95d9f53bcc08e2"
+checksum = "3f40079b45a46eec4a7e96e6c1b9a530528d7878b13b32f47556181537a0ee3b"
 dependencies = [
  "async-compression",
  "async-stream",
@@ -641,9 +641,9 @@ dependencies = [
 
 [[package]]
 name = "dbn-macros"
-version = "0.73.0"
+version = "0.74.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b40db7e1c61598dac780cae4409f9866d7d4301bf1e045c1dadea62164c19788"
+checksum = "268e6872893e1036475d764ebab29ec3acf021d0dfe7312cc2156c451817f4ae"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
